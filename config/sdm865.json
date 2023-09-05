@@ -444,7 +444,7 @@
       "fastLimitCapacity": 10.0,
       "fastLimitRecoverScale": 0.3,
       "predictThd": 0.3,
-      "margin": 0.2,
+      "margin": 0.25,
       "burst": 0,
       "guideCap": true,
       "limitEfficiency": false
@@ -456,8 +456,8 @@
       "llccddrRC4": "400",
       "cpusetTa": "0-7",
       "cpusetFg": "0-2,4-7",
-      "cpusetBg": "0-2",
-      "cpusetSysBg": "0-2",
+      "cpusetBg": "0-3",
+      "cpusetSysBg": "0-3",
       "cpusetRe": "0-6"
     },
     "sched": {
@@ -471,7 +471,7 @@
         "cpu.slowLimitPower": 2.0,
         "cpu.fastLimitPower": 2.0,
         "cpu.fastLimitCapacity": 16.0,
-        "cpu.margin": 0.2
+        "cpu.margin": 0.25
       },
       "idle": {
         "cpu.baseSampleTime": 0.04,
@@ -486,11 +486,11 @@
       },
       "trigger": {
         "cpu.latencyTime": 0.0,
-        "cpu.margin": 0.4,
+        "cpu.margin": 0.5,
         "sched.scene": "touch"
       },
       "gesture": {
-        "cpu.margin": 0.4,
+        "cpu.margin": 0.5,
         "sched.scene": "touch"
       },
       "junk": {
@@ -502,7 +502,7 @@
         "cpu.slowLimitPower": 3.0,
         "cpu.fastLimitPower": 5.0,
         "cpu.fastLimitRecoverScale": 0.1,
-        "cpu.margin": 0.4,
+        "cpu.margin": 0.6,
         "sched.scene": "boost"
       }
     },
