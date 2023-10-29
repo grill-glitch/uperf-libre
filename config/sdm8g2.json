@@ -43,7 +43,7 @@
           "typicalPower": 0.5, 
           "typicalFreq": 1.9, 
           "sweetFreq": 1.6, 
-          "plainFreq": 1.2, 
+          "plainFreq": 1.4, 
           "freeFreq": 0.6
         }, 
         {
@@ -498,7 +498,7 @@
         "cpu.slowLimitPower": 2.0, 
         "cpu.fastLimitPower": 2.0, 
         "cpu.fastLimitCapacity": 16.0, 
-        "cpu.margin": 0.2
+        "cpu.margin": 0.21
       }, 
       "idle": {
         "cpu.baseSampleTime": 0.04, 
@@ -585,7 +585,7 @@
         "cpu.fastLimitPower": 999.0, 
         "cpu.fastLimitCapacity": 999.0, 
         "cpu.margin": 0.2,
-        "cpu.burst": 0.2
+        "cpu.burst": 0.22
       }, 
       "idle": {
         "sched.scene": "idle"
