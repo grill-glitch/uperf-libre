@@ -526,10 +526,10 @@
       }, 
       "switch": {
         "cpu.latencyTime": 0.0, 
-        "cpu.slowLimitPower": 4.0, 
-        "cpu.fastLimitPower": 6.0, 
+        "cpu.slowLimitPower": 6.0, 
+        "cpu.fastLimitPower": 8.0, 
         "cpu.fastLimitRecoverScale": 0.1, 
-        "cpu.margin": 0.5, 
+        "cpu.margin": 0.65, 
         "sched.scene": "boost"
       }
     }, 
@@ -610,7 +610,7 @@
         "sched.scene": "touch"
       }, 
       "switch": {
-        "cpu.burst": 0.25, 
+        "cpu.burst": 0.65, 
         "sched.scene": "boost"
       }
     }, 

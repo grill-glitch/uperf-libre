@@ -433,7 +433,7 @@
       "fastLimitCapacity": 10,
       "fastLimitRecoverScale": 0.3,
       "predictThd": 0.3,
-      "margin": 0.25,
+      "margin": 0.28,
       "burst": 0,
       "guideCap": true,
       "limitEfficiency": false
@@ -489,10 +489,10 @@
       },
       "switch": {
         "cpu.latencyTime": 0,
-        "cpu.slowLimitPower": 3,
-        "cpu.fastLimitPower": 5,
+        "cpu.slowLimitPower": 6,
+        "cpu.fastLimitPower": 8,
         "cpu.fastLimitRecoverScale": 0.1,
-        "cpu.margin": 0.4,
+        "cpu.margin": 0.6,
         "sched.scene": "boost"
       }
     },
@@ -525,7 +525,7 @@
         "sched.scene": "touch"
       }, 
       "junk": {
-        "cpu.burst": 0.08, 
+        "cpu.burst": 0.1, 
         "sched.scene": "touch"
       }, 
       "switch": {
@@ -566,7 +566,7 @@
         "sched.scene": "touch"
       }, 
       "switch": {
-        "cpu.burst": 0.3, 
+        "cpu.burst": 0.7, 
         "sched.scene": "boost"
       }
     }, 
