@@ -43,6 +43,8 @@
 | 配置 schema v3 = `meta` / `modules` / `initials` / `presets`，**层叠覆盖用点号键**（`cpu.margin`、`sysfs.xxx`、`sched.scene`） | 仓库内 `config/README.md`（376 行，v3 权威规范） |
 | Q: 根 `README.md` 里的 `powermodes/actions`、`knob type` 是 **v1/v2 旧文档**，与 v3 配置不符 | 对照 `config/template.json` 与 `config/sdm855.json` 实际键 |
 | 事件总线 topic 与 dfps 逐字相同 | `cgroup.{ta,fg,bg,re}.{list,update}`、`input.{touch,btn,state}`、`offscreen.state`、`topapp.pkgName`；uperf 独有 `anim.running`、`sfanalysis.hint`、`config.profile` |
+| uperf v3 的日志 pattern 就是 dfps 的 `%H:%M:%S %L %v`；`Usage:`/`Uperf is running`/守护横幅/`v3(22.09.04)`/作者串与二进制逐字一致 | 见 §7.3 的证据链 |
+| 12 个业务模块源文件名在二进制里保真：`anim_watcher / atrace_switcher / cgroup_listener / context_scheduler / cpu_governor / input_listener / offscreen_monitor / profile_switcher / sfanalysis_listener / sysfs_writer / topapp_monitor / main` | `__FILE__` 串 |
 | uperf 比 dfps 多出的能力层 | `context_scheduler`（PCRE2 正则规则引擎）、`cpu_governor` + `cpu_busy_reader`、`profile_switcher`、`sysfs_writer` + 12 个 `CpufreqWriter*`、`sfanalysis_listener`、`anim_watcher`、`log_level_switcher` |
 
 ---
@@ -219,22 +221,35 @@ uperf <config.json> [-o <log_file>]
 | `USER_PATH/uperf_log.txt` | 日志（`-o` 指定） |
 | `flag/need_recuser` | 启动自恢复标记（脚本侧创建/删除，仓库不提交该目录）；本项目不改 |
 
-### 7.3 日志格式
+### 7.3 日志格式（**已核验：README 的示例是 v1 时代，不能用**）
 
-原版（README 示例）：`[13:03:33][I] CfgMgr: Using [sdm855/sdm855+ v20200516] by [yc@coolapk]`
-**Rust 侧日志必须产出同样的可正则解析格式**：`[HH:MM:SS][L] <Tag>: <msg>`。
-必须保留的关键行（parity 断言的锚点）：
+证据链：
+* v3 二进制里存在的 pattern 串只有 `%H:%M:%S %L %v`（与 dfps `source/main.cpp:InitLogger()` 的
+  `logger->set_pattern("%H:%M:%S %L %v")` 逐字相同），**没有** `[%H:%M:%S][%L]` 这种带方括号的串。
+* v3 二进制里**不存在** `CfgMgr` 这个字符串；存在的是模块名 `CpuGovernor` / `SysfsWriter` /
+  `ContextScheduler` / `ProfileSwitcher` / `SfAnalysisListener` / `TopappMonitor` / `CgroupListener` /
+  `InputListener` / `AtraceSwitcher` / `AnimWatcher`。
+* v1 二进制里反而是 `CfgMgr: Using [%s] by [%s]` 这种把标签写进消息的 printf 风格串。
+* README（本仓库与上游同款）的日志示例用的还是 `/sdcard/yc/uperf/`（v2 路径），而 v3 的 USER_PATH
+  是 `/sdcard/Android/yc/uperf`。
+
+结论：**v3 的日志行形如 `13:03:33 I <消息>`**（spdlog 默认 sink + `%H:%M:%S %L %v`），
+标签由消息内容或 logger 名承载。M0 已按此 pattern 落地（`cpp/uperf/app_main.cpp:InitLogger`）。
+**精确到"哪条日志由哪个 logger 名产出"仍未静态确定 → M2 起以真机原版日志逐条采集为准。**
+
+必须保留的关键行（parity 断言的锚点，均已在本机二进制里核到原串）：
 ```
-CfgMgr: Using [<name>] by [<author>]
-CfgMgr: Read default powermode from <switchInode>
-CfgMgr: Powermode "<old>" -> "<new>"
-CfgMgr: Bind HintNone -> <action>            （v3 的 hint 命名不同，以 v3 行为为准，需实测对齐）
-CfgMgr: Ignored root/platform/knobs/<knob> [Disabled by config file]
-CfgMgr: Ignored root/platform/knobs/<knob> [Path is not writable]
-CfgMgr: Ignored knobs in action ...: <names>
-SfAnalysis: Surfaceflinger analysis connected
+uperf v3(22.09.04)[<hash>], by Matt Yang (yccy@outlook.com)   （守护进程横幅，格式串 "{} {}[{}], by {}"）
+Uperf is running
+Config file updated, restart uperf to load new config file
+Failed to start uperf(pid=...)
+uperf(pid=...) terminated unexpectedly, try to get tombstone
+>>> Start of tombstone ... <<< / >>> End of tombstone ... <<<
+Cannot find the tombstone
+Usage: uperf [-o log_file] config_file
 ```
-> ⚠️ v3 的 `hint` 命名与 v2 README 的 `HintNone/HintTap/...` **可能不同**（v3 引入了 `idle/touch/trigger/gesture/junk/switch`）。**以真机实测原版日志为准**，不许照抄 v2 文档。
+> ⚠️ 配置层的日志文案（`Using [..] by [..]`、`Ignored root/platform/knobs/..` 等）在 v3 里**不存在同名串**，
+> 说明 v3 的配置层重写过，具体文案必须真机采集，不许照抄 v2 README。
 
 ### 7.4 `sfanalysis.hint` 文件协议
 
@@ -396,7 +411,7 @@ uperf-cli warn   <config.json>              # 输出告警行（应与原版日�
 
 | 阶段 | 内容 | 交付 | 验收 |
 |---|---|---|---|
-| **M0** | vendor dfps 到 `cpp/dfps/`，跑通 dfps 原样构建；确定 CLI/日志/进程名适配点 | `DFPS_VENDOR.md`、可编译的 `cpp/uperf` | 在 alioth 上启动自编译的 dfps，日志正常 |
+| **M0** ✅ | vendor dfps 到 `cpp/dfps/`，跑通 dfps 原样构建；确定 CLI/日志/进程名适配点 | `DFPS_VENDOR.md`、可编译的 `cpp/uperf`、`docs/m0-evidence.md` | **已达成**（2026-10-02，alioth）：`build.sh check` 全绿，进程监督器/日志格式/CLI/4 个事件源/配置热重载全部真机验证；`offscreen.state` 未触发，列入 §12.2 |
 | **M1** | Rust staticlib 骨架 + C ABI 桥跑通：C++ 启动 → 调 `uperf_rs_start` → 订阅 `input.touch`/`topapp.pkgName` → 收到事件打日志 | 骨架 + 桥 | 真机日志出现 Rust 侧收到的事件 |
 | **M2** | 配置系统 + `uperf-cli parse/warn`；63 份配置全部解析 | parity 工具 | §10.2 告警对账 0 差异 |
 | **M3** | switcher/profile/sysfs（6 类写入器）+ 状态机 | `plan` 输出 | §10.3 假 sysfs 写入序列 0 差异 |
@@ -422,6 +437,10 @@ M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（conf
 | 项 | 状态 | 处理 |
 |---|---|---|
 | `sfanalysis.hint` 的状态码语义 | UNKNOWN | 真机抓取（M2） |
+| **`offscreen.state` 在 alioth 上从未触发**：vendored 判据是 `/dev/cpuset/restricted` pid 数 > 10，而该集合在本机恒为 0 | 未定（不是"已确认 ROM 不用 restricted"——本次也没能真正熄屏） | M2：物理电源键熄屏后读 `/dev/cpuset/restricted/cgroup.procs`；并用**原版二进制**同机抓日志确定 v3 的真实熄屏判据。详见 `docs/m0-evidence.md` §3.2 |
+| `/dev/cpuset` 在本机是 **cgroup v1 形态**（有 `tasks`/`notify_on_release`），`/sys/fs/cgroup` 是 v2（只有 `apps`/`system`） | 未定 | M2 钉死"哪个是真正的任务分组视图"，否则 cgroup 事件可能读到陈旧数据 |
+| `topapp.pkgName` 的 `|Δpid| > 10` 门槛（`TOP_TASK_NR_DIFF_MIN`）是否与原版一致 | 未定 | M2 用原版对照小应用切换场景 |
+| NDK r30（clang 21）下 vendored scnlib / spdlog 需要非侵入式 shim | 已解决 | `cpp/CMakeLists.txt` 三处注释 + `docs/m0-evidence.md` §1（未改动 `cpp/dfps/**` 任何字节） |
 | v3 的 Hint 命名与日志文案（v2 文档不可信） | UNKNOWN | 以原版真机日志为准（M2 起逐条采集） |
 | `.data` 4 条不透明记录 | UNKNOWN | 不影响本项目（不重写该库） |
 | 原版 `CpufreqWriter` 各平台子类的确切分支条件 | 部分未知 | 用 63 份配置反推 + 真机写入对照 |
