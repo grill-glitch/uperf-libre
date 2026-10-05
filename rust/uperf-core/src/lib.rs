@@ -22,6 +22,7 @@ pub mod ffi;
 pub mod inotify;
 pub mod sched_apply;
 pub mod sched_task;
+pub mod startup_lines;
 pub mod shutdown;
 pub mod watch_task;
 pub mod hint;
@@ -123,6 +124,18 @@ pub(crate) extern "C" fn uperf_rs_start(
         }
     }
     let (loaded_cfg, mode) = load_config_and_mode(&cfg.to_string_lossy());
+
+    // Criterion 2 (AGENT.md §1): the config identity and the knob writability
+    // warnings, verbatim. Emitted without the `Rust:` prefix the rewrite's own
+    // diagnostics carry, so they are greppable against an upstream log.
+    if let Some(c) = loaded_cfg.as_ref() {
+        let (name, author) = c.meta_ident();
+        log_msg(&crate::startup_lines::config_line(&name, &author));
+        for line in crate::startup_lines::knob_warnings(&c.sysfs_knob_table(), &crate::startup_lines::real_probe())
+        {
+            log_msg(&line);
+        }
+    }
 
     // Apply `modules.log.level` (upstream's LogLevelSwitcher). Every shipped
     // config sets "info"; the logger used to be hardcoded to debug.

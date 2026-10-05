@@ -259,6 +259,12 @@ impl Config {
             .and_then(|v| v.as_bool())
     }
 
+    /// `meta.name` / `meta.author`, as upstream prints them:
+    /// `Config '<name>' by '<author>'`.
+    pub fn meta_ident(&self) -> (String, String) {
+        (self.meta.name.clone(), self.meta.author.clone())
+    }
+
     /// The config's `presets` keys, **alphabetically** (they are stored in a
     /// `BTreeMap`, so this is not the JSON order). Only used to validate a
     /// referenced preset name, where order is irrelevant.
