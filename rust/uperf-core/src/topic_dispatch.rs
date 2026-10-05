@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::ffi::DISPATCH_TX;
+use crate::orchestrator::Sink;
 
 // ---------------------------------------------------------------------------
 //  Topic — typed identifier matching cpp/uperf/bridge.cpp::dispatch()
@@ -150,14 +151,14 @@ fn decode_pid_list(payload: &[u8]) -> Option<Vec<i32>> {
 /// Spawn the dispatcher thread. The thread reads from `rx` and writes each
 /// event as a single log line through the C++ spdlog sink. It exits when both
 /// senders (the FFI sender in DISPATCH_TX and the keep-alive) are dropped.
-pub(crate) fn spawn() -> Dispatcher {
+pub(crate) fn spawn(orch: std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>) -> Dispatcher {
     let (tx, rx): (Sender<Event>, Receiver<Event>) = std::sync::mpsc::channel();
     // Install a clone so the FFI entry point can also send events.
     let tx_for_ffi = tx.clone();
     DISPATCH_TX.get_or_init(|| tx_for_ffi);
     let thread = thread::Builder::new()
         .name("uperf-rs".into())
-        .spawn(move || run(rx))
+        .spawn(move || run(rx, orch))
         .expect("spawn uperf-rs dispatcher");
     Dispatcher {
         _keep_alive: tx,
@@ -193,9 +194,65 @@ fn dummy_sender() -> Sender<Event> {
     tx
 }
 
-fn run(rx: Receiver<Event>) {
+fn run(
+    rx: Receiver<Event>,
+    orch: std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
+) {
+    // M4: writes go under a fake root so device validation never touches the
+    // real sysfs. Set `UPERF_FAKE_ROOT` to enable file emission (e.g.
+    // /data/local/tmp/uperf_fake); otherwise we only log the planned sequence.
+    let fake_root = std::env::var("UPERF_FAKE_ROOT").ok();
     while let Ok(ev) = rx.recv() {
         write_event(&ev);
+
+        let mut collected = crate::orchestrator::CollectingSink::default();
+        {
+            let mut g = orch.lock();
+            g.on_event(&ev);
+            g.drain(&mut collected);
+        }
+
+        for w in &collected.writes {
+            log_sysfs_write(w);
+        }
+
+        if let Some(root) = fake_root.as_deref() {
+            let mut files = crate::orchestrator::UnderRootSink::new(root);
+            for w in collected.writes {
+                files.write(&w);
+            }
+            log_msg(&format!(
+                "Rust: fake-write root={} ok={} failed={}",
+                root,
+                files.written.len(),
+                files.failed.len()
+            ));
+        } else {
+            for w in collected.writes {
+                log_msg(&format!("Rust: would-write {} = {}", w.path, w.value));
+            }
+        }
+    }
+}
+
+fn log_sysfs_write(w: &crate::orchestrator::SysfsWrite) {
+    use std::fmt::Write as _;
+    let mut buf = String::with_capacity(96);
+    let _ = write!(buf, "Rust: SysfsWrite path={} value={}", w.path, w.value);
+    write_log_line(&buf);
+}
+
+fn log_msg(s: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static BUF: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+    let buf = BUF.get_or_init(|| Mutex::new(Vec::with_capacity(160)));
+    let mut b = buf.lock().unwrap();
+    b.clear();
+    b.extend_from_slice(s.as_bytes());
+    b.push(b'\n');
+    // SAFETY: the C++ sink copies before returning.
+    unsafe {
+        crate::ffi::uperf_bridge_write_log(std::ptr::null(), b.as_ptr().cast(), b.len());
     }
 }
 

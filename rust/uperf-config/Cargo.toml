@@ -1,0 +1,22 @@
+[package]
+name = "uperf-config"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Shared config layer + sysfs write planner.
+#
+# Used by BOTH:
+#   * `uperf-cli` (host parity tool)
+#   * `uperf-core` (the Android staticlib; the orchestrator resolves
+#     presets[mode][scene] and turns them into concrete sysfs writes)
+#
+# Keeping one copy avoids the schema drift we already hit once (three separate
+# implementations of the cascade + dispatch tables).
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "1"
+
+[dev-dependencies]
+serde_json = "1"

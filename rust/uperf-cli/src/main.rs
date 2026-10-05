@@ -12,11 +12,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-mod config;
 mod plan;
 mod warn;
 
-use config::Config;
+use uperf_config::Config;
 
 #[derive(Parser, Debug)]
 #[command(name = "uperf-cli", version, about = "uperf v3 config parity tool")]

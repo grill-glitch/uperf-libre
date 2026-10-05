@@ -13,6 +13,8 @@ once_cell = "1"
 parking_lot = "0.12"
 thiserror = "1"
 
+uperf-config = { path = "../uperf-config" }
+
 [dev-dependencies]
 pretty_assertions = "1"
 

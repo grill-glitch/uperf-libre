@@ -63,6 +63,7 @@ impl SfHint {
 }
 
 /// Hint duration source: looks up `modules.switcher.hintDuration.<scene>` (ms).
+#[derive(Debug, Clone)]
 pub struct HintDurations {
     pub idle_ms: u64,
     pub touch_ms: u64,
@@ -70,6 +71,12 @@ pub struct HintDurations {
     pub gesture_ms: u64,
     pub switch_ms: u64,
     pub junk_ms: u64,
+}
+
+impl Default for HintDurations {
+    fn default() -> Self {
+        Self { idle_ms: 0, touch_ms: 4000, trigger_ms: 30, gesture_ms: 100, switch_ms: 400, junk_ms: 60 }
+    }
 }
 
 impl HintDurations {
@@ -190,19 +197,17 @@ mod tests {
     use serde_json::json;
 
     fn durations() -> HintDurations {
-        HintDurations::from_modules({
-            let mut m = Map::new();
-            m.insert(
-                "switcher".into(),
-                json!({
-                    "hintDuration": {
-                        "idle": 0.0, "touch": 4.0, "trigger": 0.03, "gesture": 0.1,
-                        "switch": 0.4, "junk": 0.06
-                    }
-                }),
-            );
-            m
-        }.as_object().unwrap())
+        let mut m = Map::new();
+        m.insert(
+            "switcher".into(),
+            json!({
+                "hintDuration": {
+                    "idle": 0.0, "touch": 4.0, "trigger": 0.03, "gesture": 0.1,
+                    "switch": 0.4, "junk": 0.06
+                }
+            }),
+        );
+        HintDurations::from_modules(&m)
     }
 
     #[test]
@@ -221,10 +226,14 @@ mod tests {
 
     #[test]
     fn same_hint_refreshes_timer_only() {
+        // Idle -> Touch IS a transition (returning Some(HintTransition)).
         let mut s = HintState::new(durations());
-        assert!(s.process(SfHint::Touch).is_none()); // from Idle -> Touch is a transition
+        let t = s.process(SfHint::Touch);
+        assert!(t.is_some(), "Idle -> Touch should be a transition");
         let t1 = s.bound_at;
-        let _ = s.process(SfHint::Touch);
+        let t = s.process(SfHint::Touch);
+        // A repeat of the same hint yields no transition (timer refresh).
+        assert!(t.is_none(), "Touch -> Touch should be a refresh, no transition");
         assert!(s.bound_at >= t1);
     }
 

@@ -7,6 +7,7 @@ publish = false
 # AGENT.md §10.2: offline parity tool used to diff the Rust policy engine against the
 # upstream binary. Does not depend on `uperf-core` because the tool runs on the host.
 [dependencies]
+uperf-config = { path = "../uperf-config" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "1"

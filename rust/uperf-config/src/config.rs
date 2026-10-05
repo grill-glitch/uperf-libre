@@ -50,6 +50,8 @@ pub struct Config {
     pub modules: Modules,
     pub initials: Map<String, Value>, // dot-keyed (`cpu.margin` → value)
     pub presets: BTreeMap<String, Preset>,
+    /// Raw  object (kept for hintDuration + future knob lookups).
+    pub modules_raw: Option<Map<String, Value>>,
 }
 
 /// `meta`: { name, author }
@@ -122,6 +124,9 @@ impl Config {
                 }
             }
         }
+
+        // Keep the raw modules map for hintDuration and other module-level knobs.
+        c.modules_raw = obj.get("modules").and_then(|m| m.as_object()).cloned();
 
         // initials: per-module block (e.g. `{ cpu: { margin: 0.2, ... }, sysfs: {...} }`)
         // OR a flat dotted map (`{ "cpu.margin": 0.2, ... }`). Both shapes appear
@@ -218,7 +223,59 @@ impl Config {
             .cloned()
             .collect()
     }
+
+    /// Every `sysfs.*` key that appears anywhere (initials or any preset scene).
+    /// Used by the sysfs planner to build the write set.
+    pub fn all_sysfs_keys(&self) -> Vec<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for k in self.initials.keys() {
+            if k.starts_with("sysfs.") {
+                out.insert(k.clone());
+            }
+        }
+        for p in self.presets.values() {
+            for scene in p.scenes.values() {
+                for k in scene.keys() {
+                    if k.starts_with("sysfs.") {
+                        out.insert(k.clone());
+                    }
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+    /// `modules.sysfs.knob` — the `{knob_name: absolute_path}` table.
+    ///
+    /// This is the ONLY place sysfs paths come from: the upstream binary has no
+    /// hardcoded paths at all (see `docs/m4-evidence.md` §1). Missing/empty
+    /// table → empty map (all sysfs knobs then resolve to nothing).
+    pub fn sysfs_knob_table(&self) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        let Some(m) = self.modules_raw.as_ref() else {
+            return out;
+        };
+        let Some(knob) = m
+            .get("sysfs")
+            .and_then(|s| s.as_object())
+            .and_then(|s| s.get("knob"))
+            .and_then(|k| k.as_object())
+        else {
+            return out;
+        };
+        for (name, path) in knob {
+            if let Some(p) = path.as_str() {
+                out.insert(name.clone(), p.to_string());
+            }
+        }
+        out
+    }
+
+    /// Borrow the `modules` block as a raw map (used for hintDuration lookup).
+    pub fn modules_map(&self) -> Option<&Map<String, Value>> {
+        self.modules_raw.as_ref()
+    }
 }
+
 
 impl fmt::Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

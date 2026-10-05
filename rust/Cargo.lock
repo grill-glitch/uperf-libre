@@ -367,6 +367,16 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "uperf-config",
+]
+
+[[package]]
+name = "uperf-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -380,6 +390,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "uperf-config",
 ]
 
 [[package]]
