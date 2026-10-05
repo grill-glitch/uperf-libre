@@ -6,6 +6,7 @@ import { getString } from './language.js';
 const PAGES = {
     home: { id: 'home-page', title: () => 'Uperf' },
     mode: { id: 'mode-page', title: () => getString('tab_mode') },
+    dfps: { id: 'dfps-page', title: () => getString('tab_dfps') },
     more: { id: 'more-page', title: () => getString('tab_more') },
 };
 
