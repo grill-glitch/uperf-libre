@@ -10,7 +10,6 @@ import { exec } from 'kernelsu-alt';
 export const MODULE_DIR = '/data/adb/modules/uperf';
 export const USER_PATH = '/sdcard/Android/yc/uperf';
 const SCRIPT = `${MODULE_DIR}/script/webui.sh`;
-const DFPS_SCRIPT = `${MODULE_DIR}/script/dfps.sh`;
 
 /** POSIX shell single-quote escaping; preset names come from a text file. */
 export function shellQuote(value) {
@@ -82,29 +81,6 @@ export async function readLog(lines) {
 
 export async function restart() {
     return parseKeyValue((await ctl('restart')).stdout);
-}
-
-/** dfps control entry — same `key=value` protocol as webui.sh. */
-async function dfpsCtl(subcommand, ...args) {
-    const parts = [`sh ${DFPS_SCRIPT}`, subcommand, ...args.map(shellQuote)];
-    const result = await exec(parts.join(' '));
-    const err = (result.stderr || '').trim();
-    if (result.errno !== 0 && !result.stdout) {
-        throw new Error(err || `exit ${result.errno}`);
-    }
-    return result;
-}
-
-export async function dfpsStatus() {
-    return parseKeyValue((await dfpsCtl('status')).stdout);
-}
-
-export async function dfpsInfo() {
-    return parseKeyValue((await dfpsCtl('info')).stdout);
-}
-
-export async function setRule(pkg, idle, active) {
-    return parseKeyValue((await dfpsCtl('set-rule', pkg, idle, active)).stdout);
 }
 
 /** Opens a URL through Android, with a WebView fallback. */
