@@ -81,8 +81,11 @@ static void InitLogger(void) {
         logger->sinks().emplace_back(sink);
     }
     logger->set_pattern("%H:%M:%S %L %v");
-    logger->set_level(spdlog::level::debug);
-    logger->flush_on(spdlog::level::debug);
+    // Default only: the Rust side applies `modules.log.level` once the config is
+    // parsed (all 63 shipped configs say "info"). This used to be hardcoded to
+    // debug.
+    logger->set_level(spdlog::level::info);
+    logger->flush_on(spdlog::level::info);
 }
 
 static void PrintTombstone(int pid) {

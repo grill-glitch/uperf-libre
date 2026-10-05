@@ -205,18 +205,36 @@ fn run(
     while let Ok(ev) = rx.recv() {
         write_event(&ev);
 
-        let mut collected = crate::orchestrator::CollectingSink::default();
         {
             let mut g = orch.lock();
             g.on_event(&ev);
-            g.drain(&mut collected);
         }
+        apply_pending(&orch, fake_root.as_deref());
+    }
+}
 
-        for w in &collected.writes {
-            log_sysfs_write(w);
-        }
-
-        if let Some(root) = fake_root.as_deref() {
+/// Drain whatever the orchestrator has planned into the configured sink.
+///
+/// Shared by the event loop and the mode watcher, so a preset switched from
+/// `cur_powermode.txt` produces byte-identical writes to a preset switched by an
+/// event. Returns `(written, failed)`.
+pub(crate) fn apply_pending(
+    orch: &std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
+    fake_root: Option<&str>,
+) -> (usize, usize) {
+    let mut collected = crate::orchestrator::CollectingSink::default();
+    {
+        let mut g = orch.lock();
+        g.drain(&mut collected);
+    }
+    if collected.writes.is_empty() {
+        return (0, 0);
+    }
+    for w in &collected.writes {
+        log_sysfs_write(w);
+    }
+    match fake_root {
+        Some(root) => {
             let mut files = crate::orchestrator::UnderRootSink::new(root);
             for w in collected.writes {
                 files.write(&w);
@@ -227,10 +245,13 @@ fn run(
                 files.written.len(),
                 files.failed.len()
             ));
-        } else {
+            (files.written.len(), files.failed.len())
+        }
+        None => {
             for w in collected.writes {
                 log_msg(&format!("Rust: would-write {} = {}", w.path, w.value));
             }
+            (0, 0)
         }
     }
 }

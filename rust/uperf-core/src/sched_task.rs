@@ -6,7 +6,11 @@
 //! nothing (this is the "高度优化" claim in `config/README.md` line 160).
 //!
 //! Two test hooks, both explicitly *not* config semantics:
-//!   * `UPERF_SCHED_DRY_RUN=1` — log decisions without touching the kernel;
+//!   * `UPERF_SCHED_DRY_RUN=1` — log decisions without touching the kernel.
+//!     **Use this in any device harness**: `UPERF_FAKE_ROOT` redirects the
+//!     *sysfs* writer, but `sched_setaffinity`/`sched_setscheduler` are syscalls
+//!     with no path to redirect, so a scheduler run against the shipped config
+//!     really does retune every process on the device;
 //!   * `UPERF_SCHED_ONLY=<substr>` — restrict to processes whose name contains the
 //!     substring, so a live check can be confined to a process we own.
 

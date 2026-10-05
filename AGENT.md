@@ -505,8 +505,9 @@ uperf-cli plan   <config.json> <mode> <scene>   # 层叠后的键值 + 来源（
 | **M4** ✅ | 事件→hint→config→sysfs 写入链路 | `rust/uperf-config/`、`rust/uperf-core/src/{hint,orchestrator}.rs`、`docs/m4-evidence.md` | **已达成**（真机）：16 条 sysfs 写入计划与配置路径逐字一致，fake-root 16 文件落地 |
 | **M5a** ✅ | CPU 调频器：能耗模型 + 负载采样 + 功耗限制 + 真机控频 | `rust/uperf-config/src/{cpu,governor,gov_build,freq_target,proc_stat}.rs`、`rust/uperf-core/src/cpu_task.rs`、`docs/m5-cpu-governor.md` | **已达成**（alioth）：25/25 上游 `pwr/cost` 黄金值复现；真机 `userspace`+`setspeed` 控频生效；PL1=1.0W 下满载小核贴上限 1612800 kHz；撤载回落；SIGTERM 干净 disarm |
 | **M6a** ✅ | 上下文调度器（`modules.sched`）：配置层 + 内核应用 + 真机验证 | `uperf-config/src/sched.rs`、`uperf-core/src/{sched_apply,sched_task}.rs`、`uperf-config/tests/all_sched_configs.rs`、`docs/m6-sched-evidence.md` | **已达成**：全配置闸通过（101 模块/1014 规则/4048 pattern，异常集恰为白名单 3 项）；真机隔离实验 `0-7/policy5 → 0-1/policy3` 双值命中且 6s 稳定；写后回读校验；`SIGCHLD` 跨层 bug 已修 |
-| **M6b** 🚧 | sfanalysis 监听 + anim/log/atrace；`cur_powermode.txt` 热切换；真机跑 `pinned`+top-app 路径 | — | 未开始 |
-| **M7** | 整机替换 `magisk/bin/uperf` | 可发布的 Magisk zip | §10.4 全部 7 张基线通过；§1 成功判据全绿 |
+| **M6b** ✅ | 预设热切换（`cur_powermode.txt` + perapp 规则）、`sfanalysis.hint` 监听、`log.level` | `uperf-config/src/switcher.rs`、`uperf-core/src/{inotify,watch_task}.rs`、`docs/m6b-evidence.md` | **已达成**（真机）：`Preset inode -> 'x'` → `Preset 'a' -> 'b'` → `preset applied writes=16`（与 M4 同 16 条）；`auto` 走 perapp；未定义值报上游原串；hint 字节 `transitioned=true`；`log.level` info/debug 双验；SIGTERM 干净 |
+| **M6c** 🚧 | `atrace`（marker 载荷未知）、`modules.input.*` 接入、`pinned`+top-app 真机路径 | — | 见 `docs/m6b-evidence.md` §5/§8 |
+| **M7** | 整机替换 `magisk/bin/uperf`、真机装 `libsfanalysis.so` 观察 hint 生产端与 atrace marker | 可发布的 Magisk zip | §10.4 全部 7 张基线通过；§1 成功判据全绿 |
 
 M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（config/sysfs/governor/sched 互相独立）。
 
@@ -534,6 +535,12 @@ M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（conf
 | **`comm` 被截断到 15 字符**（`com.android.launcher3` → `com.android.lau`） | **已知**：`/MAIN_THREAD/` 用观测到的 `comm` 替换，因此自洽（pattern 与线程名同源） | `docs/m6-sched-evidence.md` §7 |
 | **无 CAP_SYS_NICE 时不能把调度类"升"回去**（NORMAL→IDLE 可以，IDLE→NORMAL EPERM） | **已解**（内核真实规则，非沙箱怪癖）；host 单测按此写成"接受两种结果" | `docs/m6-sched-evidence.md` §6 |
 | `/proc/<tid>/stat` 字段 18 是 `priority`(=20+nice)，**nice 是字段 19** | **已解**：曾读 index 15 得到 25（nice=5 时） | `docs/m6-sched-evidence.md` §6 |
+| **`atrace` 的 marker 载荷** | **UNKNOWN**：二进制有 `AtraceSwitcher`、两个 `trace_marker` 路径、失败串 `Failed to open tracemark for atrace`，但**没有任何 marker 字面量**（运行时构造），且 sdm888 里 `enable=false`。只实现 open() 无任何可观测行为，故**不交付空壳** | `docs/m6b-evidence.md` §5；M7 装真模块 + 抓 trace 观察 |
+| **`sfanalysis.hint` 的生产端路径** | **UNKNOWN**：`libsfanalysis.so` 里**没有任何路径串**（只有 `/proc/<pid>/comm|stat`、`/proc/self/maps`、`/system/bin/surfaceflinger`），生产端必然另经他途取得路径。消费端按 `<config 目录>/sfanalysis.hint` 实现（[I]） | `docs/m6b-evidence.md` §8 |
+| **`modules.input.*` 未接入** | **已知 parity 缺口**：`swipeThd/gestureThdX/gestureThdY/gestureDelayTime/holdEnterTime` 仍是 vendored `input_listener.cpp` 的硬编码默认值（`0.01/0.03/0.03/2.0/1.0`），而二进制里这 5 个键**确实存在**（上游会读）。sdm888 的值恰好等于默认值，所以本机看不出来，其他配置会有差异 | 因阈值是 private 且无 setter，改它必须动 `cpp/dfps/**`（违反 M0 的"零改动"不变量）。M7 二选一：(a) 加 setter 并在 `DFPS_VENDOR.md` 记录该 diff；(b) 在 `cpp/uperf/` 侧重写 InputListener |
+| **`auto` 的语义** | [I]：`cur_powermode.txt` 的合法值之一但非预设名；二进制有 `Internal perapp switcher {}`/`Internal perapp switcher cannot be enabled`，故读作"交给 perapp 规则" | `docs/m6b-evidence.md` §1 |
+| **`UPERF_FAKE_ROOT` 只覆盖 sysfs 写入** | **已知**：`sched_setaffinity`/`sched_setscheduler` 是 syscall，无路径可重定向。真机调度测试必须同时设 `UPERF_SCHED_DRY_RUN=1` | `docs/m6b-evidence.md` §7 |
+| **`/sdcard` 下 `unlink` 对 root 静默失效**（`rm` 返回 0 但文件仍在） | **已解**：走底层 `/data/media/0/...` 删除即可（FUSE 视图同步清除）。这也解释了为何 5 份配置用 `/data/media/0/Android/yc/uperf/...` 而非 `/sdcard/...` | `docs/m6b-evidence.md` §7 |
 | **`offscreen.state` 在 alioth 上从未触发**：vendored 判据是 `/dev/cpuset/restricted` pid 数 > 10，而该集合在本机恒为 0 | **已解（M1 真验）**——电源键物理熄屏后 `restricted` 立即从 0 涨到 221，`Rust: offscreen.state = true` 出现。`input keyevent 26` 在某些场景下不会真正熄屏，必须真的按电源键。 |
 | `/dev/cpuset` 在本机是 **cgroup v1 形态**（有 `tasks`/`notify_on_release`），`/sys/fs/cgroup` 是 v2（只有 `apps`/`system`） | **已解（静态+真机）**——v3 二进制只读 `tasks`，写 `cpus`（不是 `tasks`！），fd 15-19 = `cpuset/{background,foreground,restricted,system-background,top-app}/cpus`，所以 cgroup v1 是真视图。**M3 的 sysfs 写入器必须新增 cpuset cpus (cpu mask) 子类型。** |
 | `topapp.pkgName` 的 `|Δpid| > 10` 门槛（`TOP_TASK_NR_DIFF_MIN`）是否与原版一致 | **已解**——dfps vendored `topapp_monitor.cpp` 与原版同源，原版**不复写**该模块，门槛=10 与 dfps 一致 |

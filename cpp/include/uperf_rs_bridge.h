@@ -42,6 +42,8 @@ const uperf_bridge_t *uperf_bridge_handle(void);
 void                  uperf_bridge_write_log(const char *tag, const char *msg, size_t len);
 int                   uperf_bridge_subscribe(const char *topic);
 void                  uperf_bridge_init_rust(const char *config_path, const char *log_path);
+// `modules.log.level`; called from Rust once the config is parsed.
+void                  uperf_bridge_set_log_level(const char *level);
 
 #ifdef __cplusplus
 }

@@ -79,4 +79,6 @@ pub(crate) static DISPATCH_TX: OnceLock<Sender<Event>> = OnceLock::new();
 
 extern "C" {
     pub(crate) fn uperf_bridge_write_log(tag: *const c_char, msg: *const c_char, len: usize);
+    /// `modules.log.level` — applied from Rust once the config is parsed.
+    pub(crate) fn uperf_bridge_set_log_level(level: *const c_char);
 }

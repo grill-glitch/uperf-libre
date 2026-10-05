@@ -19,8 +19,10 @@
 
 pub mod cpu_task;
 pub mod ffi;
+pub mod inotify;
 pub mod sched_apply;
 pub mod sched_task;
+pub mod watch_task;
 pub mod hint;
 pub mod orchestrator;
 pub mod sysfs;
@@ -112,6 +114,15 @@ pub(crate) extern "C" fn uperf_rs_start(
     let log = unsafe { CStr::from_ptr(log_path) };
 
     let (loaded_cfg, mode) = load_config_and_mode(&cfg.to_string_lossy());
+
+    // Apply `modules.log.level` (upstream's LogLevelSwitcher). Every shipped
+    // config sets "info"; the logger used to be hardcoded to debug.
+    if let Some(level) = loaded_cfg.as_ref().and_then(|c| c.log_level()) {
+        if let Ok(lv) = std::ffi::CString::new(level.clone()) {
+            // SAFETY: NUL-terminated, read only for the duration of the call.
+            unsafe { crate::ffi::uperf_bridge_set_log_level(lv.as_ptr()) };
+        }
+    }
     let has_cfg = loaded_cfg.is_some();
     let cfg_for_governor = loaded_cfg.clone();
     {
@@ -173,8 +184,29 @@ pub(crate) extern "C" fn uperf_rs_start(
         }
     }
 
+    // Start the file watcher: cur_powermode.txt / perapp_powermode.txt preset
+    // switching and the single-byte sfanalysis.hint feed.
+    if let Some(c) = cfg_for_governor.as_ref() {
+        if let Some(orch) = ORCHESTRATOR.get().cloned() {
+            let cfg_path = cfg.to_string_lossy().to_string();
+            let plan = watch_task::WatchPlan::from_config(c, std::path::Path::new(&cfg_path));
+            let fake_root = std::env::var("UPERF_FAKE_ROOT").ok();
+            let mut guard = watch_task_slot().lock();
+            if let Some(mut prev) = guard.take() {
+                prev.stop();
+            }
+            *guard = Some(watch_task::WatchTask::spawn(
+                plan,
+                orch,
+                fake_root,
+                |m: &str| log_msg(m),
+            ));
+            log_msg("Rust: preset/hint watcher started");
+        }
+    }
+
     log_msg(&format!(
-        "uperf_rs_start: cfg={} log={} (M4 orchestrator+governor+sched, mode={}, config_loaded={})",
+        "uperf_rs_start: cfg={} log={} (M4 orchestrator+governor+sched+watch, mode={}, config_loaded={})",
         cfg.to_string_lossy(),
         log.to_string_lossy(),
         mode,
@@ -211,6 +243,12 @@ pub(crate) extern "C" fn uperf_rs_stop() {
             t.stop();
         }
     }
+    {
+        let mut guard = watch_task_slot().lock();
+        if let Some(mut t) = guard.take() {
+            t.stop();
+        }
+    }
     log_msg("uperf_rs_stop: dispatcher joined");
 }
 
@@ -218,6 +256,11 @@ static DISPATCHER: OnceLock<PMutex<Option<Dispatcher>>> = OnceLock::new();
 static ORCHESTRATOR: OnceLock<Arc<PMutex<Orchestrator>>> = OnceLock::new();
 static CPU_TASK: OnceLock<PMutex<Option<cpu_task::CpuTask>>> = OnceLock::new();
 static SCHED_TASK: OnceLock<PMutex<Option<sched_task::SchedTask>>> = OnceLock::new();
+static WATCH_TASK: OnceLock<PMutex<Option<watch_task::WatchTask>>> = OnceLock::new();
+
+fn watch_task_slot() -> &'static PMutex<Option<watch_task::WatchTask>> {
+    WATCH_TASK.get_or_init(|| PMutex::new(None))
+}
 
 fn sched_task_slot() -> &'static PMutex<Option<sched_task::SchedTask>> {
     SCHED_TASK.get_or_init(|| PMutex::new(None))
