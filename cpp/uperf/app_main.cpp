@@ -155,6 +155,11 @@ static void AppMain(void) {
 
 static void AppSigHandler(int sig) {
     if (sig == TERM_SIG) {
+        // Stop the Rust engine before exiting. The CPU governor runs in
+        // "userspace" mode, i.e. it has taken frequency scaling away from the
+        // kernel; if we exit without uperf_rs_stop() the policies stay pinned to
+        // the last published frequency forever. uperf_rs_stop() disarms them.
+        uperf_rs_stop();
         exit(EXIT_SUCCESS);
     }
     exit(EXIT_FAILURE);
@@ -202,7 +207,17 @@ static void DaemonSigHandler(int signum) {
             break;
         case SIGTERM:
         case SIGINT:
-            SPDLOG_INFO("Terminated by user");
+            // Take the worker down with us. dfps' original handler just exited,
+            // which orphaned the (forked) worker — and an orphaned worker keeps
+            // the CPU governor armed, leaving every policy stuck in `userspace`.
+            SPDLOG_INFO("Terminated by user, stopping worker");
+            if (new_pid) {
+                kill(new_pid, TERM_SIG);
+            }
+            if (old_pid && old_pid != new_pid) {
+                kill(old_pid, TERM_SIG);
+            }
+            Sleep(SToUs(0.5)); // let the worker run uperf_rs_stop()
             exit(EXIT_SUCCESS);
         default:
             break;

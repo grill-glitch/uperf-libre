@@ -344,6 +344,49 @@ touch   -> idle     : 超时或渲染结束
 能耗模型（`modules.cpu.powerModel[]`，按集群顺序，字段：`efficiency / nr / typicalPower / typicalFreq / sweetFreq / plainFreq / freeFreq`）；
 **典型频点不是调频上限**，高于 `typicalFreq` 用外插。
 
+#### 8.4.1 能耗模型已解出（精确闭式）[V]
+
+用上游二进制启动时自己打印的 25 组 `opp <freq> pwr <x> cost <y>` 反推得到
+（`docs/m5-cpu-governor.md` §1）：
+
+```
+x = freq_GHz / typicalFreq;   Rp = plainFreq/typicalFreq;   Rs = sweetFreq/typicalFreq
+ratio(x) =  x<Rp: Rs·Rp·x   |   x<Rs: Rs·x²   |   x≥Rs: x³
+power = typicalPower · ratio(x)                  [W/核]
+cost  = power / ((efficiency/100) · freq_GHz)    [W / 相对GHz]
+```
+
+25/25 组上游数值全部复现到 < 0.0015（`uperf-config/src/cpu.rs` 的黄金测试）。
+`freeFreq` 不出现在曲线拟合里（README 说它是"最低功耗频点"，是容量下界的语义）。
+
+#### 8.4.2 控频通道（真机实测）[V]
+
+`scaling_max_freq` 在本内核是**驱动级只读**（mode 444；root 也 EACCES，无 AVC 记录），
+`scaling_driver = qcom-cpufreq-hw`。上游 8 种 `CpufreqWriter*` 全要 min-freq 节点，全部打不开
+→ **原版 uperf v3 在 alioth 上根本控不了频，`No CpufreqWriter supported for this platform` 直接退出**。
+
+可用通道是 `scaling_governor=userspace` + `scaling_setspeed`（实测逐档跟随）。
+代价：这是**完全接管**（内核不再自行调频，必须每周期发布目标），且进程若未 disarm 就消失，
+policy 会永久停在最后写入的频点。因此 `cpp/uperf/app_main.cpp` 已修：
+worker 收到 `TERM_SIG` 先调 `uperf_rs_stop()`（disarm + 还原 governor），
+daemon 的 `SIGTERM/SIGINT` 分支改为先给 worker 发信号再退出（原版直接 `exit()`，会留孤儿 worker）。
+
+#### 8.4.3 实现与近似
+
+* 功耗预算分配：受限时给**有负载**的集群取"边际成本（W/相对GHz）低于共同上限"的最高档，
+  二分该上限使总有功落在 `limit` 内 —— 边际成本相等即"限定功耗下总容量最大"的 KKT 条件，是我的读法 [I]；
+* 功耗归因：`cluster_power_at_khz × 集群负载`（只有忙核耗电）。曾用无条件空载底值，
+  叠加 `limitEfficiency` 把空载集群顶在高档后吃掉大半 PL1，把满载 cluster0 压到 403 kHz [V]；
+* 升频延迟：每周期最多升/降一档，`predict` 触发时直接跳到目标 —— 复现 README 说的
+  "离散采样导致实测延迟总大于 latencyTime"，**不声称与上游逐 tick 一致** [I]；
+* OPP 候选集：上游只打印了设备表的一个子集，规则拟合不出来（不是成本去重/凸包/阈值），
+  疑为当时抓取残缺 [U]。本实现用**全量**设备 OPP 表（是上游可选集的超集）。
+
+真机验收数据（`config/sdm888.json` / balance / idle，PL1=1.0W）：
+空载 c0≈0.88GHz、c1=1574400、c2=1747200（`limitEfficiency` 语义）、pool=15.00；
+把 4 个 spinner 用 `taskset 0f` 钉在 cpu0-3 → c0 目标 **1612800 kHz**（0.216W×4=0.864W ≤ 1.0W，
+下一档 1708800 是 1.028W > 1.0W，正是 PL1 下最高可行档），c1/c2 空闲不受影响；撤载后回落 883200、池回满。
+
 ### 8.5 上下文调度器（`modules.sched`）
 
 * `cpumask`：名字 → CPU id 列表。
@@ -451,8 +494,10 @@ uperf-cli plan   <config.json> <mode> <scene>   # 层叠后的键值 + 来源（
 | **M1** ✅ | Rust staticlib 骨架 + C ABI 桥跑通 | `rust/uperf-core/`（Cargo.toml + lib.rs + ffi.rs + topic_dispatch.rs + tests/）、`cpp/uperf/bridge.cpp`、`cpp/include/uperf_rs_bridge.h` | **已达成**（2026-10-05，alioth）：`build.sh check` 全绿；10/10 payload 解码单元测试通过；**真机过**：C++/Rust 同步出现 `EventTap:` / `[Rust] Rust: ...` 两份日志，pid list 预览(8/8)字节相等；电源键触发 `offscreen.state=true`，**officially§12.2 第 1 条已解** |
 | **M2** 🚧 | 配置系统 + `uperf-cli parse/warn/plan`；38 份配置全部解析 | `rust/uperf-cli/`、`docs/upstream-configs/`、`docs/m2-evidence.md` | **部分达成**：38/38 配置解析通过、`warn` 零误报；`plan` 已出层叠结果。待做：`plan` 的 sysfs 路径展开（需 M3 writer）、与原版日志文案逐条对账 |
 | **M3** 🚧 | hint FSM + sysfs writer dispatch | `rust/uperf-core/src/hint.rs`、`rust/uperf-core/src/sysfs.rs`、`docs/m3-evidence.md` | **已达成（构建+fd 验证）**：`SfHint` 枚举（0..5）匹配上游 binary；dispatch 表覆盖 13/14 个真实 device fd；`uperf-cli plan` 与上游 v3 在 alioth 上的 sysfs 写入路径一一对应；待做：把 hint FSM 接入 dispatch loop（事件→hint transition→`plan_scene`→真写）+ UFSmax 这类 SoC 专属 hex 路径发现 |
-| **M4** 🚧 | 事件→hint→config→sysfs 写入链路；CPU 调频器 + 上下文调度器 | `rust/uperf-config/`、`rust/uperf-core/src/{hint,orchestrator}.rs`、`docs/m4-evidence.md` | **链路已达成**（真机）：16 条 sysfs 写入计划与配置路径逐字一致，fake-root 16 文件落地。**待做**：真 sysfs 写入（fd 缓存 + 重试）、CPU 调频器数值模型、context scheduler |
-| **M5** | sfanalysis 监听 + anim/log/atrace；整机替换 `magisk/bin/uperf` | 可发布的 Magisk zip | §10.4 全部 7 张基线通过；§1 成功判据全绿 |
+| **M4** ✅ | 事件→hint→config→sysfs 写入链路 | `rust/uperf-config/`、`rust/uperf-core/src/{hint,orchestrator}.rs`、`docs/m4-evidence.md` | **已达成**（真机）：16 条 sysfs 写入计划与配置路径逐字一致，fake-root 16 文件落地 |
+| **M5a** ✅ | CPU 调频器：能耗模型 + 负载采样 + 功耗限制 + 真机控频 | `rust/uperf-config/src/{cpu,governor,gov_build,freq_target,proc_stat}.rs`、`rust/uperf-core/src/cpu_task.rs`、`docs/m5-cpu-governor.md` | **已达成**（alioth）：25/25 上游 `pwr/cost` 黄金值复现；真机 `userspace`+`setspeed` 控频生效；PL1=1.0W 下满载小核贴上限 1612800 kHz；撤载回落；SIGTERM 干净 disarm |
+| **M5b** 🚧 | sfanalysis 监听 + anim/log/atrace；上下文调度器（PCRE2）；`cur_powermode.txt` 热切换 | — | 未开始 |
+| **M6** | 整机替换 `magisk/bin/uperf` | 可发布的 Magisk zip | §10.4 全部 7 张基线通过；§1 成功判据全绿 |
 
 M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（config/sysfs/governor/sched 互相独立）。
 
@@ -483,7 +528,10 @@ M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（conf
 | **stale `libuperf_core.a` 导致 ABI 错位崩溃** | 已修（工程性坑） | 症状：进程 `SIGSEGV` @ `memcpy(src=0x79,len=120)`；根因：改了 Rust 侧 FFI 签名但 `.a` 未重编，C++ 把 `len` 当指针。修法：`build.sh make` 现在**先跑 cargo 再 cmake**（见 `build.sh::build_rust`） |
 | v3 的 Hint 命名与日志文案（v2 文档不可信） | UNKNOWN | 以原版真机日志为准（M2 起逐条采集） |
 | `.data` 4 条不透明记录 | UNKNOWN | 不影响本项目（不重写该库） |
-| 原版 `CpufreqWriter` 各平台子类的确切分支条件 | 部分未知 | 用 63 份配置反推 + 真机写入对照 |
+| 原版 `CpufreqWriter` 各平台子类的确切分支条件 | **已解**（机制层面）：8 个候选子类全部要求一个 **min-freq 节点**（`epic minfreq`/`msm minfreq`/`scaling min`），在 alioth 上全被驱动锁死 → 原版直接 `No CpufreqWriter supported for this platform` 退出。本实现改走 `scaling_governor=userspace` + `scaling_setspeed`（实测可用），见 §8.4.2 | 已记录 `docs/m5-cpu-governor.md` §2 |
+| **上游打印的 OPP 列表是设备表的子集**（cluster0 打了 9/17），规则拟合不出（非成本去重/非凸包/非功率阈值） | **UNKNOWN**（疑为当时抓取残缺） | 本实现用**全量**设备 OPP 表（上游可选集的超集），不影响可达频点范围 |
+| 上游功耗受限时的**分配规则**（是否也做边际成本等值） | UNKNOWN | 本实现按"边际成本相等 = 限定功耗下总容量最大"实现，属读法 [I]，非字节级对齐 |
+| `SIGKILL` 情况下 governor 不会被 disarm（`scaling_max_freq` 驱动级只读，无从外部救援） | **已知隐患** | 进程内不可解（SIGKILL 后无代码可执行）；须由 magisk 模块的 `uninstall.sh`/启动自检还原 governor，**未实现** |
 | `context_scheduler` 的原版默认规则效果 | 已文档化但未实测 | §10.4 场景对齐 |
 | UGT 的 `asoulopt.zip` / `miui_migt.sh` / `platform_special.sh` / MTK 功耗表 | 不属本项目 | 原样保留，不解析 |
 

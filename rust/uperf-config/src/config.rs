@@ -44,7 +44,7 @@ pub enum CfgError {
 
 /// Top-level structure. We deliberately do NOT use `serde(deny_unknown_fields)` —
 /// the upstream `uperf.cpp` warns about unknown module keys but accepts them.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Config {
     pub meta: Meta,
     pub modules: Modules,
@@ -64,7 +64,7 @@ pub struct Meta {
 /// `modules`: { switcher, atrace, sfanalysis, sysfs, sched, cpu, anim, input, log, … }
 /// Plus a free-form `extras` list for unknown module blocks so the warn tool
 /// can flag them.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Modules {
     pub switcher: Option<Map<String, Value>>,
     pub atrace: Option<Map<String, Value>>,
@@ -80,7 +80,7 @@ pub struct Modules {
 
 /// `presets.<name>`: flat map of `<scene>` → `{<mod>.<param>: <value>}`. `*` is
 /// the wildcard scene (preset default).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Preset {
     pub scenes: BTreeMap<String, Map<String, Value>>, // scene name → overrides
 }
