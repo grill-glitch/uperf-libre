@@ -225,6 +225,27 @@ impl Config {
             .map(str::to_string)
     }
 
+    /// `modules.input` thresholds the vendored `InputListener` needs.
+    ///
+    /// Returns `(swipeThd, gestureThdX, gestureThdY)`. `gestureDelayTime` and
+    /// `holdEnterTime` are deliberately absent: `config/README.md` lines 99-100
+    /// document both as 暂不使用 (unused), so the vendored listener's own values
+    /// for them are already correct.
+    pub fn input_thresholds(&self) -> Option<(f32, f32, f32)> {
+        let m = self.modules.input.as_ref()?;
+        let f = |k: &str| m.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
+        Some((f("swipeThd")?, f("gestureThdX")?, f("gestureThdY")?))
+    }
+
+    /// `modules.input.enable`. All 63 shipped configs set it true.
+    pub fn input_enabled(&self) -> Option<bool> {
+        self.modules
+            .input
+            .as_ref()
+            .and_then(|m| m.get("enable"))
+            .and_then(|v| v.as_bool())
+    }
+
     /// The config's `presets` keys, **alphabetically** (they are stored in a
     /// `BTreeMap`, so this is not the JSON order). Only used to validate a
     /// referenced preset name, where order is irrelevant.

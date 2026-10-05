@@ -148,6 +148,23 @@ pub(crate) extern "C" fn uperf_rs_start(
         bridge.subscribe(topic);
     }
 
+    // Apply `modules.input.*` to the vendored InputListener. This is the one place
+    // the rewrite reaches into a vendored module, because dfps hardcodes these
+    // three thresholds while uperf reads them (README lines 96-98) — 62 of the 63
+    // configs ask for swipeThd 3x the hardcoded value.
+    if let Some(c) = cfg_for_governor.as_ref() {
+        if c.input_enabled() == Some(false) {
+            log_msg(
+                "Rust: modules.input.enable=false is not honoured (the listener is started by the \
+                 platform layer before the config is parsed)",
+            );
+        }
+        if let Some((swipe, gx, gy)) = c.input_thresholds() {
+            // SAFETY: plain scalars across the C ABI.
+            unsafe { crate::ffi::uperf_bridge_set_input_thresholds(swipe, gx, gy) };
+        }
+    }
+
     // Start the userspace CPU governor: samples /proc/stat, runs the power-model
     // loop and publishes per-cluster frequency targets.
     if let Some(c) = cfg_for_governor.as_ref() {
@@ -310,7 +327,11 @@ fn dispatcher_slot() -> &'static PMutex<Option<Dispatcher>> {
 }
 
 fn log_msg(s: &str) {
-    let mut buf = log_buf().lock().unwrap();
+    // `try_lock`, not `lock`: this is on the shutdown path, and a signal handler
+    // can re-enter that path (SIGTERM plus the supervisor's SIGUSR1). A plain
+    // `lock()` deadlocks against itself there and the process never exits,
+    // leaving the CPU governor armed. A dropped log line beats a hung daemon.
+    let Ok(mut buf) = log_buf().try_lock() else { return };
     buf.clear();
     buf.extend_from_slice(s.as_bytes());
     buf.push(b'\n');
@@ -324,4 +345,46 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+#[cfg(test)]
+mod shutdown_reentrancy_tests {
+    use super::*;
+
+    /// Regression for the deadlock that made `killall uperf` leave the device
+    /// pinned in `userspace`.
+    ///
+    /// `killall` delivers SIGTERM to the daemon and the worker at once, and the
+    /// daemon's own handler then forwards SIGUSR1 to the worker — so the shutdown
+    /// path runs twice, concurrently, on the same thread. Both runs log, and the
+    /// shared line buffer is a plain `Mutex`, which is not reentrant: the second
+    /// `lock()` blocked on the first and the process never exited.
+    ///
+    /// This test reproduces the shape exactly — hold the buffer, then log — so a
+    /// future change back to `lock()` hangs here instead of on a phone.
+    #[test]
+    fn logging_never_blocks_when_the_buffer_is_already_held() {
+        let guard = log_buf().lock().unwrap();
+        log_msg("reentrant log line: must be dropped, not blocked on");
+        drop(guard);
+        // Still usable afterwards.
+        log_msg("after the guard is released");
+    }
+
+    /// The same guarantee for the per-module log helpers, which each own their own
+    /// static buffer.
+    #[test]
+    fn concurrent_logging_completes() {
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    for n in 0..200 {
+                        log_msg(&format!("thread {i} line {n}"));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("a logging thread must not panic or hang");
+        }
+    }
 }

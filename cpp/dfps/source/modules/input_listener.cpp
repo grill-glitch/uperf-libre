@@ -60,6 +60,14 @@ InputListener::InputListener() : cancelPollFd_(-1), prevBtn_(0), swipeDist_(0.0)
 
 InputListener::~InputListener() {}
 
+// ADDED FOR THE UPERF REWRITE — see the declaration in the header and
+// cpp/dfps/DFPS_VENDOR.md. Values come from `modules.input` in the config.
+void InputListener::SetThresholds(float swipeThd, float gestureThdX, float gestureThdY) {
+    swipeThd_ = swipeThd;
+    gestureThdX_ = gestureThdX;
+    gestureThdY_ = gestureThdY;
+}
+
 void InputListener::Start(void) {
     using namespace std::placeholders;
     auto inoti = Inotifier::GetInstance();

@@ -81,4 +81,11 @@ extern "C" {
     pub(crate) fn uperf_bridge_write_log(tag: *const c_char, msg: *const c_char, len: usize);
     /// `modules.log.level` — applied from Rust once the config is parsed.
     pub(crate) fn uperf_bridge_set_log_level(level: *const c_char);
+    /// `modules.input.{swipeThd,gestureThdX,gestureThdY}` — applied from Rust once
+    /// the config is parsed, to the listener the platform layer registered.
+    pub(crate) fn uperf_bridge_set_input_thresholds(
+        swipe_thd: f32,
+        gesture_thd_x: f32,
+        gesture_thd_y: f32,
+    );
 }

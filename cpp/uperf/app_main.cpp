@@ -121,7 +121,14 @@ static void StartPlatform(void) {
 
     static std::vector<std::unique_ptr<ModuleBase>> modules;
     modules.emplace_back(std::make_unique<M0EventTap>());
-    modules.emplace_back(std::make_unique<InputListener>());
+    // Register before pushing: Rust applies `modules.input.*` to this instance
+    // once it has parsed the config (the listener's thresholds are hardcoded in
+    // the vendored dfps ctor).
+    {
+        auto inputListener = std::make_unique<InputListener>();
+        uperf_register_input_listener(inputListener.get());
+        modules.emplace_back(std::move(inputListener));
+    }
     modules.emplace_back(std::make_unique<CgroupListener>());
     modules.emplace_back(std::make_unique<TopappMonitor>());
     modules.emplace_back(std::make_unique<OffscreenMonitor>());
@@ -157,18 +164,53 @@ static void AppMain(void) {
 // ---------------------------------------------------------------- supervisor (dfps)
 
 static void AppSigHandler(int sig) {
-    if (sig == TERM_SIG) {
-        // Stop the Rust engine before exiting. The CPU governor runs in
-        // "userspace" mode, i.e. it has taken frequency scaling away from the
-        // kernel; if we exit without uperf_rs_stop() the policies stay pinned to
-        // the last published frequency forever. uperf_rs_stop() disarms them.
-        uperf_rs_stop();
-        exit(EXIT_SUCCESS);
+    // Block the shutdown signals for the duration of the handler.
+    //
+    // Without this the handler re-enters: `killall uperf` delivers SIGTERM to the
+    // daemon AND the worker at the same time, and the daemon's own handler then
+    // also sends SIGUSR1 to the worker. Two concurrent runs of the shutdown path
+    // fight over the same non-reentrant log mutex (Rust's global line buffer and
+    // spdlog's sink lock), deadlock, and the process never exits — leaving the CPU
+    // governor armed in `userspace` mode. Observed on device: `killall uperf` left
+    // two processes alive with `governors: userspace userspace userspace`.
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, TERM_SIG);
+    sigaddset(&block, SIGTERM);
+    sigaddset(&block, SIGINT);
+    sigprocmask(SIG_BLOCK, &block, nullptr);
+
+    switch (sig) {
+        case TERM_SIG:
+        case SIGTERM:
+        case SIGINT:
+            // Stop the Rust engine before exiting. The CPU governor runs in
+            // "userspace" mode, i.e. it has taken frequency scaling away from the
+            // kernel; if we exit without uperf_rs_stop() the policies stay pinned
+            // to the last published frequency forever. uperf_rs_stop() disarms
+            // them.
+            //
+            // SIGTERM/SIGINT must be handled here, not only TERM_SIG: the worker
+            // inherits the *daemon's* SIGTERM handler (SetSigHandler only replaced
+            // TERM_SIG), and the daemon's handler just exits — so a plain
+            // `killall uperf`, which is exactly what the module's own
+            // `uperf_stop()` does, killed the worker without disarming the
+            // governor. uperf_rs_stop() is idempotent, so a daemon-then-worker
+            // sequence is fine.
+            uperf_rs_stop();
+            exit(EXIT_SUCCESS);
+        default:
+            exit(EXIT_FAILURE);
     }
-    exit(EXIT_FAILURE);
 }
 
-static void SetSigHandler(void) { signal(TERM_SIG, AppSigHandler); }
+static void SetSigHandler(void) {
+    signal(TERM_SIG, AppSigHandler);
+    // Replace the inherited daemon handler: a direct SIGTERM to a worker (e.g.
+    // `killall uperf`) must run the same cleanup, not the supervisor's exit path.
+    signal(SIGTERM, AppSigHandler);
+    signal(SIGINT, AppSigHandler);
+}
 
 static void StartNewApp(void) {
     new_pid = fork();
