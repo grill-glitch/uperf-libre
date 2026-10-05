@@ -2,6 +2,7 @@
 <resources>
     <string name="tab_home">Home</string>
     <string name="tab_mode">Mode</string>
+    <string name="tab_dfps">Refresh rate</string>
     <string name="tab_more">More</string>
     <string name="state_unknown">Reading…</string>
     <string name="state_running">Running</string>
@@ -63,4 +64,12 @@
     <string name="preset_crazy">Extreme</string>
     <string name="preset_auto">Auto</string>
     <string name="preset_defined">Defined by the loaded config</string>
+    <string name="dfps_cur_title">Current refresh rate</string>
+    <string name="section_dfps_rules">Rules</string>
+    <string name="dfps_idle">idle</string>
+    <string name="dfps_active">active</string>
+    <string name="dfps_prompt_idle">New idle Hz for {pkg} (was {idle})</string>
+    <string name="dfps_prompt_active">New active Hz for {pkg} (was {active})</string>
+    <string name="toast_rule_ok">Rule for {pkg} updated</string>
+    <string name="toast_rule_fail">Failed to update rule: {err}</string>
 </resources>

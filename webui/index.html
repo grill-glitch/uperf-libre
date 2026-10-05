@@ -70,7 +70,23 @@
                 </div>
             </div>
 
-            <!-- ------------------------------------------------ 3. 更多 -->
+            <!-- ------------------------------------------------ 3. 刷新率 (dfps) -->
+            <div id="dfps-page" class="page">
+                <div class="page-content">
+                    <div class="card current-card">
+                        <md-icon class="leading-icon" id="dfps-cur-icon"></md-icon>
+                        <div class="card-text">
+                            <div class="card-title" id="dfps-cur-label" data-i18n="dfps_cur_title">Current refresh rate</div>
+                            <div class="card-subtitle" id="dfps-cur">—</div>
+                            <div class="card-subtitle" id="dfps-config-path"></div>
+                        </div>
+                    </div>
+                    <div class="section-label" data-i18n="section_dfps_rules">Rules</div>
+                    <div class="preset-list" id="dfps-rules"></div>
+                </div>
+            </div>
+
+            <!-- ------------------------------------------------ 4. 更多 -->
             <div id="more-page" class="page">
                 <div class="page-content">
                     <div class="card list-card">
@@ -119,6 +135,10 @@
             <div class="bottom-bar-item" id="mode">
                 <md-icon class="bottom-icon" data-icon="tune"></md-icon>
                 <div class="bottom-bar-item-text" data-i18n="tab_mode">模式切换</div>
+            </div>
+            <div class="bottom-bar-item" id="dfps">
+                <md-icon class="bottom-icon" data-icon="speed"></md-icon>
+                <div class="bottom-bar-item-text" data-i18n="tab_dfps">刷新率</div>
             </div>
             <div class="bottom-bar-item" id="more">
                 <md-icon class="bottom-icon" data-icon="more_horiz"></md-icon>
