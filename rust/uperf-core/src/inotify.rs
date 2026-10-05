@@ -61,11 +61,21 @@ impl Inotify {
     pub fn watch(&mut self, path: &Path) -> io::Result<()> {
         if let Some(dir) = path.parent() {
             if let Ok(dc) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) {
-                let dmask = libc::IN_CREATE
-                    | libc::IN_MOVED_TO
-                    | libc::IN_CLOSE_WRITE
-                    | libc::IN_MODIFY
-                    | libc::IN_DELETE;
+                // STRUCTURAL changes only: a file appearing, being renamed into
+                // place, or being removed. `IN_CLOSE_WRITE`/`IN_MODIFY` must NOT be
+                // here.
+                //
+                // The directory we watch is the one holding the preset files — which
+                // is also where the daemon writes its log (`USER_PATH/uperf_log.txt`
+                // sits beside `cur_powermode.txt`). Including content-write events on
+                // the directory made the daemon's own log writes wake the watcher,
+                // which then re-read and logged again: a self-sustaining loop at full
+                // speed. Measured: 1065 ticks/10 s with the log in the watched
+                // directory, **61** with the directory watch restricted to structural
+                // events — a 17x difference, and on a phone that is a core spinning
+                // plus continuous storage writes. Content changes to the files we
+                // actually care about are covered by their own watches.
+                let dmask = libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_DELETE;
                 let dwd = unsafe { libc::inotify_add_watch(self.fd, dc.as_ptr(), dmask) };
                 if dwd >= 0 {
                     self.paths.insert(dwd, dir.to_path_buf());
@@ -260,6 +270,48 @@ mod tests {
         std::fs::write(&f, [4u8]).unwrap();
         let ev = ino.poll(Duration::from_millis(1500)).unwrap();
         assert!(!ev.is_empty(), "creating the file must wake us up: {ev:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A write to a *sibling* file in the watched directory must not produce an
+    /// event. This is the shape that spun a core on device: the daemon's own log
+    /// lives beside the preset files, so content-write events on the directory
+    /// closed a feedback loop with the log.
+    #[test]
+    fn sibling_file_writes_do_not_wake_us() {
+        let d = tmpdir("sibling");
+        let f = d.join("cur_powermode.txt");
+        std::fs::write(&f, "balance\n").unwrap();
+        let mut ino = Inotify::new().unwrap();
+        ino.watch(&f).unwrap();
+        // drain anything from arming
+        let _ = ino.poll(Duration::from_millis(50));
+
+        // a sibling that the daemon also writes (its log)
+        let sibling = d.join("uperf_log.txt");
+        std::fs::write(&sibling, "line 1\n").unwrap();
+        for i in 0..5 {
+            let mut fh = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&sibling)
+                .unwrap();
+            use std::io::Write as _;
+            writeln!(fh, "line {i}").unwrap();
+            drop(fh);
+        }
+        let ev = ino.poll(Duration::from_millis(300)).unwrap();
+        assert!(
+            ev.iter().all(|e| !matches!(e, WatchEvent::Written(p) if p == &sibling)),
+            "a sibling write must not be reported as a watched file: {ev:?}"
+        );
+
+        // ...but the watched file itself still works.
+        std::fs::write(&f, "performance\n").unwrap();
+        let ev = ino.poll(Duration::from_millis(1500)).unwrap();
+        assert!(
+            ev.iter().any(|e| matches!(e, WatchEvent::Written(p) if p == &f)),
+            "the watched file must still wake us: {ev:?}"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

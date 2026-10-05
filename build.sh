@@ -110,19 +110,43 @@ check_uperf() {
     # the original dev-22.09.04 binary links exactly libm/libdl/libc
     local unexpected=$(echo "$needed" | tr ' ' '\n' | grep -vE "^(libm\.so|libdl\.so|libc\.so|)$" | tr '\n' ' ')
     [ -z "$unexpected" ] || { echo " !! unexpected NEEDED libs: $unexpected"; exit 1; }
+
+    # The module tree must contain THIS build. That single assertion covers both
+    # failure modes worth guarding: the closed-source upstream binary still sitting
+    # in magisk/bin/uperf (which is what this project exists to replace), and a
+    # stale copy left behind by an earlier build. Upstream's dev-22.09.04 is
+    # 1461512 bytes; this build is not.
+    local module_bin="$BASEDIR/magisk/bin/uperf"
+    if [ -f "$module_bin" ]; then
+        if ! cmp -s "$module_bin" "$bin"; then
+            echo " !! magisk/bin/uperf differs from the built binary"
+            echo "    module: $(stat -c %s "$module_bin") bytes"
+            echo "    build : $sz bytes"
+            echo "    fix   : sh build.sh $BUILD_TYPE pack"
+            exit 1
+        fi
+        echo "    module bin: magisk/bin/uperf matches this build"
+    else
+        echo " !! magisk/bin/uperf is missing; run 'sh build.sh $BUILD_TYPE pack'"
+        exit 1
+    fi
     [ "$sz" -lt 3145728 ] || { echo " !! binary too large (> 3 MiB)"; exit 1; }
     echo "    -> OK"
 }
 
 pack_uperf() {
-    echo ">>> Packing uperf-magisk.zip (staged copy; the committed magisk/bin/uperf is left untouched)"
+    echo ">>> Packing uperf-magisk.zip"
     rm -rf $STAGE_DIR
     mkdir -p $STAGE_DIR $PKG_DIR
     cp -a $BASEDIR/magisk/. $STAGE_DIR/
     cp -f $BINARY $STAGE_DIR/bin/uperf
     cp -f $BASEDIR/LICENSE $BASEDIR/NOTICE $STAGE_DIR/
     (cd $STAGE_DIR && zip -q -9 -r $PKG_DIR/uperf-magisk.zip .)
+    # Also refresh the in-tree copy, so the repository never carries the
+    # closed-source upstream binary and `check` can assert the two agree.
+    cp -f $BINARY $BASEDIR/magisk/bin/uperf
     echo "    -> $PKG_DIR/uperf-magisk.zip ($(stat -c %s $PKG_DIR/uperf-magisk.zip) bytes)"
+    echo "    -> magisk/bin/uperf refreshed from $BINARY"
 }
 
 push_files() {
@@ -174,9 +198,10 @@ do_task() {
     reboot) reboot_device ;;
     clean) clean ;;
     all)
+        # pack before check: check asserts magisk/bin/uperf matches the build
         make_uperf
-        check_uperf
         pack_uperf
+        check_uperf
         ;;
     *)
         echo " ! Unknown task name $1"

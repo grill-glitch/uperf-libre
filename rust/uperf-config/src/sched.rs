@@ -823,7 +823,8 @@ mod tests {
     fn home_package_substitution_is_unescaped() {
         // A package name's dots must stay regex metacharacters, as the shipped
         // configs rely on (bare `com.android.systemui`, `^com.tencent.mobileqq|...`).
-        let mut p = SchedPlanner::new(sdm888_sched(), "com.miui.home").unwrap();
+        // Only `match_process` is used here, which takes &self.
+        let p = SchedPlanner::new(sdm888_sched(), "com.miui.home").unwrap();
         let re = p.match_process("comXmiuiYhome").map(|r| r.name.clone());
         assert_eq!(
             re.as_deref(),

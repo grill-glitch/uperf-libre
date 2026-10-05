@@ -145,12 +145,13 @@ impl SchedApplier {
     fn apply_proc(&mut self, p: &ProcInfo) -> ScanReport {
         let mut r = ScanReport { procs_seen: 1, ..Default::default() };
         let is_top = self.top_app.as_deref() == Some(p.name.as_str());
-        // The main thread's `comm` is what `/MAIN_THREAD/` substitutes to.
+        // The main thread's `comm` is what `/MAIN_THREAD/` substitutes to. Read it
+        // once per process rather than once per thread.
         let main_comm = p
             .threads
             .iter()
             .find(|t| t.is_main)
-            .map(|t| t.comm.clone())
+            .map(|t| sched_apply::comm_of(p.pid, t.tid))
             .unwrap_or_else(|| p.name.clone());
 
         // Does any rule match this process? (A `"."` catch-all rule means yes for
@@ -166,12 +167,22 @@ impl SchedApplier {
         let scene = self.scene.clone();
         for t in &p.threads {
             r.threads_seen += 1;
+            // Already decided and still in effect: the decision cannot differ
+            // unless the scene/top-app moved (which clears the cache) or the thread
+            // is new. Skipping here avoids a `comm` read plus the whole rule match
+            // for ~3000 settled threads per scan — which is what made the scan cost
+            // more than one CPU core.
+            if self.applied.contains_key(&t.tid) {
+                r.unchanged += 1;
+                continue;
+            }
+            let comm = sched_apply::comm_of(p.pid, t.tid);
             let Some(d) = self.planner.decide(
                 &p.name,
                 is_top,
                 &scene,
                 &main_comm,
-                &t.comm,
+                &comm,
             ) else {
                 continue;
             };
@@ -185,7 +196,7 @@ impl SchedApplier {
                     r.would_change += 1;
                     log_line(&format!(
                         "Rust: sched[DRY] pid={} {:?} tid={} {:?} rule={:?} scene={} ac={} pc={} -> cpus={:?} policy={:?}",
-                        p.pid, p.name, t.tid, t.comm, d.rule, d.scene, d.ac, d.pc, d.cpus, d.policy
+                        p.pid, p.name, t.tid, comm, d.rule, d.scene, d.ac, d.pc, d.cpus, d.policy
                     ));
                 }
                 r.unchanged += 1;
@@ -243,7 +254,7 @@ impl SchedApplier {
             if changed {
                 log_line(&format!(
                     "Rust: sched pid={} {:?} tid={} {:?} rule={:?} scene={} ac={} pc={} -> cpus={:?} policy={:?}",
-                    p.pid, p.name, t.tid, t.comm, d.rule, d.scene, d.ac, d.pc, d.cpus, d.policy
+                    p.pid, p.name, t.tid, comm, d.rule, d.scene, d.ac, d.pc, d.cpus, d.policy
                 ));
                 self.applied.insert(t.tid, want);
             }
@@ -337,9 +348,10 @@ impl SchedTask {
                     } else {
                         idle_ticks += 1;
                     }
-                    // Scan on a state change; otherwise every 4th tick (~1 s), so
-                    // a steady state does not walk /proc at full rate.
-                    if changed || idle_ticks % 4 == 0 {
+                    // Scan on a state change; otherwise every 12th tick (~3 s). A
+                    // steady state has nothing to do — the change cache skips every
+                    // settled thread — so walking /proc more often only burns CPU.
+                    if changed || idle_ticks % 12 == 0 {
                         let r = applier.scan();
                         if r.affinity_changes
                             + r.policy_changes
@@ -463,8 +475,6 @@ mod tests {
     fn unchanged_decision_is_skipped_on_the_second_pass() {
         // Same scene + no top-app change -> the second scan must find nothing to
         // do, which is the whole point of the change cache.
-        let mut a = applier_for_self();
-        a.only = Some(self_name());
         // Everything is a no-op by construction (prio 0, affinity "all"), so use
         // a real policy to make changes observable.
         let cfg = SchedConfig::from_value(&json!({
@@ -475,7 +485,7 @@ mod tests {
             "rules": [{ "name": "self", "regex": self_name(), "pinned": false,
                         "rules": [ { "k": ".", "ac": "ui", "pc": "ui" } ] }]
         })).unwrap();
-        a = SchedApplier::new(SchedPlanner::new(cfg, "com.miui.home").unwrap());
+        let mut a = SchedApplier::new(SchedPlanner::new(cfg, "com.miui.home").unwrap());
         a.only = Some(self_name());
         if a.planner().anomalies().len() > 0 {
             // affinity[ui] has no "idle"/"touch"/"boost" in this synthetic cfg.
@@ -501,9 +511,8 @@ mod tests {
         let mut a = applier_for_self();
         a.only = Some(self_name());
         let _ = a.scan();
-        let before = a.applied.len();
         a.set_scene("touch");
-        assert!(a.applied.is_empty(), "a scene change must drop the cache (was {before})");
+        assert!(a.applied.is_empty(), "a scene change must drop the cache");
     }
 
     #[test]
