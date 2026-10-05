@@ -81,6 +81,12 @@ pub struct Orchestrator {
     mode: String,
     scene: String,
     pending: Vec<SysfsWrite>,
+    /// Package of the process `topapp.pkgName` last reported.
+    top_app: Option<String>,
+    /// Bumped whenever `scene` or `top_app` changes, so the context scheduler
+    /// can tell "something a rule depends on moved" from "a tick went by"
+    /// without polling strings.
+    generation: u64,
 }
 
 impl Orchestrator {
@@ -93,6 +99,8 @@ impl Orchestrator {
             mode: mode.into(),
             scene: "idle".into(),
             pending: Vec::new(),
+            top_app: None,
+            generation: 0,
         }
     }
 
@@ -108,7 +116,23 @@ impl Orchestrator {
             mode: mode.into(),
             scene: "idle".into(),
             pending: Vec::new(),
+            top_app: None,
+            generation: 0,
         }
+    }
+
+    /// Package of the current top app, from `topapp.pkgName` events.
+    ///
+    /// This is what `/HOME_PACKAGE/` does NOT mean: that token is the launcher
+    /// package (upstream logs `Current home is '<pkg>'`), whereas this drives the
+    /// `fg`/`bg` half of a rule's scene. The context scheduler needs both.
+    pub fn top_app(&self) -> Option<&str> {
+        self.top_app.as_deref()
+    }
+
+    /// Monotonic counter for "scene or top app changed".
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn mode(&self) -> &str {
@@ -125,17 +149,25 @@ impl Orchestrator {
     /// new preset for the scene we're currently in.
     pub fn set_mode(&mut self, mode: impl Into<String>) {
         self.mode = mode.into();
+        self.generation += 1;
         self.plan_current_scene();
     }
 
     /// Apply an inbound event. A scene change re-resolves the preset and queues
     /// the corresponding sysfs writes.
     pub fn on_event(&mut self, ev: &crate::topic_dispatch::Event) {
+        if let crate::topic_dispatch::Event::Topapp(pkg) = ev {
+            if self.top_app.as_deref() != Some(pkg.as_str()) {
+                self.top_app = Some(pkg.clone());
+                self.generation += 1;
+            }
+        }
         let incoming = event_to_hint(ev);
         if let Some(transition) = self.hint.process(incoming) {
             let new_scene = Self::scene_for_hint(transition.to);
             if new_scene != self.scene {
                 self.scene = new_scene.to_string();
+                self.generation += 1;
                 self.plan_current_scene();
             }
         }

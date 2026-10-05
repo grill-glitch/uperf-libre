@@ -19,6 +19,8 @@
 
 pub mod cpu_task;
 pub mod ffi;
+pub mod sched_apply;
+pub mod sched_task;
 pub mod hint;
 pub mod orchestrator;
 pub mod sysfs;
@@ -76,11 +78,35 @@ pub(crate) extern "C" fn uperf_rs_init(bridge: *const Bridge) {
     let _ = BRIDGE.set(b);
 }
 
+/// Reset the `SIGCHLD` disposition so `std::process::Command` works from the
+/// worker.
+///
+/// The vendored dfps supervisor installs `signal(SIGCHLD, DaemonSigHandler)` and
+/// that handler calls `wait(2)` to notice a worker dying. The worker is forked
+/// *after* the handler is installed, so it inherits it — and the inherited
+/// handler then reaps children that the worker's own `Command` calls are waiting
+/// for. `Command::output()` fails with `ECHILD` ("No child processes"), which is
+/// exactly what the device dry run reported when resolving the home package:
+///
+/// ```text
+/// Rust: cannot resolve the home package (cmd: spawn failed: No child processes (os error 10))
+/// ```
+///
+/// The worker supervises nothing (the daemon does that), so restoring the default
+/// disposition is safe and is what makes the resolution work.
+fn reset_sigchld_for_command() {
+    // SAFETY: signal() with a plain disposition, no handlers installed here.
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+    }
+}
+
 #[no_mangle]
 pub(crate) extern "C" fn uperf_rs_start(
     config_path: *const libc::c_char,
     log_path: *const libc::c_char,
 ) -> libc::c_int {
+    reset_sigchld_for_command();
     // SAFETY: NUL-terminated per contract.
     let cfg = unsafe { CStr::from_ptr(config_path) };
     let log = unsafe { CStr::from_ptr(log_path) };
@@ -123,8 +149,32 @@ pub(crate) extern "C" fn uperf_rs_start(
         log_msg("Rust: cpu governor started");
     }
 
+    // Start the context scheduler (modules.sched): it resolves each process
+    // through the config's rules and applies affinity / SCHED class per thread.
+    if let Some(c) = cfg_for_governor.as_ref() {
+        if c.modules_map().is_some() {
+            let mut log_fn = |m: &str| log_msg(m);
+            if let Some(planner) = sched_task::SchedTask::planner_for(c, &mut log_fn) {
+                let Some(orch) = ORCHESTRATOR.get().cloned() else {
+                    log_msg("Rust: context scheduler skipped (no orchestrator)");
+                    return 0;
+                };
+                let state = move || {
+                    let g = orch.lock();
+                    (g.current_scene().to_string(), g.top_app().map(str::to_string), g.generation())
+                };
+                let mut guard = sched_task_slot().lock();
+                if let Some(mut prev) = guard.take() {
+                    prev.stop();
+                }
+                *guard = Some(sched_task::SchedTask::spawn(planner, state));
+                log_msg("Rust: context scheduler started");
+            }
+        }
+    }
+
     log_msg(&format!(
-        "uperf_rs_start: cfg={} log={} (M4 orchestrator+governor, mode={}, config_loaded={})",
+        "uperf_rs_start: cfg={} log={} (M4 orchestrator+governor+sched, mode={}, config_loaded={})",
         cfg.to_string_lossy(),
         log.to_string_lossy(),
         mode,
@@ -155,12 +205,23 @@ pub(crate) extern "C" fn uperf_rs_stop() {
             t.stop();
         }
     }
+    {
+        let mut guard = sched_task_slot().lock();
+        if let Some(mut t) = guard.take() {
+            t.stop();
+        }
+    }
     log_msg("uperf_rs_stop: dispatcher joined");
 }
 
 static DISPATCHER: OnceLock<PMutex<Option<Dispatcher>>> = OnceLock::new();
 static ORCHESTRATOR: OnceLock<Arc<PMutex<Orchestrator>>> = OnceLock::new();
 static CPU_TASK: OnceLock<PMutex<Option<cpu_task::CpuTask>>> = OnceLock::new();
+static SCHED_TASK: OnceLock<PMutex<Option<sched_task::SchedTask>>> = OnceLock::new();
+
+fn sched_task_slot() -> &'static PMutex<Option<sched_task::SchedTask>> {
+    SCHED_TASK.get_or_init(|| PMutex::new(None))
+}
 
 fn cpu_task_slot() -> &'static PMutex<Option<cpu_task::CpuTask>> {
     CPU_TASK.get_or_init(|| PMutex::new(None))
