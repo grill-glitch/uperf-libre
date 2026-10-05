@@ -17,6 +17,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod cpu_task;
 pub mod ffi;
 pub mod hint;
 pub mod orchestrator;
@@ -86,6 +87,7 @@ pub(crate) extern "C" fn uperf_rs_start(
 
     let (loaded_cfg, mode) = load_config_and_mode(&cfg.to_string_lossy());
     let has_cfg = loaded_cfg.is_some();
+    let cfg_for_governor = loaded_cfg.clone();
     {
         let mut guard = dispatcher_slot().lock();
         if let Some(mut prev) = guard.take() {
@@ -108,10 +110,25 @@ pub(crate) extern "C" fn uperf_rs_start(
         bridge.subscribe(topic);
     }
 
+    // Start the userspace CPU governor: samples /proc/stat, runs the power-model
+    // loop and publishes per-cluster frequency targets.
+    if let Some(c) = cfg_for_governor.as_ref() {
+        {
+            let mut guard = cpu_task_slot().lock();
+            if let Some(mut prev) = guard.take() {
+                prev.stop();
+            }
+            *guard = cpu_task::CpuTask::spawn(c, &mode, "idle");
+        }
+        log_msg("Rust: cpu governor started");
+    }
+
     log_msg(&format!(
-        "uperf_rs_start: cfg={} log={} (M4: orchestrator wired)",
+        "uperf_rs_start: cfg={} log={} (M4 orchestrator+governor, mode={}, config_loaded={})",
         cfg.to_string_lossy(),
-        log.to_string_lossy()
+        log.to_string_lossy(),
+        mode,
+        has_cfg
     ));
     0
 }
@@ -132,11 +149,22 @@ pub(crate) extern "C" fn uperf_rs_stop() {
     if let Some(mut prev) = guard.take() {
         prev.join_timeout(std::time::Duration::from_secs(2));
     }
+    {
+        let mut guard = cpu_task_slot().lock();
+        if let Some(mut t) = guard.take() {
+            t.stop();
+        }
+    }
     log_msg("uperf_rs_stop: dispatcher joined");
 }
 
 static DISPATCHER: OnceLock<PMutex<Option<Dispatcher>>> = OnceLock::new();
 static ORCHESTRATOR: OnceLock<Arc<PMutex<Orchestrator>>> = OnceLock::new();
+static CPU_TASK: OnceLock<PMutex<Option<cpu_task::CpuTask>>> = OnceLock::new();
+
+fn cpu_task_slot() -> &'static PMutex<Option<cpu_task::CpuTask>> {
+    CPU_TASK.get_or_init(|| PMutex::new(None))
+}
 
 /// Read + parse the config and derive the initial preset.
 ///

@@ -1,0 +1,399 @@
+//! Device-side governor task.
+//!
+//! Reads the real OPP tables + `/proc/stat`, ticks the governor, and turns each
+//! cluster's target into a knob write. Writes go through the same
+//! [`crate::orchestrator::Sink`] the scene writes use, so `UPERF_FAKE_ROOT`
+//! redirects them for offline validation and the real sysfs is untouched until
+//! a later milestone wires the fd-cached writer.
+
+#![allow(dead_code)]
+
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+#[cfg(test)]
+use std::time::Duration;
+
+use uperf_config::{
+    cpu_slices, freq_targets, freq_writes, governor_from_config, parse_stat, Config, FreqTarget,
+    Governor,
+};
+
+/// Root under which sysfs writes are redirected for offline validation.
+fn fake_root() -> Option<String> {
+    std::env::var("UPERF_FAKE_ROOT").ok().filter(|s| !s.is_empty())
+}
+
+/// Rewrite a sysfs path under `UPERF_FAKE_ROOT`, if set.
+fn apply_root(path: &str, root: &Option<String>) -> String {
+    match root {
+        Some(r) => format!("{}{}", r.trim_end_matches('/'), path),
+        None => path.to_string(),
+    }
+}
+
+/// The `userspace` governor writer: arms `scaling_governor = userspace` for each
+/// cluster, drives `scaling_setspeed` every cycle, and restores the original
+/// governors on stop.
+///
+/// This is the only frequency-control mechanism verified to work on alioth
+/// (`qcom-cpufreq-hw` registers `scaling_max_freq` read-only). It is a *full
+/// takeover*: once a policy runs `userspace`, the kernel no longer scales it, so
+/// the governor must publish a target every cycle — which it does.
+#[derive(Debug, Default)]
+pub struct UserspaceWriter {
+    /// (policy_dir, original governor)
+    armed: Vec<(String, String)>,
+}
+
+impl UserspaceWriter {
+    /// Switch every userspace cluster to the `userspace` governor, remembering
+    /// what it was. Idempotent.
+    pub fn arm(&mut self, targets: &[FreqTarget]) {
+        let root = fake_root();
+        for t in targets {
+            let FreqTarget::Userspace { policy_dir } = t else { continue };
+            if self.armed.iter().any(|(d, _)| d == policy_dir) {
+                continue;
+            }
+            let gov = apply_root(&format!("{policy_dir}/scaling_governor"), &root);
+            let prev = std::fs::read_to_string(&gov)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if std::fs::write(&gov, "userspace").is_ok() {
+                self.armed.push((policy_dir.clone(), prev));
+            }
+        }
+    }
+
+    /// Write one cycle's targets. Returns the number of frequencies applied.
+    pub fn apply(&self, targets: &[FreqTarget], freqs_khz: &[f64]) -> usize {
+        let root = fake_root();
+        let mut n = 0;
+        for (t, f) in targets.iter().zip(freqs_khz.iter()) {
+            let FreqTarget::Userspace { policy_dir } = t else { continue };
+            let path = apply_root(&format!("{policy_dir}/scaling_setspeed"), &root);
+            if std::fs::write(&path, format!("{}", *f as i64)).is_ok() {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Restore each policy's original governor (and thus kernel-driven scaling).
+    pub fn disarm(&mut self) {
+        let root = fake_root();
+        for (dir, prev) in self.armed.drain(..) {
+            if prev.is_empty() {
+                continue;
+            }
+            let gov = apply_root(&format!("{dir}/scaling_governor"), &root);
+            let _ = std::fs::write(&gov, prev);
+        }
+    }
+
+    pub fn is_armed(&self) -> bool {
+        !self.armed.is_empty()
+    }
+}
+
+use crate::orchestrator::{CollectingSink, Sink, SysfsWrite};
+
+/// OPP list for a cpufreq policy, in kHz.
+///
+/// Preference order matches what the upstream binary reads:
+/// `scaling_available_frequencies` → `scaling_boost_frequencies` →
+/// `cpuinfo_max_freq` (+`cpuinfo_min_freq` as a two-point fallback).
+pub fn read_opps_for_policy(policy_dir: &str) -> Vec<f64> {
+    let read_list = |f: &str| -> Vec<f64> {
+        std::fs::read_to_string(format!("{policy_dir}/{f}"))
+            .ok()
+            .map(|s| {
+                s.split_whitespace()
+                    .filter_map(|t| t.parse::<f64>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut opps = read_list("scaling_available_frequencies");
+    if opps.is_empty() {
+        opps = read_list("scaling_boost_frequencies");
+    }
+    if opps.is_empty() {
+        let mut two = read_list("cpuinfo_min_freq");
+        two.extend(read_list("cpuinfo_max_freq"));
+        two.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        two.dedup();
+        opps = two;
+    }
+    opps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    opps
+}
+
+/// OPPs for every cluster, in `powerModel` order.
+pub fn read_opps_for_config(cfg: &Config) -> Vec<Vec<f64>> {
+    let Some(modules) = cfg.modules_map() else {
+        return Vec::new();
+    };
+    let models = uperf_config::PowerModel::list_from_modules(modules);
+    cpu_slices(&models)
+        .iter()
+        .map(|cores| {
+            let first = cores.first().copied().unwrap_or(0);
+            read_opps_for_policy(&format!("/sys/devices/system/cpu/cpufreq/policy{first}"))
+        })
+        .collect()
+}
+
+/// Handle to the running governor thread.
+pub struct CpuTask {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CpuTask {
+    /// Spawn with an injected governor + stat reader (unit-testable path).
+    pub fn spawn_with<F>(
+        mut gov: Governor,
+        targets: Vec<FreqTarget>,
+        mut read_stat: F,
+    ) -> Self
+    where
+        F: FnMut() -> uperf_config::CpuJiffies + Send + 'static,
+    {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_child = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("uperf-cpu".into())
+            .spawn(move || {
+                let mut writer = UserspaceWriter::default();
+                writer.arm(&targets);
+                if writer.is_armed() {
+                    log_line(&format!(
+                        "Rust: cpu governor armed {} userspace cluster(s)",
+                        writer.armed.len()
+                    ));
+                }
+                // Prime the sampler and throw away the first span: it covers
+                // the interval from boot to process start, which reads as a
+                // full-load blip and would kick every cluster to max once.
+                let mut prev = read_stat();
+                std::thread::sleep(gov.sample_period());
+                prev = read_stat();
+                let mut tick = 0u64;
+                while !stop_child.load(Ordering::Relaxed) {
+                    let period = gov.sample_period();
+                    std::thread::sleep(period);
+                    if stop_child.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let cur = read_stat();
+                    let freqs = gov.tick(&prev, &cur, Instant::now());
+                    prev = cur;
+                    tick += 1;
+                    // Log every 8th tick (~0.1-0.4 s) to keep the file readable.
+                    if tick % 8 == 1 {
+                        log_cpu_tick(&gov, &freqs);
+                    }
+                    // Userspace clusters first: they need a target every cycle.
+                    writer.apply(&targets, &freqs);
+
+                    // Config-declared knobs (scaling_max_freq / msm_performance)
+                    // as a secondary path, so a device that supports them gets
+                    // them too. No-ops when the list is empty.
+                    let writes: Vec<SysfsWrite> = freq_writes(&targets, &freqs)
+                        .into_iter()
+                        .map(|(knob, value)| {
+                            let path = targets
+                                .iter()
+                                .find(|t| t.knob() == Some(knob.as_str()))
+                                .and_then(|t| t.path())
+                                .unwrap_or("")
+                                .to_string();
+                            SysfsWrite { path, value }
+                        })
+                        .filter(|w| !w.path.is_empty())
+                        .collect();
+                    if !writes.is_empty() {
+                        let root = fake_root();
+                        match root.as_deref() {
+                            Some(root) => {
+                                let mut sink = crate::orchestrator::UnderRootSink::new(root);
+                                for w in &writes {
+                                    sink.write(w);
+                                }
+                            }
+                            None => {
+                                let mut sink = CollectingSink::default();
+                                for w in &writes {
+                                    sink.write(w);
+                                }
+                            }
+                        }
+                    }
+                }
+                writer.disarm();
+                log_line("Rust: cpu governor disarmed (original governor restored)");
+            })
+            .expect("spawn uperf-cpu governor");
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Production constructor: real OPPs + real `/proc/stat`.
+    pub fn spawn(cfg: &Config, mode: &str, scene: &str) -> Option<Self> {
+        let opps = read_opps_for_config(cfg);
+        if opps.iter().all(|o| o.is_empty()) {
+            log_line("Rust: cpu governor skipped (no OPP tables readable)");
+            return None;
+        }
+        let gov = governor_from_config(cfg, mode, scene, &opps)?;
+        let targets = freq_targets(cfg);
+        let n_cpu = gov.clusters.iter().map(|c| c.cores.len()).sum::<usize>().max(1);
+        Some(Self::spawn_with(gov, targets, move || {
+            std::fs::read_to_string("/proc/stat")
+                .map(|t| parse_stat(&t, n_cpu))
+                .unwrap_or_default()
+        }))
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.thread.is_some()
+    }
+}
+
+fn log_cpu_tick(gov: &Governor, freqs: &[f64]) {
+    let mut s = String::with_capacity(160);
+    let _ = write!(s, "Rust: cpu");
+    for ((i, cl), f) in gov.clusters.iter().enumerate().zip(freqs.iter()) {
+        let _ = write!(
+            s,
+            " c{i}={:.0}kHz(load {:.2}{})",
+            f,
+            cl.load,
+            if cl.predicted { ",pred" } else { "" }
+        );
+    }
+    let _ = write!(s, " pool={:.2}", gov.pool);
+    log_line(&s);
+}
+
+fn log_line(s: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static BUF: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+    let buf = BUF.get_or_init(|| Mutex::new(Vec::with_capacity(192)));
+    let mut b = buf.lock().unwrap();
+    b.clear();
+    b.extend_from_slice(s.as_bytes());
+    b.push(b'\n');
+    // SAFETY: the C++ sink copies before returning.
+    unsafe {
+        crate::ffi::uperf_bridge_write_log(std::ptr::null(), b.as_ptr().cast(), b.len());
+    }
+}
+
+/// Host-side stub for the C++ log sink.
+///
+/// `uperf-core` is a `staticlib` linked into the Android binary, where
+/// `uperf_bridge_write_log` comes from `cpp/uperf/bridge.cpp`. Host unit tests
+/// have no C++ side, so provide a no-op with the same symbol. Without it the
+/// test binary fails to link as soon as any test reaches the logging path.
+#[cfg(test)]
+#[no_mangle]
+extern "C" fn uperf_bridge_write_log(
+    _tag: *const libc::c_char,
+    _msg: *const libc::c_char,
+    _len: usize,
+) {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_policy_dir_yields_no_opps() {
+        assert!(read_opps_for_policy("/definitely/not/here").is_empty());
+    }
+
+    #[test]
+    fn userspace_writer_arms_applies_and_restores() {
+        let tmp = std::env::temp_dir().join(format!("uperf_fake_{}", std::process::id()));
+        let dir = tmp.join("sys/devices/system/cpu/cpufreq/policy0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("scaling_governor"), "schedutil\n").unwrap();
+
+        std::env::set_var("UPERF_FAKE_ROOT", tmp.to_str().unwrap());
+        let targets = vec![FreqTarget::Userspace {
+            policy_dir: "/sys/devices/system/cpu/cpufreq/policy0".into(),
+        }];
+        let mut w = UserspaceWriter::default();
+        w.arm(&targets);
+        assert!(w.is_armed());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("scaling_governor")).unwrap().trim(),
+            "userspace"
+        );
+        assert_eq!(w.apply(&targets, &[1_478_400.0]), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("scaling_setspeed")).unwrap().trim(),
+            "1478400"
+        );
+        w.disarm();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("scaling_governor")).unwrap().trim(),
+            "schedutil",
+            "original governor must be restored"
+        );
+        std::env::remove_var("UPERF_FAKE_ROOT");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn governor_task_runs_and_stops() {
+        let mut cfg_json = serde_json::json!({
+            "meta": {"name":"t","author":"t"},
+            "modules": {
+                "cpu": {"enable": true, "powerModel": [
+                    {"efficiency":115,"nr":2,"typicalPower":0.3,"typicalFreq":1.8,
+                     "sweetFreq":1.4,"plainFreq":1.2,"freeFreq":0.6}
+                ]},
+                "sysfs": {"enable": true, "knob": {
+                    "cpuMax": "/sys/module/msm_performance/parameters/cpu_max_freq"
+                }}
+            },
+            "initials": {"cpu": {"baseSampleTime": 0.005, "baseSlackTime": 0.005, "margin": 0.2}},
+            "presets": {"balance": {"*": {}}}
+        });
+        let cfg = uperf_config::Config::from_value(cfg_json.clone()).unwrap();
+        let opps = vec![vec![600000.0, 1200000.0, 1800000.0]];
+        let gov = governor_from_config(&cfg, "balance", "*", &opps).unwrap();
+        // Explicit non-userspace targets: this test runs on the build host, and
+        // a `Userspace` target would switch the *host's* CPU governor.
+        let _ = freq_targets(&cfg);
+        let targets = vec![FreqTarget::None];
+        let mut task = CpuTask::spawn_with(gov, targets, || {
+            // escalating load so the governor has to move
+            let mut j = uperf_config::CpuJiffies::default();
+            j.busy = vec![50, 50];
+            j.total = vec![100, 100];
+            j
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        task.stop();
+        assert!(!task.is_running());
+
+        // silence the unused-mut warning on the json value above
+        cfg_json["meta"]["name"] = serde_json::json!("t");
+    }
+}
