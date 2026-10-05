@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -50,6 +51,9 @@ void                  uperf_bridge_set_log_level(const char *level);
 void                  uperf_register_input_listener(void *listener);
 void                  uperf_bridge_set_input_thresholds(float swipeThd, float gestureThdX,
                                                         float gestureThdY);
+// `modules.atrace.enable`; opens the ftrace trace_marker and toggles the markers
+// emitted by the vendored ATRACE_* instrumentation.
+void                  uperf_bridge_set_atrace(bool enable);
 
 #ifdef __cplusplus
 }

@@ -165,6 +165,15 @@ pub(crate) extern "C" fn uperf_rs_start(
         }
     }
 
+    // `modules.atrace.enable` -> open the ftrace trace_marker and toggle the
+    // markers emitted by the vendored ATRACE_* instrumentation.
+    if let Some(c) = cfg_for_governor.as_ref() {
+        if let Some(on) = c.atrace_enabled() {
+            // SAFETY: plain scalar across the C ABI.
+            unsafe { crate::ffi::uperf_bridge_set_atrace(on) };
+        }
+    }
+
     // Start the userspace CPU governor: samples /proc/stat, runs the power-model
     // loop and publishes per-cluster frequency targets.
     if let Some(c) = cfg_for_governor.as_ref() {

@@ -30,6 +30,7 @@
 #include "platform/cobridge.h"
 #include "platform/module_base.h"
 #include "modules/input_listener.h"
+#include "utils/atrace.h"
 
 #include <spdlog/spdlog.h>
 
@@ -265,6 +266,35 @@ extern "C" void uperf_bridge_set_input_thresholds(float swipeThd, float gestureT
     g_inputListener->SetThresholds(swipeThd, gestureThdX, gestureThdY);
     SPDLOG_INFO("Input thresholds: swipeThd={} gestureThdX={} gestureThdY={}", swipeThd,
                 gestureThdX, gestureThdY);
+}
+
+// `modules.atrace.enable`.
+//
+// The mechanism is the vendored dfps utility (`utils/atrace.c`), which is the same
+// code uperf's own `AtraceSwitcher` is: it opens
+// /sys/kernel/debug/tracing/trace_marker (falling back to /sys/kernel/tracing/
+// trace_marker) and emits Perfetto-compatible markers of the form
+// `C|<pid>|<tag>|<n>` and `B|<pid>|<tag>` / `E|<pid>`. The *payloads* come from
+// the ATRACE_CALL()/ATRACE_SCOPE() macros already instrumented into dfps'
+// cgroup_listener, topapp_monitor and inotify — which is why the uperf binary
+// carries no marker literal: the switcher only toggles the flag.
+//
+// Until this function is called, `--gc-sections -flto` drops AtraceInit and the
+// trace_marker paths from the binary entirely. That the upstream binary DOES
+// contain both paths is the evidence that it calls them.
+static bool g_atraceInited = false;
+
+extern "C" void uperf_bridge_set_atrace(bool enable) {
+    if (!g_atraceInited) {
+        g_atraceInited = true;
+        if (AtraceInit() != 0) {
+            // Upstream's string for this failure, verbatim.
+            SPDLOG_ERROR("Failed to open tracemark for atrace");
+            return;
+        }
+    }
+    AtraceToggle(enable);
+    SPDLOG_INFO("Atrace {}", enable ? "enabled" : "disabled");
 }
 
 extern "C" void uperf_bridge_init_rust(const char *config_path, const char *log_path) {

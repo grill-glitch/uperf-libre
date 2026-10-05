@@ -88,4 +88,7 @@ extern "C" {
         gesture_thd_x: f32,
         gesture_thd_y: f32,
     );
+    /// `modules.atrace.enable` — opens the ftrace trace_marker and toggles the
+    /// vendored ATRACE_* markers.
+    pub(crate) fn uperf_bridge_set_atrace(enable: bool);
 }
