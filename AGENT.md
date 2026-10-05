@@ -412,7 +412,7 @@ uperf-cli warn   <config.json>              # 输出告警行（应与原版日�
 | 阶段 | 内容 | 交付 | 验收 |
 |---|---|---|---|
 | **M0** ✅ | vendor dfps 到 `cpp/dfps/`，跑通 dfps 原样构建；确定 CLI/日志/进程名适配点 | `DFPS_VENDOR.md`、可编译的 `cpp/uperf`、`docs/m0-evidence.md` | **已达成**（2026-10-02，alioth）：`build.sh check` 全绿，进程监督器/日志格式/CLI/4 个事件源/配置热重载全部真机验证；`offscreen.state` 未触发，列入 §12.2 |
-| **M1** ✅ (build/check) ⚠️ (待真机) | Rust staticlib 骨架 + C ABI 桥跑通 | `rust/uperf-core/`（Cargo.toml + lib.rs + ffi.rs + topic_dispatch.rs + tests/）、`cpp/uperf/bridge.cpp`、`cpp/include/uperf_rs_bridge.h` | 构建 `build.sh check` 全绿（895 KB、NEEDED `libc/libdl/libm`、stripped、`GNU_RELRO + BIND_NOW`）；10/10 payload 解码单元测试通过；**真机待验**（alioth 离线，无法 push） |
+| **M1** ✅ | Rust staticlib 骨架 + C ABI 桥跑通 | `rust/uperf-core/`（Cargo.toml + lib.rs + ffi.rs + topic_dispatch.rs + tests/）、`cpp/uperf/bridge.cpp`、`cpp/include/uperf_rs_bridge.h` | **已达成**（2026-10-05，alioth）：`build.sh check` 全绿；10/10 payload 解码单元测试通过；**真机过**：C++/Rust 同步出现 `EventTap:` / `[Rust] Rust: ...` 两份日志，pid list 预览(8/8)字节相等；电源键触发 `offscreen.state=true`，**officially§12.2 第 1 条已解** |
 | **M2** | 配置系统 + `uperf-cli parse/warn`；63 份配置全部解析 | parity 工具 | §10.2 告警对账 0 差异 |
 | **M3** | switcher/profile/sysfs（6 类写入器）+ 状态机 | `plan` 输出 | §10.3 假 sysfs 写入序列 0 差异 |
 | **M4** | CPU 调频器 + 上下文调度器 | 真实 sysfs 写入 | §10.4 的 `wechat_resume`/`android_am` 场景行为对齐 |
@@ -437,7 +437,7 @@ M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（conf
 | 项 | 状态 | 处理 |
 |---|---|---|
 | `sfanalysis.hint` 的状态码语义 | UNKNOWN | 真机抓取（M2） |
-| **`offscreen.state` 在 alioth 上从未触发**：vendored 判据是 `/dev/cpuset/restricted` pid 数 > 10，而该集合在本机恒为 0 | 未定（不是"已确认 ROM 不用 restricted"——本次也没能真正熄屏） | M2：物理电源键熄屏后读 `/dev/cpuset/restricted/cgroup.procs`；并用**原版二进制**同机抓日志确定 v3 的真实熄屏判据。详见 `docs/m0-evidence.md` §3.2 |
+| **`offscreen.state` 在 alioth 上从未触发**：vendored 判据是 `/dev/cpuset/restricted` pid 数 > 10，而该集合在本机恒为 0 | **已解（M1 真验）**——电源键物理熄屏后 `restricted` 立即从 0 涨到 221，`Rust: offscreen.state = true` 出现。`input keyevent 26` 在某些场景下不会真正熄屏，必须真的按电源键。 | M2：物理电源键熄屏后读 `/dev/cpuset/restricted/cgroup.procs`；并用**原版二进制**同机抓日志确定 v3 的真实熄屏判据。详见 `docs/m0-evidence.md` §3.2 |
 | `/dev/cpuset` 在本机是 **cgroup v1 形态**（有 `tasks`/`notify_on_release`），`/sys/fs/cgroup` 是 v2（只有 `apps`/`system`） | 未定 | M2 钉死"哪个是真正的任务分组视图"，否则 cgroup 事件可能读到陈旧数据 |
 | `topapp.pkgName` 的 `|Δpid| > 10` 门槛（`TOP_TASK_NR_DIFF_MIN`）是否与原版一致 | 未定 | M2 用原版对照小应用切换场景 |
 | NDK r30（clang 21）下 vendored scnlib / spdlog 需要非侵入式 shim | 已解决 | `cpp/CMakeLists.txt` 三处注释 + `docs/m0-evidence.md` §1（未改动 `cpp/dfps/**` 任何字节） |

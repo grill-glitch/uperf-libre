@@ -136,6 +136,7 @@ static void AppMainMayThrow(void) {
     // Hand off to the Rust engine. From this point on, the Rust dispatcher
     // thread logs every event the C++ bridge forwards across `uperf_rs_on_event`.
     uperf_bridge_init_rust(configFile.c_str(), logFile.c_str());
+    SPDLOG_INFO("uperf_bridge_init_rust returned, entering main loop");
     for (;;) {
         Sleep(UINT32_MAX);
     }
