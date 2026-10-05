@@ -2,7 +2,6 @@
 <resources>
     <string name="tab_home">首页</string>
     <string name="tab_mode">模式切换</string>
-    <string name="tab_dfps">刷新率</string>
     <string name="tab_more">更多</string>
     <string name="state_unknown">读取中…</string>
     <string name="state_running">运行中</string>
@@ -64,12 +63,4 @@
     <string name="preset_crazy">极致</string>
     <string name="preset_auto">自动</string>
     <string name="preset_defined">由已加载的配置定义</string>
-    <string name="dfps_cur_title">当前刷新率</string>
-    <string name="section_dfps_rules">规则</string>
-    <string name="dfps_idle">待机</string>
-    <string name="dfps_active">活动</string>
-    <string name="dfps_prompt_idle">{pkg} 的待机 Hz（原 {idle}）</string>
-    <string name="dfps_prompt_active">{pkg} 的活动 Hz（原 {active}）</string>
-    <string name="toast_rule_ok">{pkg} 的规则已更新</string>
-    <string name="toast_rule_fail">更新规则失败：{err}</string>
-    </resources>
+</resources>

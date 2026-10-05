@@ -18,8 +18,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod cpu_task;
-pub mod dfps_config;
-pub mod dfps_task;
 pub mod ffi;
 pub mod inotify;
 pub mod sched_apply;
@@ -234,46 +232,6 @@ pub(crate) extern "C" fn uperf_rs_start(
         }
     }
 
-    // Start the dfps business logic (T04-T09, M1-M3). Reads dfps.txt from
-    // the same directory as the uperf config, parses it, and registers the
-    // task. The dispatcher threads will route input.touch / input.btn /
-    // topapp.pkgName / offscreen.state events into the task via
-    // topic_dispatch::spawn_for_dfps (M1 wires the dispatch path; M3 adds
-    // the heavy-worker scheduler + watch_task reload).
-    {
-        let cfg_path = std::path::Path::new(cfg.to_str().unwrap_or(""));
-        let dfps_path = cfg_path.parent().map(|d| d.join("dfps.txt"));
-        if let Some(p) = dfps_path {
-            let parsed = std::fs::read_to_string(&p)
-                .ok()
-                .and_then(|txt| crate::dfps_config::RuleTable::parse(&txt).ok());
-            match parsed {
-                Some(table) => {
-                    let rules_n = table.rules.len();
-                    let universal = table.universal;
-                    let offscreen = table.offscreen;
-                    let task = crate::dfps_task::DfpsTask::new(table);
-                    let task = std::sync::Arc::new(parking_lot::Mutex::new(task));
-                    let _ = DFPS_TASK.set(task);
-                    log_msg(&format!(
-                        "Rust: dfps loaded ({} rules, universal={}/{}, offscreen={}/{})",
-                        rules_n,
-                        universal.idle,
-                        universal.active,
-                        offscreen.idle,
-                        offscreen.active,
-                    ));
-                }
-                None => {
-                    log_msg(&format!(
-                        "Rust: dfps disabled (cannot load '{}')",
-                        p.display()
-                    ));
-                }
-            }
-        }
-    }
-
     // Start the file watcher: cur_powermode.txt / perapp_powermode.txt preset
     // switching and the single-byte sfanalysis.hint feed.
     if let Some(c) = cfg_for_governor.as_ref() {
@@ -347,7 +305,6 @@ static ORCHESTRATOR: OnceLock<Arc<PMutex<Orchestrator>>> = OnceLock::new();
 static CPU_TASK: OnceLock<PMutex<Option<cpu_task::CpuTask>>> = OnceLock::new();
 static SCHED_TASK: OnceLock<PMutex<Option<sched_task::SchedTask>>> = OnceLock::new();
 static WATCH_TASK: OnceLock<PMutex<Option<watch_task::WatchTask>>> = OnceLock::new();
-static DFPS_TASK: OnceLock<Arc<PMutex<crate::dfps_task::DfpsTask>>> = OnceLock::new();
 
 fn watch_task_slot() -> &'static PMutex<Option<watch_task::WatchTask>> {
     WATCH_TASK.get_or_init(|| PMutex::new(None))

@@ -9,7 +9,6 @@ import { setupRoute, currentTab } from './route.js';
 import { readAll, readConfig, restart } from './ctl.js';
 import * as home from './pages/home.js';
 import * as mode from './pages/mode.js';
-import * as dfps from './pages/dfps.js';
 import * as more from './pages/more.js';
 
 // The page modules build their own markup (they render lists), so the two helpers they
@@ -38,10 +37,6 @@ async function load() {
 async function render() {
     home.render(state.data, state.config, state.error);
     mode.render(state.data, state.config, async () => {
-        await load();
-        await render();
-    });
-    dfps.render(state.data, state.config, async () => {
         await load();
         await render();
     });
