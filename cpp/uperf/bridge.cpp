@@ -50,16 +50,27 @@ void uperf_rs_init(const uperf_bridge_t *bridge);
 
 static std::string log_prefix; // reserved for future per-tag routing
 
-extern "C" void uperf_bridge_write_log(const char *msg, size_t len) {
+// `uperf_bridge_write_log`: forward bytes to spdlog at INFO level.
+// The original v3 binary's spdlog pattern is "%H:%M:%S %L %v" (no logger name) —
+// keep the same. The argument identifies the originating Rust module so we can
+// route per-tag (e.g. "Config", "SfAnalysis", "Switcher") once M2 wires the
+// schema-specific code. Tag "" means default and matches the original's bare
+// output.
+extern "C" void uperf_bridge_write_log(const char *tag, const char *msg, size_t len) {
     if (msg == nullptr || len == 0) {
         return;
     }
-    // spdlog expects a NUL-terminated string; `len` may include the trailing newline.
     std::string line(msg, msg + len);
     while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
         line.pop_back();
     }
-    SPDLOG_INFO("[{}] {}", log_prefix.empty() ? "Rust" : log_prefix.c_str(), line);
+    if (tag == nullptr || *tag == '\0') {
+        SPDLOG_INFO("{}", line);
+    } else {
+        // spdlog default pattern (%v) does NOT include %n; we prefix the tag
+        // manually so the original's grep-by-class-name workflow keeps working.
+        SPDLOG_INFO("[{}] {}", tag, line);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,8 +201,8 @@ namespace {
 extern "C" int bridge_subscribe(const char *topic) {
     return uperf_bridge_subscribe(topic);
 }
-extern "C" void bridge_write_log(const char *msg, size_t len) {
-    uperf_bridge_write_log(msg, len);
+extern "C" void bridge_write_log(const char *tag, const char *msg, size_t len) {
+    uperf_bridge_write_log(tag, msg, len);
 }
 const uperf_bridge_t kBridge = {bridge_subscribe, bridge_write_log};
 } // namespace

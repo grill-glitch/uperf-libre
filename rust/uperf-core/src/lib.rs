@@ -144,7 +144,7 @@ fn log_msg(s: &str) {
     buf.extend_from_slice(s.as_bytes());
     buf.push(b'\n');
     // SAFETY: spdlog file sink copies before returning.
-    unsafe { ffi::uperf_bridge_write_log(buf.as_ptr().cast(), buf.len()) };
+    unsafe { ffi::uperf_bridge_write_log(std::ptr::null(), buf.as_ptr().cast(), buf.len()) };
 }
 
 #[allow(dead_code)]
