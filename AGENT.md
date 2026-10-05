@@ -394,7 +394,15 @@ daemon 的 `SIGTERM/SIGINT` 分支改为先给 worker 发信号再退出（原�
 * `prio[类][scene]`：`0`=跳过，`1~98`=SCHED_FIFO，`100~139`=SCHED_NORMAL，`-1/-2/-3`=NORMAL/BATCH/IDLE。
 * `rules[]`：`name / regex / pinned / rules[{k,ac,pc}]`，按数组顺序 = 匹配优先级；`/HOME_PACKAGE/`→启动器包名，`/MAIN_THREAD/`→主线程名（运行时替换）。
 * 场景来自 `initials.sched.scene`（`idle|touch|boost`）+ 前台/后台判定（由 `topapp.pkgName` / `cgroup.*` 事件驱动）。
-* 正则：用 PCRE2（见 §3.2），并在 §10.2 里对 63 份配置的**全部** regex 做一次编译+匹配自检。
+* 正则：**用 Rust `regex` crate，不需要 PCRE2**（原 §3.2 的"PCRE2 必须"是未经验证的假设，已由数据推翻）。
+  实测 63 份配置共 2528 处 pattern、**28 条唯一模式**，全为普通 ERE：无 lookaround/lookbehind/atomic/branch-reset/
+  conditional/recursion/`\K`/inline flag/反向引用。见 `docs/m6-sched-evidence.md` §2 与
+  `uperf-config/tests/all_sched_configs.rs::no_shipped_pattern_needs_pcre2`（新增 PCRE-only 语法会编译失败）。
+  全量编译自检在 `all_sched_configs.rs`：101 个 sched 模块 / 1014 条进程规则 / 4048 个 pattern。
+* `pinned` 语义（README line 248）：**"始终作为处于顶层可见的进程应用规则"**，不是"首匹配优先"。
+* `affinity` 取值可以是**逗号分隔的多个 cpumask 组名**（`sdm8g3.json` 用了 `"c1,c2"`，全树 8 处），取并集。
+* 已发布配置含**真实缺陷且被上游容忍**（`sdm8g2/8g3` 漏定义 `affinity.fuck`；`sdm7g1` 连 `prio.fuck` 也没有），
+  所以悬空类别 = 该维度 no-op，并记入 `Anomaly`；验收闸断言异常集合**恰好等于**白名单三项。
 
 ---
 
@@ -496,8 +504,9 @@ uperf-cli plan   <config.json> <mode> <scene>   # 层叠后的键值 + 来源（
 | **M3** 🚧 | hint FSM + sysfs writer dispatch | `rust/uperf-core/src/hint.rs`、`rust/uperf-core/src/sysfs.rs`、`docs/m3-evidence.md` | **已达成（构建+fd 验证）**：`SfHint` 枚举（0..5）匹配上游 binary；dispatch 表覆盖 13/14 个真实 device fd；`uperf-cli plan` 与上游 v3 在 alioth 上的 sysfs 写入路径一一对应；待做：把 hint FSM 接入 dispatch loop（事件→hint transition→`plan_scene`→真写）+ UFSmax 这类 SoC 专属 hex 路径发现 |
 | **M4** ✅ | 事件→hint→config→sysfs 写入链路 | `rust/uperf-config/`、`rust/uperf-core/src/{hint,orchestrator}.rs`、`docs/m4-evidence.md` | **已达成**（真机）：16 条 sysfs 写入计划与配置路径逐字一致，fake-root 16 文件落地 |
 | **M5a** ✅ | CPU 调频器：能耗模型 + 负载采样 + 功耗限制 + 真机控频 | `rust/uperf-config/src/{cpu,governor,gov_build,freq_target,proc_stat}.rs`、`rust/uperf-core/src/cpu_task.rs`、`docs/m5-cpu-governor.md` | **已达成**（alioth）：25/25 上游 `pwr/cost` 黄金值复现；真机 `userspace`+`setspeed` 控频生效；PL1=1.0W 下满载小核贴上限 1612800 kHz；撤载回落；SIGTERM 干净 disarm |
-| **M5b** 🚧 | sfanalysis 监听 + anim/log/atrace；上下文调度器（PCRE2）；`cur_powermode.txt` 热切换 | — | 未开始 |
-| **M6** | 整机替换 `magisk/bin/uperf` | 可发布的 Magisk zip | §10.4 全部 7 张基线通过；§1 成功判据全绿 |
+| **M6a** ✅ | 上下文调度器（`modules.sched`）：配置层 + 内核应用 + 真机验证 | `uperf-config/src/sched.rs`、`uperf-core/src/{sched_apply,sched_task}.rs`、`uperf-config/tests/all_sched_configs.rs`、`docs/m6-sched-evidence.md` | **已达成**：全配置闸通过（101 模块/1014 规则/4048 pattern，异常集恰为白名单 3 项）；真机隔离实验 `0-7/policy5 → 0-1/policy3` 双值命中且 6s 稳定；写后回读校验；`SIGCHLD` 跨层 bug 已修 |
+| **M6b** 🚧 | sfanalysis 监听 + anim/log/atrace；`cur_powermode.txt` 热切换；真机跑 `pinned`+top-app 路径 | — | 未开始 |
+| **M7** | 整机替换 `magisk/bin/uperf` | 可发布的 Magisk zip | §10.4 全部 7 张基线通过；§1 成功判据全绿 |
 
 M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（config/sysfs/governor/sched 互相独立）。
 
@@ -517,7 +526,14 @@ M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（conf
 ### 12.2 其它未知
 | 项 | 状态 | 处理 |
 |---|---|---|
-| `sfanalysis.hint` 的状态码语义 | UNKNOWN | 真机抓取（M5 SfAnalysisListener 落地时同步做） |
+| `sfanalysis.hint` 的状态码语义 | UNKNOWN | 真机抓取（SfAnalysisListener 落地时同步做） |
+| **悬空类别引用 / 逗号 cpumask** | **已解**：3 份配置有真实缺陷（见上），按"容忍 + 记录 Anomaly"处理，白名单钉死 | `docs/m6-sched-evidence.md` §3 |
+| **worker 里 `std::process::Command` 报 `ECHILD`** | **已解**：vendored dfps 监督器装了 `SIGCHLD`→`wait()` 处理器，worker 继承后**偷走并回收** Rust 的子进程。worker 不监督任何东西，故在 `uperf_rs_start` 重置为 `SIG_DFL` | `docs/m6-sched-evidence.md` §4 |
+| **空替换会让正则匹配一切** | **已解 + 加锁**：home 解析失败曾返回空串，`/HOME_PACKAGE/`→`""` 使 Launcher 规则匹配全系统（3400 条判定）。三重防护：空结果视为失败、失败时保留字面 token、`SchedPlanner` 直接拒绝空 process pattern | `docs/m6-sched-evidence.md` §5 |
+| **Android 自己的 task-profile 控制器会改写亲和性/SCHED 类** | **已解（方法层面）**：新进程 1–2s 内被 Android 归类（实测落到 cpus 0-3 / SCHED_IDLE，恰好与配置同值→曾造成假阳性）。**真机调度实验必须使用与 Android 取值不相交的目标值**，并做对照实验 | `docs/m6-sched-evidence.md` §7 |
+| **`comm` 被截断到 15 字符**（`com.android.launcher3` → `com.android.lau`） | **已知**：`/MAIN_THREAD/` 用观测到的 `comm` 替换，因此自洽（pattern 与线程名同源） | `docs/m6-sched-evidence.md` §7 |
+| **无 CAP_SYS_NICE 时不能把调度类"升"回去**（NORMAL→IDLE 可以，IDLE→NORMAL EPERM） | **已解**（内核真实规则，非沙箱怪癖）；host 单测按此写成"接受两种结果" | `docs/m6-sched-evidence.md` §6 |
+| `/proc/<tid>/stat` 字段 18 是 `priority`(=20+nice)，**nice 是字段 19** | **已解**：曾读 index 15 得到 25（nice=5 时） | `docs/m6-sched-evidence.md` §6 |
 | **`offscreen.state` 在 alioth 上从未触发**：vendored 判据是 `/dev/cpuset/restricted` pid 数 > 10，而该集合在本机恒为 0 | **已解（M1 真验）**——电源键物理熄屏后 `restricted` 立即从 0 涨到 221，`Rust: offscreen.state = true` 出现。`input keyevent 26` 在某些场景下不会真正熄屏，必须真的按电源键。 |
 | `/dev/cpuset` 在本机是 **cgroup v1 形态**（有 `tasks`/`notify_on_release`），`/sys/fs/cgroup` 是 v2（只有 `apps`/`system`） | **已解（静态+真机）**——v3 二进制只读 `tasks`，写 `cpus`（不是 `tasks`！），fd 15-19 = `cpuset/{background,foreground,restricted,system-background,top-app}/cpus`，所以 cgroup v1 是真视图。**M3 的 sysfs 写入器必须新增 cpuset cpus (cpu mask) 子类型。** |
 | `topapp.pkgName` 的 `|Δpid| > 10` 门槛（`TOP_TASK_NR_DIFF_MIN`）是否与原版一致 | **已解**——dfps vendored `topapp_monitor.cpp` 与原版同源，原版**不复写**该模块，门槛=10 与 dfps 一致 |
