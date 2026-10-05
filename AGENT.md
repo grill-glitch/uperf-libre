@@ -311,18 +311,26 @@ touch   -> idle     : 超时或渲染结束
 
 `modules.*` 为静态段，只在实例化时读一次。**必须复刻原版的告警语义**（§10.2 逐条对账）。
 
-### 8.3 sysfs 写入器（6 类）
+### 8.3 sysfs 写入器（**已按 `modules.sysfs.knob` 实测重写**）
 
-| 类型 | 语义（来自 v2 文档 + v3 行为，需实测校正） |
-|---|---|
-| `string` | 直写 `echo val > path` |
-| `percluster` | 用 `clusterCpuId` 替换 `path` 里的 `%d`，值逗号分隔 |
-| `percpu` | 按 `efficiency` 列表长度生成核心序列，值逗号分隔 |
-| `cpufreq` | `percluster` 变体，值 = 设定值 × 100000，写入失败要重试（处理 new min > old max） |
-| `cgroup_procs` | 进程名 → PID 替换，最多 4 值，**关闭去重**（线程会变） |
-| `uxaffinity` | 1 = 把顶层 APP 的 UI 相关线程绑到大核；0 = 放开全部核心；顶层 APP 变化时重扫 |
+**路径不来自代码，来自配置**：`modules.sysfs.knob` 是 `{knob名: 绝对路径}` 表。
+上游二进制里**没有**任何 `devfreq`/`llcc`/`ufshc` 字符串（`strings` 0 命中），
+所以 `uperf-cli plan` 与设备侧都从这张表查路径（见 `docs/m4-evidence.md` §1）。
 
-优化要求（原版核心卖点）：**切换动作时与上一动作 diff，跳过相同值**；节点以 fd 缓存常开；单次切换开销要能在真机上用 atrace 量到（原版量级：轮询 0.4ms/100ms）。
+写入器种类**由路径形状推断**（schema 里没有 `type` 字段，README 的 type 列是 v1/v2 遗留）：
+
+| 路径形状 | WriterKind | 值格式 |
+|---|---|---|
+| `/dev/cpuset/*/cpus` | `CpusetCpus` | cpu mask（`0-3,4-5`） |
+| `*/cgroup.procs`、`*/tasks` | `CgroupProcs` | pid 列表 |
+| 含 `/cpufreq/` 且 `_freq` 结尾 | `Cpufreq` | kHz 原样 |
+| `*/online` | `PerCpu` | 0/1 |
+| 其余（devfreq `*_freq`、`msm_performance/*`、`/proc/ppm/*`） | `String` | 原样 |
+
+> 旧表（string/percluster/percpu/uxaffinity 等 6 类的猜测）**作废**：
+> 实测没有 `{0}` 占位展开，也没有 uxaffinity 的痕迹。
+
+优化要求（原版核心卖点）：**切换动作时与上一动作 diff，跳过相同值**（同 node 同值只写一次）。
 
 ### 8.4 CPU 调频器（`config/README.md` 六步，逐条实现）
 
@@ -443,7 +451,7 @@ uperf-cli plan   <config.json> <mode> <scene>   # 层叠后的键值 + 来源（
 | **M1** ✅ | Rust staticlib 骨架 + C ABI 桥跑通 | `rust/uperf-core/`（Cargo.toml + lib.rs + ffi.rs + topic_dispatch.rs + tests/）、`cpp/uperf/bridge.cpp`、`cpp/include/uperf_rs_bridge.h` | **已达成**（2026-10-05，alioth）：`build.sh check` 全绿；10/10 payload 解码单元测试通过；**真机过**：C++/Rust 同步出现 `EventTap:` / `[Rust] Rust: ...` 两份日志，pid list 预览(8/8)字节相等；电源键触发 `offscreen.state=true`，**officially§12.2 第 1 条已解** |
 | **M2** 🚧 | 配置系统 + `uperf-cli parse/warn/plan`；38 份配置全部解析 | `rust/uperf-cli/`、`docs/upstream-configs/`、`docs/m2-evidence.md` | **部分达成**：38/38 配置解析通过、`warn` 零误报；`plan` 已出层叠结果。待做：`plan` 的 sysfs 路径展开（需 M3 writer）、与原版日志文案逐条对账 |
 | **M3** 🚧 | hint FSM + sysfs writer dispatch | `rust/uperf-core/src/hint.rs`、`rust/uperf-core/src/sysfs.rs`、`docs/m3-evidence.md` | **已达成（构建+fd 验证）**：`SfHint` 枚举（0..5）匹配上游 binary；dispatch 表覆盖 13/14 个真实 device fd；`uperf-cli plan` 与上游 v3 在 alioth 上的 sysfs 写入路径一一对应；待做：把 hint FSM 接入 dispatch loop（事件→hint transition→`plan_scene`→真写）+ UFSmax 这类 SoC 专属 hex 路径发现 |
-| **M4** | CPU 调频器 + 上下文调度器 | 真实 sysfs 写入 | §10.4 的 `wechat_resume`/`android_am` 场景行为对齐 |
+| **M4** 🚧 | 事件→hint→config→sysfs 写入链路；CPU 调频器 + 上下文调度器 | `rust/uperf-config/`、`rust/uperf-core/src/{hint,orchestrator}.rs`、`docs/m4-evidence.md` | **链路已达成**（真机）：16 条 sysfs 写入计划与配置路径逐字一致，fake-root 16 文件落地。**待做**：真 sysfs 写入（fd 缓存 + 重试）、CPU 调频器数值模型、context scheduler |
 | **M5** | sfanalysis 监听 + anim/log/atrace；整机替换 `magisk/bin/uperf` | 可发布的 Magisk zip | §10.4 全部 7 张基线通过；§1 成功判据全绿 |
 
 M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（config/sysfs/governor/sched 互相独立）。
