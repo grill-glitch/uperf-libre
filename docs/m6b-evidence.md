@@ -166,8 +166,52 @@ One startup banner, exactly one `Preset inode -> 'balance'` line, and
   `rm /data/media/0/Android/yc/uperf/cur_powermode.txt` works and clears the FUSE
   view too. That is a plausible explanation for why 5 of the 63 configs use
   `/data/media/0/Android/yc/uperf/...` instead of `/sdcard/...` for the same files.
+  (The FUSE dentry cache can also keep `stat` reporting a path that a directory
+  listing no longer shows; `ls -A <parent>` is the honest view.)
+* **Tear down with SIGTERM, and match the right name.** dfps sets the process name to
+  `uperf` for **both** the daemon and its forked worker, so cleanup that matches the
+  binary's filename only kills the daemon and orphans every worker — which is exactly
+  what happened, leaving twelve live workers (one of them still running the context
+  scheduler against the device). Worse, `SIGKILL`-ing the daemon leaves its workers as
+  **zombies** reparented to `init`, whose comm is `[uperf]`: `pidof uperf` does not
+  match them, so the harness reports "0 processes" while five remain. Count with
+  `ps -A -o NAME | grep -c uperf`, tear down with `kill -TERM`, and expect that a
+  `-9` teardown is only clearable by a reboot.
+* **`su -c 'sh script'` in the foreground is the reliable shape.** Backgrounding the
+  *script itself* (`nohup sh script > f 2>&1 &`) loses it: su exits and takes the
+  process group with it, so `f` stays empty. Redirecting **inside** the foregrounded
+  script is fine. A dropped adb link also truncates the output stream without an error,
+  which reads exactly like "the script produced nothing" — check `uptime` and device
+  presence before concluding anything about the code.
 
-## 8. Still open
+## 8. Bounded joins on the shutdown path [V]
+
+`uperf_rs_stop()` joins its background tasks so each can release what it owns — in
+particular the CPU governor, which must disarm and restore the kernel's original
+governors. An unbounded join is a liability: the watcher thread did hang once (the
+mutex-taken-twice bug in §3), and a hung task made `uperf_rs_stop()` block forever, so
+a worker that the supervisor had signalled never restored the governor. On device,
+`kill -TERM` left four workers alive.
+
+`shutdown::stop_and_join` now bounds every join (`STOP_TIMEOUT = 2 s`, ~8x the longest
+poll interval), and on timeout the thread is deliberately detached rather than
+blocking process exit. The CPU task additionally shares its `UserspaceWriter` with the
+handle, so the **stop path can disarm the governor itself** when the task thread never
+reached its own `disarm()`. Restoring the governors is the one cleanup this module
+cannot afford to skip.
+
+Verified: after `kill -TERM`, the log ends with
+
+```text
+Rust: context scheduler stopped
+uperf_rs_stop: dispatcher joined
+```
+
+and all three policies read `powersave` with no live `uperf` process left, while the
+five pre-existing `[uperf]` zombies (from an earlier `SIGKILL` teardown) kept exactly
+the same PIDs — i.e. the graceful path added none.
+
+## 9. Still open
 
 * the **producer** of `sfanalysis.hint`: the vendor `libsfanalysis.so` contains no
   path string at all (only `/proc/<pid>/comm`, `/proc/<pid>/stat`, `/proc/self/maps`,

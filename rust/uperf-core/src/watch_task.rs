@@ -297,9 +297,9 @@ impl WatchTask {
     }
 
     pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        let Some(t) = self.thread.take() else { return };
+        if !crate::shutdown::stop_and_join(&self.stop, t, crate::shutdown::STOP_TIMEOUT, || {}) {
+            log_line("Rust: watch task did not stop in time, detached");
         }
     }
     pub fn is_running(&self) -> bool {
@@ -414,6 +414,22 @@ fn handle_sf_hint(
         b as i8,
         transitioned
     ));
+}
+
+/// Log a line through the shared C++ sink (the `log` closure is owned by the task
+/// thread, so the stop path cannot use it).
+fn log_line(s: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static BUF: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+    let buf = BUF.get_or_init(|| Mutex::new(Vec::with_capacity(160)));
+    let mut b = buf.lock().unwrap();
+    b.clear();
+    b.extend_from_slice(s.as_bytes());
+    b.push(b'\n');
+    // SAFETY: the C++ sink copies before returning.
+    unsafe {
+        crate::ffi::uperf_bridge_write_log(std::ptr::null(), b.as_ptr().cast(), b.len());
+    }
 }
 
 fn apply_mode(

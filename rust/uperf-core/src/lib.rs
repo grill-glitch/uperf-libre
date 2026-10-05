@@ -22,6 +22,7 @@ pub mod ffi;
 pub mod inotify;
 pub mod sched_apply;
 pub mod sched_task;
+pub mod shutdown;
 pub mod watch_task;
 pub mod hint;
 pub mod orchestrator;
