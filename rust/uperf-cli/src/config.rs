@@ -123,10 +123,38 @@ impl Config {
             }
         }
 
-        // initials: flat map of dot-key → value.
+        // initials: per-module block (e.g. `{ cpu: { margin: 0.2, ... }, sysfs: {...} }`)
+        // OR a flat dotted map (`{ "cpu.margin": 0.2, ... }`). Both shapes appear
+        // across upstream release (some configs use flat, some nested). We always
+        // flatten to dotted keys so `Config::resolve` and the sysfs writer work
+        // against one shape.
         if let Some(init) = obj.get("initials").and_then(|m| m.as_object()) {
-            for (k, v) in init {
-                c.initials.insert(k.clone(), v.clone());
+            for (top, body) in init {
+                let key_prefix = top.clone();
+                if let Some(inner) = body.as_object() {
+                    // Heuristic: if every inner key already starts with
+                    // `top.` or doesn't contain `.`, treat this as an already-flat
+                    // map at this top-level only. Otherwise treat as nested per-mod.
+                    let looks_flat = inner.keys().all(|k| !k.contains('.'));
+                    if looks_flat {
+                        // Flat: keys are top-subkey (treat as dotted in their own right).
+                        for (k, v) in inner {
+                            let dotted = if k.contains('.') {
+                                k.clone()
+                            } else {
+                                format!("{key_prefix}.{k}")
+                            };
+                            c.initials.insert(dotted, v.clone());
+                        }
+                    } else {
+                        for (k, v) in inner {
+                            c.initials.insert(format!("{key_prefix}.{k}"), v.clone());
+                        }
+                    }
+                } else {
+                    // Scalar at top-level (rare) — treat as `top.<value>`.
+                    c.initials.insert(key_prefix, body.clone());
+                }
             }
         }
 
