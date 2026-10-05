@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "uperf-core",
+    "uperf-cli",
+]
+
+[profile.release]
+opt-level = "z"      # we want small, the C++ side already has the perf budget
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = true   # AGENT.md §13: no panics, so check everything at runtime
+
+[profile.release-debug]
+inherits = "release"
+opt-level = "z"
+debug = true
+strip = false
