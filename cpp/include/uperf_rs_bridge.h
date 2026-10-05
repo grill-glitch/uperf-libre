@@ -27,7 +27,7 @@ extern "C" {
 // `rust/uperf-core/src/ffi.rs` — keep the two in sync.
 typedef struct {
     int  (*subscribe)(const char *topic);
-    void (*write_log)(const char *msg, size_t len);
+    void (*write_log)(const char *tag, const char *msg, size_t len);
 } uperf_bridge_t;
 
 // Functions implemented in Rust (uperf-core), called from C++.
@@ -39,7 +39,7 @@ void uperf_rs_on_event(const char *topic, const void *data, size_t len);
 
 // Functions implemented in C++ (bridge.cpp), called from Rust or app_main.
 const uperf_bridge_t *uperf_bridge_handle(void);
-void                  uperf_bridge_write_log(const char *msg, size_t len);
+void                  uperf_bridge_write_log(const char *tag, const char *msg, size_t len);
 int                   uperf_bridge_subscribe(const char *topic);
 void                  uperf_bridge_init_rust(const char *config_path, const char *log_path);
 

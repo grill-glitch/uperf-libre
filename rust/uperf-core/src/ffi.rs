@@ -36,7 +36,7 @@ impl LogLine {
 #[derive(Copy, Clone)]
 pub(crate) struct Bridge {
     subscribe: unsafe extern "C" fn(*const c_char) -> c_int,
-    write_log: unsafe extern "C" fn(*const c_char, usize),
+    write_log: unsafe extern "C" fn(*const c_char, *const c_char, usize),
 }
 
 impl Bridge {
@@ -77,6 +77,6 @@ pub(crate) static TOPICS: once_cell::sync::Lazy<Vec<&'static str>> =
 /// from this to forward events to the dispatcher thread.
 pub(crate) static DISPATCH_TX: OnceLock<Sender<Event>> = OnceLock::new();
 
-unsafe extern "C" {
-    pub(crate) fn uperf_bridge_write_log(buf: *const c_char, len: usize);
+extern "C" {
+    pub(crate) fn uperf_bridge_write_log(tag: *const c_char, msg: *const c_char, len: usize);
 }

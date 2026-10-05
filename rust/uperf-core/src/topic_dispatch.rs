@@ -240,7 +240,7 @@ fn write_log_line(s: &str) {
     };
     // SAFETY: the FFI copies the bytes.
     unsafe {
-        crate::ffi::uperf_bridge_write_log(cstr.as_ptr(), s.len());
+        crate::ffi::uperf_bridge_write_log(std::ptr::null(), cstr.as_ptr(), s.len());
     }
 }
 
