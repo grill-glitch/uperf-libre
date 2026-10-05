@@ -1,0 +1,1 @@
+Result<std::sync::MutexGuard<'_, Option<std::sync::mpsc::Sender<Event>>>, PoisonError<std::sync::MutexGuard<'_, Option<std::sync::mpsc::Sender<Event>>>>>

@@ -412,7 +412,7 @@ uperf-cli warn   <config.json>              # 输出告警行（应与原版日�
 | 阶段 | 内容 | 交付 | 验收 |
 |---|---|---|---|
 | **M0** ✅ | vendor dfps 到 `cpp/dfps/`，跑通 dfps 原样构建；确定 CLI/日志/进程名适配点 | `DFPS_VENDOR.md`、可编译的 `cpp/uperf`、`docs/m0-evidence.md` | **已达成**（2026-10-02，alioth）：`build.sh check` 全绿，进程监督器/日志格式/CLI/4 个事件源/配置热重载全部真机验证；`offscreen.state` 未触发，列入 §12.2 |
-| **M1** | Rust staticlib 骨架 + C ABI 桥跑通：C++ 启动 → 调 `uperf_rs_start` → 订阅 `input.touch`/`topapp.pkgName` → 收到事件打日志 | 骨架 + 桥 | 真机日志出现 Rust 侧收到的事件 |
+| **M1** ✅ (build/check) ⚠️ (待真机) | Rust staticlib 骨架 + C ABI 桥跑通 | `rust/uperf-core/`（Cargo.toml + lib.rs + ffi.rs + topic_dispatch.rs + tests/）、`cpp/uperf/bridge.cpp`、`cpp/include/uperf_rs_bridge.h` | 构建 `build.sh check` 全绿（895 KB、NEEDED `libc/libdl/libm`、stripped、`GNU_RELRO + BIND_NOW`）；10/10 payload 解码单元测试通过；**真机待验**（alioth 离线，无法 push） |
 | **M2** | 配置系统 + `uperf-cli parse/warn`；63 份配置全部解析 | parity 工具 | §10.2 告警对账 0 差异 |
 | **M3** | switcher/profile/sysfs（6 类写入器）+ 状态机 | `plan` 输出 | §10.3 假 sysfs 写入序列 0 差异 |
 | **M4** | CPU 调频器 + 上下文调度器 | 真实 sysfs 写入 | §10.4 的 `wechat_resume`/`android_am` 场景行为对齐 |

@@ -1,0 +1,16 @@
+[package]
+name = "uperf-cli"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# AGENT.md §10.2: offline parity tool used to diff the Rust policy engine against the
+# upstream binary. Does not depend on `uperf-core` because the tool runs on the host.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "1"
+
+[[bin]]
+name = "uperf-cli"
+path = "src/main.rs"

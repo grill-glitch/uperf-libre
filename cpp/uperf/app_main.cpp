@@ -48,6 +48,7 @@
 #include "modules/topapp_monitor.h"
 #include "platform/heavy_worker.h"
 #include "platform/module_base.h"
+#include "uperf_rs_bridge.h"
 #include "utils/inotify.h"
 #include "utils/misc.h"
 #include "utils/misc_android.h"
@@ -128,10 +129,13 @@ static void StartPlatform(void) {
 }
 
 static void AppMainMayThrow(void) {
-    SPDLOG_INFO("{}[{}] M0 platform bring-up, config={} log={} (config parsing lands in M2)",
+    SPDLOG_INFO("{}[{}] M1 platform bring-up, config={} log={} (Rust event tap)",
                 PROC_NAME, GetGitCommitHash(), configFile, logFile);
     StartPlatform();
     SPDLOG_INFO("Uperf is running");
+    // Hand off to the Rust engine. From this point on, the Rust dispatcher
+    // thread logs every event the C++ bridge forwards across `uperf_rs_on_event`.
+    uperf_bridge_init_rust(configFile.c_str(), logFile.c_str());
     for (;;) {
         Sleep(UINT32_MAX);
     }

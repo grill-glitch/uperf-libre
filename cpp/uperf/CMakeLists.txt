@@ -17,7 +17,9 @@ set(DFPS_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../dfps/source)
 
 set(UPERF_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/app_main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/bridge.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/m0_event_tap.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/rust_stub.cpp
 
     ${DFPS_SOURCE_DIR}/platform/cobridge.cpp
     ${DFPS_SOURCE_DIR}/platform/delayed_worker.cpp
@@ -41,7 +43,7 @@ set(UPERF_SRCS
 set(UPERF_INCS
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../dfps/source
+    ${DFPS_SOURCE_DIR}
 )
 
 # version.c from the vendored template (same recipe as dfps' source/CMakeLists.txt)
@@ -53,9 +55,15 @@ execute_process(COMMAND git log -1 --format=%h
 configure_file(${DFPS_SOURCE_DIR}/version.c.in ${CMAKE_CURRENT_BINARY_DIR}/version.c @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/.git/index)
 
+# Rust staticlib (cargo build --release --target aarch64-linux-android)
+set(UPERF_RS_LIB "${CMAKE_SOURCE_DIR}/rust/target/aarch64-linux-android/release/libuperf_core.a")
+
 add_executable(uperf ${UPERF_SRCS} ${CMAKE_CURRENT_BINARY_DIR}/version.c)
 target_include_directories(uperf PRIVATE ${UPERF_INCS})
 target_link_libraries(uperf PRIVATE spdlog scn)
+if(EXISTS ${UPERF_RS_LIB})
+    target_link_libraries(uperf PRIVATE ${UPERF_RS_LIB})
+endif()
 
 set(THIS_COMPILE_FLAGS
     -Wall -Werror -fdata-sections -ffunction-sections -fno-threadsafe-statics -fno-omit-frame-pointer -fno-rtti
