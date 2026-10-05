@@ -65,6 +65,10 @@ install_uperf() {
     mkdir -p $USER_PATH
     mv -f $USER_PATH/uperf.json $USER_PATH/uperf.json.bak
     cp -f $MODULE_PATH/config/$cfgname.json $USER_PATH/uperf.json
+    # Kept for libuperf.sh::uperf_ensure_config(): `config/` is deleted below, so this
+    # is the only copy left on the device, and it is what makes a lost user directory
+    # recoverable instead of requiring a reinstall.
+    cp -f $MODULE_PATH/config/$cfgname.json $USER_PATH/uperf.json.default
     [ ! -e "$USER_PATH/perapp_powermode.txt" ] && cp $MODULE_PATH/config/perapp_powermode.txt $USER_PATH/perapp_powermode.txt
     rm -rf $MODULE_PATH/config
     set_perm_recursive $BIN_PATH 0 0 0755 0755 u:object_r:system_file:s0

@@ -333,6 +333,23 @@ static void ParseOpt(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    // A daemon must not die because a pipe it inherited broke.
+    //
+    // spdlog's default logger keeps a stdout sink, so every line is written to the
+    // log file *and* to inherited stdout. When the daemon is (re)started from a shell
+    // whose stdout is a pipe — an adb shell, or the WebUI's `exec` — the reader goes
+    // away as soon as that command returns, and the next buffered flush lands on a
+    // closed pipe: SIGPIPE, and the daemon dies with no tombstone and no log line.
+    // Measured on alioth: `sh webui.sh restart` at 23:31:28 logged normally until
+    // 23:32:55 and then stopped, leaving pid 9601 as an unreaped zombie that init
+    // reported as "received SIGPIPE". At boot this never showed because service.sh's
+    // stdout is not a short-lived pipe.
+    //
+    // Ignoring it is the correct behaviour for this process regardless of how it was
+    // launched: nothing in the daemon depends on a SIGPIPE, and the log file — the
+    // interface the module actually contracts on — stays open.
+    signal(SIGPIPE, SIG_IGN);
+
     InitLogger();
     InitArgv(argc, argv);
     ParseOpt(argc, argv);
