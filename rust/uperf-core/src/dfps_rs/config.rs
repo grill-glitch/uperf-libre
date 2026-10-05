@@ -42,8 +42,8 @@ const MAX_ENABLE_MIN_BRIGHTNESS: i32 = 255;
 /// `idle == -1 && active == -1` is the upstream "rule disabled" sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FpsRule {
-    pub(crate) idle: i32,
-    pub(crate) active: i32,
+    pub idle: i32,
+    pub active: i32,
 }
 
 impl FpsRule {
@@ -234,6 +234,18 @@ impl RuleTable {
             .get(pkg_name)
             .copied()
             .unwrap_or(self.universal)
+    }
+
+    /// Read-only accessors so external binaries (e.g. `dfpsd` smoke) can
+    /// inspect the parsed table without needing `pub` fields.
+    pub fn universal_rule(&self) -> FpsRule {
+        self.universal
+    }
+    pub fn offscreen_rule(&self) -> FpsRule {
+        self.offscreen
+    }
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
     }
 }
 
