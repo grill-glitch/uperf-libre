@@ -29,6 +29,7 @@
 #include "modules/cobridge_type.h"
 #include "platform/cobridge.h"
 #include "platform/module_base.h"
+#include "modules/input_listener.h"
 
 #include <spdlog/spdlog.h>
 
@@ -243,6 +244,27 @@ extern "C" void uperf_bridge_set_log_level(const char *level) {
     // without an explicit flush per call.
     logger->flush_on(lv);
     SPDLOG_INFO("Log level set to '{}'", spdlog::level::to_string_view(lv).data());
+}
+
+// The one vendored-module adaptation: uperf reads the input thresholds from
+// `modules.input` while dfps hardcodes them. The listener is constructed in
+// StartPlatform() (before the config is parsed), so it registers itself here and
+// Rust applies the config values once it has them.
+static InputListener *g_inputListener = nullptr;
+
+extern "C" void uperf_register_input_listener(void *listener) {
+    g_inputListener = static_cast<InputListener *>(listener);
+}
+
+extern "C" void uperf_bridge_set_input_thresholds(float swipeThd, float gestureThdX,
+                                                 float gestureThdY) {
+    if (g_inputListener == nullptr) {
+        SPDLOG_WARN("input listener not registered, thresholds not applied");
+        return;
+    }
+    g_inputListener->SetThresholds(swipeThd, gestureThdX, gestureThdY);
+    SPDLOG_INFO("Input thresholds: swipeThd={} gestureThdX={} gestureThdY={}", swipeThd,
+                gestureThdX, gestureThdY);
 }
 
 extern "C" void uperf_bridge_init_rust(const char *config_path, const char *log_path) {

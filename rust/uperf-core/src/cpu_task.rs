@@ -312,7 +312,11 @@ fn log_line(s: &str) {
     use std::sync::{Mutex, OnceLock};
     static BUF: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
     let buf = BUF.get_or_init(|| Mutex::new(Vec::with_capacity(192)));
-    let mut b = buf.lock().unwrap();
+    // `try_lock`, not `lock`: this buffer is written from the shutdown path too,
+    // and a signal handler can re-enter that path (SIGTERM + the supervisor's
+    // SIGUSR1). A plain `lock()` there deadlocks on itself and the process never
+    // exits. A dropped log line is always better than a hung daemon.
+    let Ok(mut b) = buf.try_lock() else { return };
     b.clear();
     b.extend_from_slice(s.as_bytes());
     b.push(b'\n');

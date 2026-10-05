@@ -44,6 +44,12 @@ int                   uperf_bridge_subscribe(const char *topic);
 void                  uperf_bridge_init_rust(const char *config_path, const char *log_path);
 // `modules.log.level`; called from Rust once the config is parsed.
 void                  uperf_bridge_set_log_level(const char *level);
+// `modules.input.{swipeThd,gestureThdX,gestureThdY}`. The listener is built in
+// StartPlatform() before the config is parsed, so app_main registers it here and
+// Rust applies the values afterwards.
+void                  uperf_register_input_listener(void *listener);
+void                  uperf_bridge_set_input_thresholds(float swipeThd, float gestureThdX,
+                                                        float gestureThdY);
 
 #ifdef __cplusplus
 }

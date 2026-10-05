@@ -211,7 +211,55 @@ and all three policies read `powersave` with no live `uperf` process left, while
 five pre-existing `[uperf]` zombies (from an earlier `SIGKILL` teardown) kept exactly
 the same PIDs — i.e. the graceful path added none.
 
-## 9. Still open
+## 9. `killall uperf` used to leave the device pinned in `userspace` [V]
+
+Found by testing **the module's own stop path** instead of one of my own invention:
+`magisk/script/libuperf.sh` stops the daemon with `killall uperf`, and that is also what
+`uninstall.sh` and any user script would do.
+
+Real run, no `UPERF_FAKE_ROOT`, so the governor genuinely takes over:
+
+```text
+armed:                 governors: userspace userspace userspace   live uperf: 2
+after killall uperf:   governors: userspace userspace userspace   live uperf: 2
+                       disarmed lines: 0
+```
+
+Two processes survived and all three policies stayed in `userspace` — a phone pinned at
+the last published frequency with no way back except a manual write.
+
+**Cause: a re-entered signal handler deadlocking on a non-reentrant mutex.** `killall`
+delivers `SIGTERM` to the daemon *and* the worker at the same time, and the daemon's own
+handler then forwards `TERM_SIG` (`SIGUSR1`) to the worker. The worker's `AppSigHandler`
+therefore runs **twice, concurrently, on the same thread**; both runs call
+`uperf_rs_stop()`, and both log. The shared log line buffer is a plain
+`std::sync::Mutex`, which is not reentrant, so the second `lock()` blocked on the first
+forever. `AppSigHandler` also previously handled only `TERM_SIG`, so a direct `SIGTERM`
+to a worker took the *daemon's* inherited handler and exited **without**
+`uperf_rs_stop()` at all.
+
+Two fixes, both needed:
+
+1. `AppSigHandler` now handles `SIGTERM`/`SIGINT` as well as `TERM_SIG` — a direct
+   `killall` must run the same cleanup, not the supervisor's bare `exit()`;
+2. the handler blocks `TERM_SIG`/`SIGTERM`/`SIGINT` with `sigprocmask` before doing any
+   work, so it cannot re-enter;
+3. every log helper uses `try_lock` and **drops** the line when the buffer is busy (a
+   lost log line is always better than a hung daemon). Verified standalone that
+   `try_lock` returns `WouldBlock` immediately in exactly that shape.
+
+After the fix, same test:
+
+```text
+after killall uperf:   governors: powersave powersave powersave   live uperf: 0
+                       Rust: cpu governor disarmed (original governor restored)
+                       uperf_rs_stop: dispatcher joined
+```
+
+Signalling the daemon alone was always fine (`t+2s live=0`, governors restored) — the bug
+only showed up on the path the module actually uses.
+
+## 10. Still open
 
 * the **producer** of `sfanalysis.hint`: the vendor `libsfanalysis.so` contains no
   path string at all (only `/proc/<pid>/comm`, `/proc/<pid>/stat`, `/proc/self/maps`,
@@ -219,8 +267,41 @@ the same PIDs — i.e. the graceful path added none.
   The consumer-side path `<config dir>/sfanalysis.hint` is **[I]**. **[U]**
 * `auto` semantics **[I]** (see §1).
 * `atrace` payload **[U]** (see §5).
-* `modules.input.*` (`swipeThd`, `gestureThdX/Y`, `gestureDelayTime`, `holdEnterTime`)
-  are still the vendored dfps hardcoded defaults (`0.01/0.03/0.03/2.0/1.0` in
-  `input_listener.cpp`) and are **not** read from the config yet. The values used by
-  `sdm888.json` happen to equal those defaults, which is why the mismatch is invisible
-  on this device but is real for other configs. **[V]**
+* solved in §11 — kept here as the original note of the gap.
+
+## 11. `modules.input.*` wired (the one vendored deviation) [V]
+
+`modules.input` documents five parameters; the README marks two of them unused:
+
+| key | README | consequence |
+|---|---|---|
+| `swipeThd` | 单次触摸轨迹百分比长度超过该阈值，判定为滑动操作 | **wired** |
+| `gestureThdX` | 全面屏手势起始 X 轴百分比位置 | **wired** |
+| `gestureThdY` | 全面屏手势起始 Y 轴百分比位置 | **wired** |
+| `gestureDelayTime` | **暂不使用** | not wired — correct as-is |
+| `holdEnterTime` | **暂不使用** | not wired — correct as-is |
+
+So the real gap was three values, and one of them mattered: **62 of the 63 configs ask for
+`swipeThd` = 0.03 while the vendored constructor hardcodes 0.01** — a 3x difference in
+swipe detection. Only `sdm888.json`, the config used for development here, uses 0.01,
+which is why it never showed up on this device. `uperf-config`'
+`the_shipped_swipe_threshold_distribution_is_what_justifies_the_wiring` test pins that
+distribution so the claim cannot rot.
+
+dfps hardcodes them in the constructor with no setter, so this needed **the first and only
+change to `cpp/dfps/**`**: a 3-line `SetThresholds()` (see `DFPS_VENDOR.md` for the diff
+and why a setter beats reimplementing ~300 lines of evdev hotplug). The alternative —
+rewriting `InputListener` under `cpp/uperf/` — was rejected as the larger risk.
+
+Plumbing: `app_main.cpp` registers the constructed listener with the bridge, Rust calls
+`uperf_bridge_set_input_thresholds()` after parsing the config. Device:
+
+```text
+sdm888.json        -> Input thresholds: swipeThd=0.01 gestureThdX=0.03 gestureThdY=0.03
+the 62/63 variant  -> Input thresholds: swipeThd=0.03 gestureThdX=0.03 gestureThdY=0.03
+```
+
+`modules.input.enable` is **not** honoured: all 63 configs set it true, and the vendored
+listener is started by the platform layer before the config is parsed, so a config that
+disabled it would be logged but not obeyed. **[U]** — worth closing if a config ever
+disables it.

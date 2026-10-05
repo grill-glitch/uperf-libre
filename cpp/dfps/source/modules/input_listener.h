@@ -32,6 +32,21 @@ public:
     ~InputListener();
     void Start(void) override;
 
+    // ADDED FOR THE UPERF REWRITE — the only change to this vendored file.
+    //
+    // dfps hardcodes swipeThd/gestureThdX/gestureThdY in its constructor, while
+    // uperf reads them from the config (`modules.input`, described in
+    // config/README.md lines 96-98). Without this the listener uses 0.01 for
+    // swipeThd on every device, whereas 62 of the 63 shipped configs ask for
+    // 0.03 — a 3x difference in swipe detection. The upstream uperf binary does
+    // read these keys, so wiring them is fidelity, not divergence.
+    //
+    // `gestureDelayTime` and `holdEnterTime` are deliberately NOT wired: the
+    // README documents both as 暂不使用 (unused).
+    //
+    // Recorded in cpp/dfps/DFPS_VENDOR.md.
+    void SetThresholds(float swipeThd, float gestureThdX, float gestureThdY);
+
 private:
     void TouchEventThread(void);
     void OnInputDevUpdated(const std::string &filename, int flag);
