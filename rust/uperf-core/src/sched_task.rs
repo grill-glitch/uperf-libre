@@ -356,9 +356,14 @@ impl SchedTask {
     }
 
     pub fn stop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        let Some(t) = self.thread.take() else { return };
+        if !crate::shutdown::stop_and_join(
+            &self.stop,
+            t,
+            crate::shutdown::STOP_TIMEOUT,
+            || {},
+        ) {
+            log_line("Rust: sched task did not stop in time, detached");
         }
     }
 

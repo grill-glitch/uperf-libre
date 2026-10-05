@@ -150,6 +150,10 @@ pub fn read_opps_for_config(cfg: &Config) -> Vec<Vec<f64>> {
 pub struct CpuTask {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The `userspace` governor arming, shared with the task thread so the stop
+    /// path can restore the kernel's original governors even if the task thread
+    /// is stuck and never reaches its own `disarm()`.
+    writer: Arc<std::sync::Mutex<UserspaceWriter>>,
 }
 
 impl CpuTask {
@@ -164,10 +168,12 @@ impl CpuTask {
     {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_child = stop.clone();
+        let writer = Arc::new(std::sync::Mutex::new(UserspaceWriter::default()));
+        let writer_child = writer.clone();
         let thread = std::thread::Builder::new()
             .name("uperf-cpu".into())
             .spawn(move || {
-                let mut writer = UserspaceWriter::default();
+                let mut writer = writer_child.lock().expect("writer lock");
                 writer.arm(&targets);
                 if writer.is_armed() {
                     log_line(&format!(
@@ -233,13 +239,17 @@ impl CpuTask {
                         }
                     }
                 }
-                writer.disarm();
+                // Drop the lock before disarming so a stuck *caller* cannot
+                // deadlock us; disarm is idempotent.
+                drop(writer);
+                writer_child.lock().expect("writer lock").disarm();
                 log_line("Rust: cpu governor disarmed (original governor restored)");
             })
             .expect("spawn uperf-cpu governor");
         Self {
             stop,
             thread: Some(thread),
+            writer,
         }
     }
 
@@ -261,9 +271,19 @@ impl CpuTask {
     }
 
     pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        let Some(t) = self.thread.take() else { return };
+        let writer = self.writer.clone();
+        let ok = crate::shutdown::stop_and_join(&self.stop, t, crate::shutdown::STOP_TIMEOUT, || {
+            // The task thread never finished, so it never disarmed. Restore the
+            // kernel's governors from here: leaving every policy pinned in
+            // `userspace` at the last published frequency is the one failure this
+            // module cannot recover from on its own.
+            if writer.lock().map(|mut w| w.disarm()).is_ok() {
+                log_line("Rust: cpu governor disarmed by the stop path (task did not exit)");
+            }
+        });
+        if !ok {
+            log_line("Rust: cpu task did not stop in time, detached");
         }
     }
 
