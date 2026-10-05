@@ -45,9 +45,18 @@ fn apply_root(path: &str, root: &Option<String>) -> String {
 pub struct UserspaceWriter {
     /// (policy_dir, original governor)
     armed: Vec<(String, String)>,
+    /// Optional file where the originals are recorded for the stop script.
+    state_file: Option<std::path::PathBuf>,
 }
 
 impl UserspaceWriter {
+    /// Where to record the governors we replaced, so the module's stop script can
+    /// restore the truth even if this process is killed outright. Set from the
+    /// config's directory; `None` disables the record.
+    pub fn state_file(&mut self, path: Option<std::path::PathBuf>) {
+        self.state_file = path;
+    }
+
     /// Switch every userspace cluster to the `userspace` governor, remembering
     /// what it was. Idempotent.
     pub fn arm(&mut self, targets: &[FreqTarget]) {
@@ -64,6 +73,25 @@ impl UserspaceWriter {
             if std::fs::write(&gov, "userspace").is_ok() {
                 self.armed.push((policy_dir.clone(), prev));
             }
+        }
+        self.record_state();
+    }
+
+    /// Write `<policy-name> <original-governor>` lines. Only entries whose original
+    /// is known and is not `userspace` are recorded — recording `userspace` as an
+    /// "original" is how a device ends up stuck.
+    fn record_state(&self) {
+        let Some(path) = self.state_file.as_ref() else { return };
+        let mut out = String::new();
+        for (dir, prev) in &self.armed {
+            if prev.is_empty() || prev == "userspace" {
+                continue;
+            }
+            let name = dir.rsplit('/').next().unwrap_or(dir);
+            out.push_str(&format!("{name} {prev}\n"));
+        }
+        if !out.is_empty() {
+            let _ = std::fs::write(path, out);
         }
     }
 
@@ -99,6 +127,15 @@ impl UserspaceWriter {
 }
 
 use crate::orchestrator::{CollectingSink, Sink, SysfsWrite};
+
+/// `<config dir>/orig_governor.txt` — where the governors we replace are recorded.
+///
+/// The module's stop script reads the same path, so a SIGKILL (which no in-process
+/// handler can survive) still leaves enough information for something else to put
+/// the device back.
+fn state_file_for(_cfg: &Config) -> Option<std::path::PathBuf> {
+    std::env::var("UPERF_STATE_FILE").ok().filter(|s| !s.is_empty()).map(std::path::PathBuf::from)
+}
 
 /// OPP list for a cpufreq policy, in kHz.
 ///
@@ -161,6 +198,7 @@ impl CpuTask {
     pub fn spawn_with<F>(
         mut gov: Governor,
         targets: Vec<FreqTarget>,
+        state_file: Option<std::path::PathBuf>,
         mut read_stat: F,
     ) -> Self
     where
@@ -174,6 +212,7 @@ impl CpuTask {
             .name("uperf-cpu".into())
             .spawn(move || {
                 let mut writer = writer_child.lock().expect("writer lock");
+                writer.state_file(state_file);
                 writer.arm(&targets);
                 if writer.is_armed() {
                     log_line(&format!(
@@ -181,12 +220,12 @@ impl CpuTask {
                         writer.armed.len()
                     ));
                 }
-                // Prime the sampler and throw away the first span: it covers
-                // the interval from boot to process start, which reads as a
-                // full-load blip and would kick every cluster to max once.
-                let mut prev = read_stat();
+                // Prime the sampler and throw away the first span: it covers the
+                // interval from boot to process start, which reads as a full-load
+                // blip and would kick every cluster to max once. Sample, wait one
+                // period, then start from the *second* reading.
                 std::thread::sleep(gov.sample_period());
-                prev = read_stat();
+                let mut prev = read_stat();
                 let mut tick = 0u64;
                 while !stop_child.load(Ordering::Relaxed) {
                     let period = gov.sample_period();
@@ -253,8 +292,37 @@ impl CpuTask {
         }
     }
 
+    /// Whether the userspace frequency takeover is wanted.
+    ///
+    /// **Off unless `UPERF_CPU_GOVERNOR=1`.** It is a takeover: the kernel stops
+    /// scaling the policy and the last published frequency sticks if the daemon
+    /// dies without disarming. Measured on alioth against the stock `schedutil`:
+    ///
+    /// ```text
+    ///                        idle            under 4 busy threads
+    ///   schedutil  policy0   1804800 (max)   1804800
+    ///   ours       policy0   883200-1420800  691200 (min)
+    /// ```
+    ///
+    /// Because `config/sdm888.json` caps the whole CPU at PL1 = 1.0 W and allocates
+    /// it by marginal cost, the little cluster (efficiency 115 vs 320/400) gets
+    /// almost nothing — so interactive work that runs there drops to the minimum
+    /// frequency. Upstream's own governor cannot run on this kernel at all (all
+    /// eight CpufreqWriter strategies need a min-freq knob that the driver locks),
+    /// so taking over preserves no upstream behaviour. The default is therefore to
+    /// leave the platform's governor alone.
+    pub fn takeover_wanted() -> bool {
+        std::env::var("UPERF_CPU_GOVERNOR").map(|v| v == "1").unwrap_or(false)
+    }
+
     /// Production constructor: real OPPs + real `/proc/stat`.
     pub fn spawn(cfg: &Config, mode: &str, scene: &str) -> Option<Self> {
+        if !Self::takeover_wanted() {
+            log_line(
+                "Rust: cpu governor idle (set UPERF_CPU_GOVERNOR=1 to take over frequency control)",
+            );
+            return None;
+        }
         let opps = read_opps_for_config(cfg);
         if opps.iter().all(|o| o.is_empty()) {
             log_line("Rust: cpu governor skipped (no OPP tables readable)");
@@ -263,7 +331,7 @@ impl CpuTask {
         let gov = governor_from_config(cfg, mode, scene, &opps)?;
         let targets = freq_targets(cfg);
         let n_cpu = gov.clusters.iter().map(|c| c.cores.len()).sum::<usize>().max(1);
-        Some(Self::spawn_with(gov, targets, move || {
+        Some(Self::spawn_with(gov, targets, state_file_for(cfg), move || {
             std::fs::read_to_string("/proc/stat")
                 .map(|t| parse_stat(&t, n_cpu))
                 .unwrap_or_default()
@@ -406,7 +474,7 @@ mod tests {
         // a `Userspace` target would switch the *host's* CPU governor.
         let _ = freq_targets(&cfg);
         let targets = vec![FreqTarget::None];
-        let mut task = CpuTask::spawn_with(gov, targets, || {
+        let mut task = CpuTask::spawn_with(gov, targets, None, || {
             // escalating load so the governor has to move
             let mut j = uperf_config::CpuJiffies::default();
             j.busy = vec![50, 50];

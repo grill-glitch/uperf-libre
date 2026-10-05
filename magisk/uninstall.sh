@@ -37,6 +37,13 @@ wait_until_login() {
 on_remove() {
     wait_until_login
 
+    # Stop the daemon and undo the userspace-governor takeover before the module
+    # (and its binary) disappears. Without this a running daemon keeps the
+    # policies pinned, and after the module is gone nothing can restore them.
+    . $MODDIR/script/libuperf.sh 2>/dev/null || . $MODDIR/libuperf.sh 2>/dev/null
+    uperf_stop 2>/dev/null || killall uperf 2>/dev/null
+    uperf_restore_governors 2>/dev/null
+
     # keep user perapp config
     cp -af $USER_PATH/perapp_powermode.txt /sdcard/
     rm -rf $USER_PATH

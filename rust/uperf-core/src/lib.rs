@@ -114,6 +114,14 @@ pub(crate) extern "C" fn uperf_rs_start(
     let cfg = unsafe { CStr::from_ptr(config_path) };
     let log = unsafe { CStr::from_ptr(log_path) };
 
+    // Where the CPU governor records the governors it replaces, so the module's
+    // stop script can restore them even after a SIGKILL.
+    if std::env::var("UPERF_STATE_FILE").is_err() {
+        let cfg_str = cfg.to_string_lossy().to_string();
+        if let Some(dir) = std::path::Path::new(&cfg_str).parent() {
+            std::env::set_var("UPERF_STATE_FILE", dir.join("orig_governor.txt"));
+        }
+    }
     let (loaded_cfg, mode) = load_config_and_mode(&cfg.to_string_lossy());
 
     // Apply `modules.log.level` (upstream's LogLevelSwitcher). Every shipped

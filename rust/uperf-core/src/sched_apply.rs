@@ -182,8 +182,6 @@ pub struct ProcInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadInfo {
     pub tid: i32,
-    /// `/proc/<pid>/task/<tid>/comm`.
-    pub comm: String,
     pub is_main: bool,
 }
 
@@ -199,17 +197,25 @@ pub fn read_proc(pid: i32) -> Option<ProcInfo> {
     if name.is_empty() {
         return None; // kernel thread
     }
+    // Thread *ids* only. Reading every thread's `comm` here cost one file read per
+    // thread per scan — ~3000 reads a second on this device, which measured at more
+    // than one full CPU core. Callers read `comm` lazily, via `comm_of`, and only
+    // for threads they have not already decided.
     let mut threads = Vec::new();
     let task_dir = PathBuf::from(format!("/proc/{pid}/task"));
     for e in std::fs::read_dir(task_dir).ok()?.flatten() {
         let Ok(tid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm"))
-            .map(|s| s.trim_end_matches('\n').to_string())
-            .unwrap_or_default();
-        threads.push(ThreadInfo { tid, comm, is_main: tid == pid });
+        threads.push(ThreadInfo { tid, is_main: tid == pid });
     }
     threads.sort_by_key(|t| t.tid);
     Some(ProcInfo { pid, name, threads })
+}
+
+/// A thread's `comm` (`/proc/<pid>/task/<tid>/comm`), trimmed.
+pub fn comm_of(pid: i32, tid: i32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm"))
+        .map(|s| s.trim_end_matches('\n').to_string())
+        .unwrap_or_default()
 }
 
 /// Enumerate every process that has a non-empty cmdline.
@@ -459,6 +465,9 @@ mod tests {
             p.threads.iter().any(|t| t.is_main && t.tid == pid),
             "the main thread must be tid == pid"
         );
+        // `comm` is read lazily now (see `comm_of`), so `read_proc` must not have
+        // paid for it: the struct no longer carries it at all.
+        assert!(!comm_of(pid, pid).is_empty(), "comm_of works for the main thread");
     }
 
     #[test]

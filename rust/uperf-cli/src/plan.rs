@@ -9,7 +9,7 @@
 //! of `uperf_core::sysfs::dispatch` (kept in sync here — both crates are
 //! independently tested).
 
-use uperf_config::{Config, WriterKind};
+use uperf_config::Config;
 
 /// Emit the cascade + sysfs path expansion for `<mode> <scene>`.
 pub fn emit(cfg: &Config, mode: &str, scene: &str) {

@@ -183,7 +183,11 @@ impl Orchestrator {
 
     /// Apply an inbound event. A scene change re-resolves the preset and queues
     /// the corresponding sysfs writes.
-    pub fn on_event(&mut self, ev: &crate::topic_dispatch::Event) {
+    ///
+    /// `pub(crate)`: `Event` is the dispatcher's internal type, so a public
+    /// signature would leak it. The crate's real public surface is the
+    /// `extern "C"` entry points in `lib.rs`.
+    pub(crate) fn on_event(&mut self, ev: &crate::topic_dispatch::Event) {
         if let crate::topic_dispatch::Event::Offscreen(b) = ev {
             if self.offscreen != *b {
                 self.offscreen = *b;

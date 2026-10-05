@@ -39,6 +39,10 @@ use crate::orchestrator::Orchestrator;
 /// Name of the hint file inside the config's directory.
 pub const SF_HINT_FILE: &str = "sfanalysis.hint";
 
+/// How often the watcher wakes up. See the comment at the loop: this thread was the
+/// daemon's dominant CPU consumer at 250 ms.
+pub const POLL_INTERVAL: Duration = Duration::from_millis(1000);
+
 /// Why a preset was chosen — mirrors upstream's three log shapes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Why {
@@ -217,6 +221,10 @@ impl WatchTask {
                 if plan.sf_hint.is_none() {
                     log("SfAnalysisListener disabled by config");
                 }
+                if plan.switch_inode.is_none() && plan.perapp.is_none() && plan.sf_hint.is_none() {
+                    log("Rust: nothing to watch, preset watcher exiting");
+                    return;
+                }
                 for p in [
                     plan.switch_inode.as_deref(),
                     plan.perapp.as_deref(),
@@ -233,22 +241,38 @@ impl WatchTask {
                 // ---- loop ---------------------------------------------------
                 let mut last_gen = orch.lock().generation();
                 let mut last_sf_byte: Option<u8> = None;
+                // 1 s, not 250 ms. Measured: this thread was the daemon's dominant CPU
+                // consumer (cumulative ticks an order of magnitude above every other
+                // thread, while the vendored C++ modules were at ~0). The files it
+                // watches change when a human picks a preset or the vendor library
+                // emits a hint — 1 s of latency is invisible, and it cuts the polling
+                // work 4x. A `/MAIN_THREAD/`-style responsiveness argument does not
+                // apply here; the preset path is already the slow path.
                 while !stop_child.load(Ordering::Relaxed) {
-                    let events = ino.poll(Duration::from_millis(250)).unwrap_or_default();
-                    // Re-arm unconditionally. `inotify_add_watch` on an
-                    // already-watched path is idempotent (same wd, no duplicate
-                    // events), and this is what arms a file created *after*
-                    // startup: on /sdcard the directory create notification did
-                    // not arrive, so the hint file never got a watch of its own.
-                    for p in [
-                        plan.switch_inode.as_deref(),
-                        plan.perapp.as_deref(),
-                        plan.sf_hint.as_deref(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        ino.rearm(p);
+                    let events = ino.poll(POLL_INTERVAL).unwrap_or_default();
+                    // Re-arm only when the kernel says a watch is gone, or when a
+                    // file we read turns out to be missing (it may have been
+                    // recreated). Doing this on *every* tick was the original
+                    // approach — it arms a file created later, but it also meant six
+                    // `inotify_add_watch` calls per tick forever, and this thread
+                    // ended up the daemon's biggest CPU consumer.
+                    let mut need_rearm = false;
+                    for ev in &events {
+                        if matches!(ev, crate::inotify::WatchEvent::WatchLost(_)) {
+                            need_rearm = true;
+                        }
+                    }
+                    if need_rearm {
+                        for p in [
+                            plan.switch_inode.as_deref(),
+                            plan.perapp.as_deref(),
+                            plan.sf_hint.as_deref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            ino.rearm(p);
+                        }
                     }
                     if !events.is_empty() {
                         // Any event is a wakeup: re-read everything and re-arm

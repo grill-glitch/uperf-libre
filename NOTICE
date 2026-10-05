@@ -786,3 +786,95 @@ library.  If this is what you want to do, use the GNU Library General
 Public License instead of this License.
 =========================================
 END OF osm0sis/android-busybox-ndk NOTICES AND INFORMATION
+
+=========================================================================
+ADDITIONS FOR THE RUST REWRITE (this repository)
+=========================================================================
+
+This distribution is a reimplementation of uperf v3. The upstream NOTICE above is
+retained in full. Two things changed and are stated here explicitly so nobody has to
+diff the trees to find out:
+
+  1. components this build no longer contains, and
+  2. components this build adds.
+
+-------------------------------------------------------------------------
+1. NO LONGER PRESENT (upstream used these; the rewrite does not)
+-------------------------------------------------------------------------
+
+  * jpcre2/jpcre2 10.32.01
+  * nlohmann/json 3.10.4
+  * PhilipHazel/pcre2 10.39
+
+These were the upstream binary's regex stack. The rewrite replaces all three with the
+pure-Rust `regex` crate, which was chosen on evidence rather than preference: across
+the 63 shipped configs there are 2528 pattern occurrences but only 28 unique patterns,
+and none uses a PCRE-only construct (no lookaround, atomic group, branch reset,
+conditional, recursion, \K, inline flag or backreference). Measured and pinned by
+`rust/uperf-config/tests/all_sched_configs.rs::no_shipped_pattern_needs_pcre2`.
+Dropping them also removes a C dependency from the Android staticlib — `build.sh check`
+asserts the binary's NEEDED list stays at libm/libdl/libc.
+
+-------------------------------------------------------------------------
+2. ADDED
+-------------------------------------------------------------------------
+
+2.1 yc9559/dfps — Apache-2.0
+    The C++ platform layer (process supervisor, module base, event bus, cgroup /
+    input / topapp / offscreen listeners, inotify, input reader, atrace, scheduler
+    helpers, plus vendored scnlib 0.4.0 and spdlog 1.9.2) is taken verbatim from the
+    same author's open-source dfps, whose README describes it as "Splited from Uperf
+    v2". Vendored at commit f84866c1ff1518da72037056844cb0917a941904 (2023-01-15),
+    with its own LICENSE and NOTICE kept in place and original file headers intact.
+    Exactly one vendored file carries a local change — a three-line setter in
+    `source/modules/input_listener.{h,cpp}`, because uperf reads its input thresholds
+    from the config while dfps hardcodes them. See `cpp/dfps/DFPS_VENDOR.md`.
+    https://github.com/yc9559/dfps
+
+2.2 Rust crates statically linked into the Android artifact
+    All are permissive (MIT / Apache-2.0 / Unlicense); none is copyleft. Version and
+    licence expression as resolved for the aarch64-linux-android target:
+
+      aho-corasick 1.1.5          Unlicense OR MIT
+      cfg-if 1.0.5                MIT OR Apache-2.0
+      equivalent 1.0.2            Apache-2.0 OR MIT
+      hashbrown 0.17.1            MIT OR Apache-2.0
+      indexmap 2.14.2             Apache-2.0 OR MIT
+      itoa 1.0.18                 MIT OR Apache-2.0
+      libc 0.2.190                MIT OR Apache-2.0
+      lock_api 0.4.14             MIT OR Apache-2.0
+      memchr 2.8.3                Unlicense OR MIT
+      once_cell 1.21.4            MIT OR Apache-2.0
+      parking_lot 0.12.5          MIT OR Apache-2.0
+      parking_lot_core 0.9.12     MIT OR Apache-2.0
+      regex 1.13.1                MIT OR Apache-2.0
+      regex-automata 0.4.18       MIT OR Apache-2.0
+      regex-syntax 0.8.11         MIT OR Apache-2.0
+      scopeguard 1.2.0            MIT OR Apache-2.0
+      serde 1.0.229               MIT OR Apache-2.0
+      serde_core 1.0.229          MIT OR Apache-2.0
+      serde_json 1.0.151          MIT OR Apache-2.0
+      smallvec 1.16.2             MIT OR Apache-2.0
+      thiserror 1.0.69            MIT OR Apache-2.0
+      unicode-ident 1.0.26        (MIT OR Apache-2.0) AND Unicode-3.0
+      zmij 1.0.23                 MIT
+
+    Build-time only (proc-macro crates; their code runs at compile time and is not
+    part of the artifact): proc-macro2 1.0.107, quote 1.0.47, serde_derive 1.0.229,
+    syn 3.0.6, thiserror-impl 1.0.69 — all MIT OR Apache-2.0.
+
+    The full text of each licence, and each crate's own copyright notice, is
+    available from the crate sources at https://crates.io. Apache-2.0 licensed
+    crates are used under the terms of the Apache License, Version 2.0, a copy of
+    which is in LICENSE.
+
+-------------------------------------------------------------------------
+3. THE ORIGINAL BINARY IS NOT DISTRIBUTED
+-------------------------------------------------------------------------
+
+The closed-source upstream `uperf` binary that this project replaces is not part of
+this distribution. `build.sh pack` stages a copy of the module tree and overwrites
+`bin/uperf` with the freshly built executable, so a released archive can only contain
+the rewrite. `build.sh check` additionally refuses to accept a module tree whose
+`bin/uperf` is the upstream binary. Any upstream binary kept by a developer for
+behaviour comparison lives outside the repository and outside the archive.
