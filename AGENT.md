@@ -394,14 +394,21 @@ C 侧禁止 `-fno-exceptions`（桥要能抛给 upper 层兜底）。
 
 ### 10.2 parity 工具（关键：必须有真证据）
 
-`rust/uperf-cli` 提供两个子命令，**离线**对账（不需要设备）：
+> **两套配置要分清**：
+> * **上游 v3 发行包**里是 **38** 份 `config/*.json` → 已 vendor 到 `docs/upstream-configs/`，
+>   用作 parser 的回归基线（38/38 通过，见 `docs/m2-evidence.md` §2）。
+> * **本仓库（UGT 基线）**里是 **63** 份 `config/*.json`（UGT 在 38 份基础上补了自己的平台）
+>   → M3 起用 `uperf-cli` 对**这 63 份**做全量 plan 对账，那才是发货目标。
+
+`rust/uperf-cli` 提供三个子命令，**离线**对账（不需要设备）：
 
 ```
-uperf-cli parse  <config.json>              # 输出解析后的展开表（JSON）
-uperf-cli expand <config.json> <mode> <scene>   # 输出该场景下所有 knob 的最终值
-uperf-cli plan   <config.json> <mode> <scene>   # 输出 sysfs 写入序列（path=value）
-uperf-cli warn   <config.json>              # 输出告警行（应与原版日志逐字一致）
+uperf-cli parse  <config.json>                  # 结构摘要（meta/modules/initials/presets）
+uperf-cli warn   <config.json>                  # 告警行（应与原版 CfgMgr 日志逐字一致）
+uperf-cli plan   <config.json> <mode> <scene>   # 层叠后的键值 + 来源（M3 起再接 sysfs path 展开）
 ```
+> 原计划的 `expand` 子命令已并入 `plan`（同一份层叠结果，`plan` 额外标出每个键的来源：
+> `preset[scene]` / `preset[*]` / `init`）。
 验收：对 63 份配置 × 5 preset × 7 scene 全组合跑 `warn`/`plan` 并与原版日志/实测写入比对，
 差异必须为 0（或每一处差异都有书面理由）。
 
