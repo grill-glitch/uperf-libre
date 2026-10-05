@@ -154,11 +154,78 @@ accounting read `/proc/<tid>/stat` for every thread every scan (now lazy, via
 exposed a crate-private type publicly. Both cleaned; the Android build and the host
 build are warning-free.
 
-## 6. What §1's other criteria still need
+## 6. Criterion 2 — config identity and knob warnings, verbatim [V]
 
-* **criterion 2** (63 configs parse + warnings match upstream verbatim): the parse
-  side is covered (`all_configs`, `all_sched_configs`); the *warning-line* comparison
-  against upstream has not been done for all 63 — only for the configs exercised here.
+Implemented in `uperf-core/src/startup_lines.rs` and emitted at startup. The strings
+come from `strings` on the upstream binary, not from memory:
+
+```text
+Config '{}' by '{}'
+Knob '{}' not writeable
+Knob '{}' not defined in '{}'
+Config file not specified
+Config file not found
+```
+
+`Config '<name>' by '<author>'` is **byte-identical** to upstream's line for the same
+config, which is a stronger statement than it looks: the shipped metas carry emoji and
+irregular spacing, so this is a real comparison and not a shape check:
+
+```text
+upstream: Config 'sdm888/sdm888' by 'yc@coolapk   ❤️吟惋兮❤改'
+ours:     Config 'sdm888/sdm888' by 'yc@coolapk   ❤️吟惋兮❤改'
+```
+
+The rewrite's own diagnostics keep a `Rust:` prefix for greppability; the parity lines
+are deliberately emitted **without** one, exactly as upstream emits them.
+
+### The knob-warning set: a strict subset, with the divergence investigated
+
+Criterion 2 asks for the warnings to match verbatim. The *format* does; the *set* does
+not, and the cause is worth writing down rather than waving at.
+
+```text
+upstream (sdm888, alioth): 16 paths
+ours:                       8 paths — all 8 are in upstream's list (no false alarms)
+```
+
+Getting there required establishing what "not writeable" actually tests, by trying
+each candidate against the disputed paths:
+
+| test | `/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq` | `/dev/cpuset/top-app/cpus` |
+|---|---|---|
+| `open(O_WRONLY)` as root | succeeds | succeeds |
+| write the **current** value back | succeeds (no-op) | succeeds |
+| write a **different** value (`0-7`) | **fails EACCES** (driver) | succeeds |
+| mode bits | **444 — no write bit** | writable |
+
+So no single syscall reproduces upstream's verdicts:
+
+* for `scaling_max_freq` the **mode bits** are the honest signal — the driver accepts
+  an open and even a no-op write-back while refusing real values (this is the M5a
+  finding), which is why the probe checks the mode bit *and* does a write-back;
+* for `/dev/cpuset/<group>/cpus` this device **demonstrably accepts the write** while
+  upstream still warns. That part of upstream's list is not reproducible and is left as
+  a documented divergence rather than imitated — warning about a knob that works would
+  be the more damaging of the two errors.
+
+Residual: 8 upstream-only paths (5 `/dev/cpuset/*/cpus`, 3 devfreq `min_freq` symlink
+names). Every one of our 8 is also in upstream's list, so the failure mode is
+under-warning, never a false alarm.
+
+### Not yet exercised
+
+`Knob '{}' not defined in '{}'` (a resolved knob name that is not in the sysfs knob
+table) is implemented in vocabulary but never triggered: the shipped configs do not
+reference undeclared knobs — which is what `uperf-cli warn` already asserts for all 63.
+Its verbatim form is known; its firing condition is **[I]**.
+
+## 6b. What §1's other criteria still need
+
+* **criterion 2**, remaining: the *unknown-key* / hint-duration families
+  (`Unknown key '{}' of module '{}' …`, `Duration of hint '{}' not specified`,
+  `Base hint of preset '{}' not defined`) are known only as strings; no shipped config
+  triggers them, so they cannot be compared against an upstream run here.
 * **criterion 3** (all 5 presets × 7 scenes produce the same write sequence as
   upstream): upstream's own write sequence is unobtainable on this kernel (its
   governor and writers cannot start), so this can only be compared against the
