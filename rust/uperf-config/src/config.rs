@@ -215,6 +215,28 @@ impl Config {
     }
 
     /// All scenes that have at least one knob in this preset (excludes `*`).
+    /// `modules.log.level`, if present (`trace|debug|info|warn|...`).
+    pub fn log_level(&self) -> Option<String> {
+        self.modules
+            .log
+            .as_ref()
+            .and_then(|m| m.get("level"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    /// The config's `presets` keys, **alphabetically** (they are stored in a
+    /// `BTreeMap`, so this is not the JSON order). Only used to validate a
+    /// referenced preset name, where order is irrelevant.
+    ///
+    /// Used to validate values that reference a preset by name but live outside
+    /// the JSON — `cur_powermode.txt` and `perapp_powermode.txt`. Upstream's
+    /// message for a bad one is `Perapp preset '{}' for app '{}' not defined in
+    /// config` / `Failed to switch to undefined preset '{}'`.
+    pub fn preset_names(&self) -> Vec<String> {
+        self.presets.keys().cloned().collect()
+    }
+
     pub fn scenes_in_preset(&self, mode: &str) -> Vec<String> {
         let Some(p) = self.presets.get(mode) else { return vec![]; };
         p.scenes

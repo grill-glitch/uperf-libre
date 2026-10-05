@@ -215,6 +215,36 @@ extern "C" const uperf_bridge_t *uperf_bridge_handle(void) {
 //  uperf_rs_init wrapper called from app_main.cpp
 // ---------------------------------------------------------------------------
 
+// `modules.log.level` from the config. Upstream has a LogLevelSwitcher class and
+// the level names trace/debug/info/warn are literals in its binary; every shipped
+// config sets "info". The logger used to be hardcoded to debug, which is not what
+// any config asks for.
+extern "C" void uperf_bridge_set_log_level(const char *level) {
+    spdlog::level::level_enum lv = spdlog::level::info;
+    const std::string v = level ? level : "";
+    if (v == "trace") {
+        lv = spdlog::level::trace;
+    } else if (v == "debug") {
+        lv = spdlog::level::debug;
+    } else if (v == "info") {
+        lv = spdlog::level::info;
+    } else if (v == "warn" || v == "warning") {
+        lv = spdlog::level::warn;
+    } else if (v == "error" || v == "err") {
+        lv = spdlog::level::err;
+    } else if (v == "critical") {
+        lv = spdlog::level::critical;
+    } else if (v == "off") {
+        lv = spdlog::level::off;
+    }
+    auto logger = spdlog::default_logger();
+    logger->set_level(lv);
+    // Flush on the same level so every line we emit reaches the file promptly
+    // without an explicit flush per call.
+    logger->flush_on(lv);
+    SPDLOG_INFO("Log level set to '{}'", spdlog::level::to_string_view(lv).data());
+}
+
 extern "C" void uperf_bridge_init_rust(const char *config_path, const char *log_path) {
     uperf_rs_init(&kBridge);
     if (uperf_rs_start(config_path, log_path) != 0) {

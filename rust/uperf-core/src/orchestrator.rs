@@ -83,6 +83,10 @@ pub struct Orchestrator {
     pending: Vec<SysfsWrite>,
     /// Package of the process `topapp.pkgName` last reported.
     top_app: Option<String>,
+    /// Raw screen state from `offscreen.state` (not the FSM's interpretation).
+    /// The per-app switcher needs the flag itself: `offscreen.state` maps to the
+    /// `Switch` hint, but `Switch` also covers other transitions.
+    offscreen: bool,
     /// Bumped whenever `scene` or `top_app` changes, so the context scheduler
     /// can tell "something a rule depends on moved" from "a tick went by"
     /// without polling strings.
@@ -100,6 +104,7 @@ impl Orchestrator {
             scene: "idle".into(),
             pending: Vec::new(),
             top_app: None,
+            offscreen: false,
             generation: 0,
         }
     }
@@ -117,6 +122,7 @@ impl Orchestrator {
             scene: "idle".into(),
             pending: Vec::new(),
             top_app: None,
+            offscreen: false,
             generation: 0,
         }
     }
@@ -133,6 +139,28 @@ impl Orchestrator {
     /// Monotonic counter for "scene or top app changed".
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Whether the screen is off, straight from `offscreen.state`.
+    pub fn offscreen(&self) -> bool {
+        self.offscreen
+    }
+
+    /// Feed a hint that arrived out of band — the `sfanalysis.hint` byte written
+    /// by the vendor injection library, which is not an event-bus topic.
+    pub fn on_sf_hint(&mut self, h: crate::hint::SfHint) -> bool {
+        match self.hint.process(h) {
+            Some(t) => {
+                let new_scene = Self::scene_for_hint(t.to);
+                if new_scene != self.scene {
+                    self.scene = new_scene.to_string();
+                    self.generation += 1;
+                    self.plan_current_scene();
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn mode(&self) -> &str {
@@ -156,6 +184,12 @@ impl Orchestrator {
     /// Apply an inbound event. A scene change re-resolves the preset and queues
     /// the corresponding sysfs writes.
     pub fn on_event(&mut self, ev: &crate::topic_dispatch::Event) {
+        if let crate::topic_dispatch::Event::Offscreen(b) = ev {
+            if self.offscreen != *b {
+                self.offscreen = *b;
+                self.generation += 1;
+            }
+        }
         if let crate::topic_dispatch::Event::Topapp(pkg) = ev {
             if self.top_app.as_deref() != Some(pkg.as_str()) {
                 self.top_app = Some(pkg.clone());
