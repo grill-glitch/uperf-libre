@@ -37,6 +37,7 @@ ANDROID_NDK="${ANDROID_NDK:-$HOME/Android/Sdk/ndk/android-ndk-r30}"
 TOOLCHAIN_PREBUILT="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64"
 TOOLCHAIN_BIN="$TOOLCHAIN_PREBUILT/bin"
 ARM64_PREFIX=aarch64-linux-android23
+ARM64_TARGET=aarch64-linux-android
 
 TOOL="${TOOL:-$HOME/Android/Sdk/platform-tools/adb}"
 ADB="$TOOL ${ADB_SERIAL:+-s $ADB_SERIAL}"
@@ -62,8 +63,18 @@ build_targets() {
     cmake --build $BUILD_DIR/$1 --config $BUILD_TYPE --target $2 -j
 }
 
+# Rust staticlib for the target ABI. Must run before cmake links: a stale
+# libuperf_core.a silently produces an ABI-mismatched binary (this bit us once —
+# the bridge's write_log gained a `tag` parameter and the C++ side read a length
+# as a pointer).
+build_rust() {
+    echo ">>> Making libuperf_core.a (Rust, $ARM64_TARGET)"
+    (cd $BASEDIR/rust && cargo build -p uperf-core --release --target $ARM64_TARGET)
+}
+
 make_uperf() {
     echo ">>> Making uperf ($BUILD_TYPE, $ARM64_PREFIX)"
+    build_rust
     build_targets $ARM64_PREFIX uperf
 }
 

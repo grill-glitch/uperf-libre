@@ -283,12 +283,33 @@ touch   -> idle     : 超时或渲染结束
 每个 hint 有最长时长（`modules.switcher.hintDuration.{idle,touch,trigger,gesture,switch,junk}`，
 `idle` 为 0.0 表示默认无时限）；`junk` 时长取 **preset/scene 同名键**（`junk` 场景）。
 
-### 8.2 配置层叠（`CSS 式覆盖`）
+### 8.2 配置层叠（**已按 38 份真实配置修正：不是 `base_hint` 嵌套**）
 
-优先级：`presets.<mode>.<scene>` > `presets.<mode>.*` > `initials.<module>.<param>`；
-键名带模块前缀（`cpu.baseSampleTime`、`sysfs.cpusetTa`、`sched.scene`）。
-`modules.*` 为静态段，只在实例化时读一次。
-**必须复刻原版的告警语义**：定义了在 `modules` 里不存在的模块/键 → 按原版文案告警并忽略（§10.2 逐条对账）。
+实测的 v3 结构（`docs/upstream-configs/*.json` 全量验证，见 `docs/m2-evidence.md`）：
+
+```jsonc
+{
+  "meta":     { "name": "...", "author": "..." },
+  "modules":  { "switcher": {...}, "atrace": {...}, "sfanalysis": {...},
+                "sysfs": {...}, "sched": {...}, "cpu": {...}, "anim": {...},
+                "input": {...}, "log": {...} },
+  "initials": { "<mod>.<param>": <value>, ... },     // 扁平点号键
+  "presets":  { "balance": { "*": {...}, "idle": {...}, "touch": {...},
+                             "trigger": {...}, "gesture": {...}, "switch": {...},
+                             "junk": {...} }, ... }  // 每个 preset 下：scene -> {点号键: 值}
+}
+```
+
+**关键更正**：`presets.<preset>` 的下一层**直接就是 scene 名**（`*` / `idle` / `touch` /
+`trigger` / `gesture` / `switch` / `junk`），`*` 是该 preset 的通配默认。**38 份配置里没有任何
+一份使用 `base_hint` 或 `presets.<p>.initials` 嵌套**（AGENT.md 早先版本记错了，
+来自对文档而非数据的推断）。层叠优先级：
+
+1. `presets[<mode>][<scene>][<dotted>]`
+2. `presets[<mode>]["*"][<dotted>]`
+3. `initials[<dotted>]`
+
+`modules.*` 为静态段，只在实例化时读一次。**必须复刻原版的告警语义**（§10.2 逐条对账）。
 
 ### 8.3 sysfs 写入器（6 类）
 
@@ -413,7 +434,7 @@ uperf-cli warn   <config.json>              # 输出告警行（应与原版日�
 |---|---|---|---|
 | **M0** ✅ | vendor dfps 到 `cpp/dfps/`，跑通 dfps 原样构建；确定 CLI/日志/进程名适配点 | `DFPS_VENDOR.md`、可编译的 `cpp/uperf`、`docs/m0-evidence.md` | **已达成**（2026-10-02，alioth）：`build.sh check` 全绿，进程监督器/日志格式/CLI/4 个事件源/配置热重载全部真机验证；`offscreen.state` 未触发，列入 §12.2 |
 | **M1** ✅ | Rust staticlib 骨架 + C ABI 桥跑通 | `rust/uperf-core/`（Cargo.toml + lib.rs + ffi.rs + topic_dispatch.rs + tests/）、`cpp/uperf/bridge.cpp`、`cpp/include/uperf_rs_bridge.h` | **已达成**（2026-10-05，alioth）：`build.sh check` 全绿；10/10 payload 解码单元测试通过；**真机过**：C++/Rust 同步出现 `EventTap:` / `[Rust] Rust: ...` 两份日志，pid list 预览(8/8)字节相等；电源键触发 `offscreen.state=true`，**officially§12.2 第 1 条已解** |
-| **M2** | 配置系统 + `uperf-cli parse/warn`；63 份配置全部解析 | parity 工具 | §10.2 告警对账 0 差异 |
+| **M2** 🚧 | 配置系统 + `uperf-cli parse/warn/plan`；38 份配置全部解析 | `rust/uperf-cli/`、`docs/upstream-configs/`、`docs/m2-evidence.md` | **部分达成**：38/38 配置解析通过、`warn` 零误报；`plan` 已出层叠结果。待做：`plan` 的 sysfs 路径展开（需 M3 writer）、与原版日志文案逐条对账 |
 | **M3** | switcher/profile/sysfs（6 类写入器）+ 状态机 | `plan` 输出 | §10.3 假 sysfs 写入序列 0 差异 |
 | **M4** | CPU 调频器 + 上下文调度器 | 真实 sysfs 写入 | §10.4 的 `wechat_resume`/`android_am` 场景行为对齐 |
 | **M5** | sfanalysis 监听 + anim/log/atrace；整机替换 `magisk/bin/uperf` | 可发布的 Magisk zip | §10.4 全部 7 张基线通过；§1 成功判据全绿 |
@@ -442,7 +463,9 @@ M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（conf
 | `topapp.pkgName` 的 `|Δpid| > 10` 门槛（`TOP_TASK_NR_DIFF_MIN`）是否与原版一致 | **已解**——dfps vendored `topapp_monitor.cpp` 与原版同源，原版**不复写**该模块，门槛=10 与 dfps 一致 |
 | NDK r26（clang 21）下 vendored scnlib / spdlog 需要非侵入式 shim | 已解决 | `cpp/CMakeLists.txt` 三处注释 + `docs/m0-evidence.md` §1（未改动 `cpp/dfps/**` 任何字节） |
 | **新增**：原版写 `/dev/cpuset/<g>/cpus`（cpu mask），不是 cgroup v2 cpu.max | 已发现 | M3 sysfs 写入器必须新增 cpu-mask 子类型（详见 `docs/m1-static-reverse.md` §3-§4） |
-| **SfHint 枚举值 ↔ 字符串映射** | **已静态推导出（6 值：idle/switch/trigger/gesture/touch/junk，对应 0..5；≥6 = unknown）** | 见 `docs/m1-static-reverse.md` §1.3；M3 hint state machine 按此实现
+| **SfHint 枚举值 ↔ 字符串映射** | **已静态推导出（6 值：idle/switch/trigger/gesture/touch/junk，对应 0..5；≥6 = unknown）** | 见 `docs/m1-static-reverse.md` §1.3；M3 hint state machine 按此实现 |
+| **`presets` 的真实结构** | **已解**：扁平 `presets[preset][scene]`，无 `base_hint` | 见 §8.2 与 `docs/m2-evidence.md` |
+| **stale `libuperf_core.a` 导致 ABI 错位崩溃** | 已修（工程性坑） | 症状：进程 `SIGSEGV` @ `memcpy(src=0x79,len=120)`；根因：改了 Rust 侧 FFI 签名但 `.a` 未重编，C++ 把 `len` 当指针。修法：`build.sh make` 现在**先跑 cargo 再 cmake**（见 `build.sh::build_rust`） |
 | v3 的 Hint 命名与日志文案（v2 文档不可信） | UNKNOWN | 以原版真机日志为准（M2 起逐条采集） |
 | `.data` 4 条不透明记录 | UNKNOWN | 不影响本项目（不重写该库） |
 | 原版 `CpufreqWriter` 各平台子类的确切分支条件 | 部分未知 | 用 63 份配置反推 + 真机写入对照 |

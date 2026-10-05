@@ -10,7 +10,11 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "1"
+clap = { version = "4", features = ["derive"] }
 
 [[bin]]
 name = "uperf-cli"
 path = "src/main.rs"
+[lib]
+name = "uperf_cli"
+path = "src/lib.rs"

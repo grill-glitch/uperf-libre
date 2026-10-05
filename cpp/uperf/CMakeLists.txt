@@ -19,7 +19,6 @@ set(UPERF_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/app_main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/bridge.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/m0_event_tap.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/rust_stub.cpp
 
     ${DFPS_SOURCE_DIR}/platform/cobridge.cpp
     ${DFPS_SOURCE_DIR}/platform/delayed_worker.cpp
