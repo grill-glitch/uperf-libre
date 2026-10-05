@@ -78,6 +78,27 @@ make_uperf() {
     build_targets $ARM64_PREFIX uperf
 }
 
+# The WebUI is built into magisk/webroot (KernelSU serves `<module>/webroot`), so it
+# travels with the module like any other file. The build output is deliberately not
+# committed — same reason the binary is not: what ships must be what was just built.
+build_webui() {
+    local dir="$BASEDIR/webui"
+    [ -d "$dir" ] || { echo " !! webui/ is missing"; exit 1; }
+    if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+        echo " !! node and npm are required to build the WebUI"
+        echo "    install node, then re-run; or build webui/ elsewhere and copy the"
+        echo "    result to magisk/webroot/ by hand"
+        exit 1
+    fi
+    echo ">>> Building WebUI"
+    # `npm ci` when the lockfile exists (reproducible), otherwise a plain install.
+    (cd "$dir" && { [ -f package-lock.json ] && npm ci --no-audit --no-fund >/dev/null 2>&1 || npm install --no-audit --no-fund >/dev/null 2>&1; })
+    (cd "$dir" && npm run build) || { echo " !! webui build failed"; exit 1; }
+    local idx="$BASEDIR/magisk/webroot/index.html"
+    [ -f "$idx" ] || { echo " !! magisk/webroot/index.html was not produced"; exit 1; }
+    echo "    -> magisk/webroot ($(du -sh "$BASEDIR/magisk/webroot" | awk '{print $1}'))"
+}
+
 # M0 artifact assertions (AGENT.md §9.3). Prints every measured value, fails on a
 # violated invariant.
 check_uperf() {
@@ -131,10 +152,32 @@ check_uperf() {
         exit 1
     fi
     [ "$sz" -lt 3145728 ] || { echo " !! binary too large (> 3 MiB)"; exit 1; }
+
+    # The WebUI must be a real build of webui/, not a leftover or a placeholder. The
+    # bundle is grepped for the two things that only a resolved build has: the control
+    # script path it calls, and the absence of the bare import specifier (which proves
+    # `kernelsu-alt` was bundled rather than left as a browser-unresolvable import).
+    local webroot="$BASEDIR/magisk/webroot"
+    local bundle
+    bundle=$(ls "$webroot"/assets/*.js 2>/dev/null | head -1)
+    if [ ! -f "$webroot/index.html" ] || [ -z "$bundle" ]; then
+        echo " !! magisk/webroot is missing or empty; run 'sh build.sh $BUILD_TYPE pack'"
+        exit 1
+    fi
+    if ! grep -q "script/webui.sh" "$bundle"; then
+        echo " !! the WebUI bundle does not reference the control script"
+        exit 1
+    fi
+    if grep -qE 'from *"kernelsu-alt"|require\("kernelsu-alt"\)' "$bundle"; then
+        echo " !! the WebUI bundle still imports 'kernelsu-alt' unbundled"
+        exit 1
+    fi
+    echo "    webui     : index.html + $(basename "$bundle") ($(stat -c %s "$bundle") bytes), imports resolved"
     echo "    -> OK"
 }
 
 pack_uperf() {
+    build_webui
     echo ">>> Packing uperf-magisk.zip"
     rm -rf $STAGE_DIR
     mkdir -p $STAGE_DIR $PKG_DIR

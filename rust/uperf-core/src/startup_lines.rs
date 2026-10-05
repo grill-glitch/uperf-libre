@@ -18,7 +18,6 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::io;
 
 /// True when the path is writeable *in the sense that matters*: the knob can be
 /// given a value.

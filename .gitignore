@@ -3,3 +3,9 @@ __pycache__
 /build
 /rust/target
 
+# WebUI: dependencies, the generated icon module, and the build output. `build.sh pack`
+# runs `npm ci` + the icon generator + vite, so all three are reproducible; what ships
+# is what was just built (same rule as the binary).
+/webui/node_modules
+/webui/icons.js
+/magisk/webroot
