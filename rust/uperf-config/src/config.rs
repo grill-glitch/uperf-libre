@@ -237,6 +237,19 @@ impl Config {
         Some((f("swipeThd")?, f("gestureThdX")?, f("gestureThdY")?))
     }
 
+    /// `modules.atrace.enable`.
+    ///
+    /// Upstream has an `AtraceSwitcher` class; the mechanism is the vendored dfps
+    /// `utils/atrace.c`, whose two trace_marker paths are exactly the strings the
+    /// uperf binary contains.
+    pub fn atrace_enabled(&self) -> Option<bool> {
+        self.modules
+            .atrace
+            .as_ref()
+            .and_then(|m| m.get("enable"))
+            .and_then(|v| v.as_bool())
+    }
+
     /// `modules.input.enable`. All 63 shipped configs set it true.
     pub fn input_enabled(&self) -> Option<bool> {
         self.modules

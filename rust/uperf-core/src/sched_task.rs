@@ -47,6 +47,11 @@ pub struct ScanReport {
     /// Affinity writes the kernel accepted but which did not take effect
     /// (cpuset constraint or an external controller re-applying its mask).
     pub affinity_ineffective: usize,
+    /// In dry-run mode: decisions that *would* have changed something. Without
+    /// this the counters all stay zero in dry-run and the periodic summary line
+    /// is never emitted, so a harness run cannot see the scene/top-app it is
+    /// evaluating.
+    pub would_change: usize,
 }
 
 impl ScanReport {
@@ -59,6 +64,7 @@ impl ScanReport {
         self.errors += o.errors;
         self.unchanged += o.unchanged;
         self.affinity_ineffective += o.affinity_ineffective;
+        self.would_change += o.would_change;
     }
 }
 
@@ -176,6 +182,7 @@ impl SchedApplier {
             }
             if self.dry_run {
                 if want.cpus.is_some() || want.policy != SchedPolicy::Skip {
+                    r.would_change += 1;
                     log_line(&format!(
                         "Rust: sched[DRY] pid={} {:?} tid={} {:?} rule={:?} scene={} ac={} pc={} -> cpus={:?} policy={:?}",
                         p.pid, p.name, t.tid, t.comm, d.rule, d.scene, d.ac, d.pc, d.cpus, d.policy
@@ -334,11 +341,15 @@ impl SchedTask {
                     // a steady state does not walk /proc at full rate.
                     if changed || idle_ticks % 4 == 0 {
                         let r = applier.scan();
-                        if r.affinity_changes + r.policy_changes + r.errors + r.affinity_ineffective
+                        if r.affinity_changes
+                            + r.policy_changes
+                            + r.errors
+                            + r.affinity_ineffective
+                            + r.would_change
                             > 0
                         {
                             log_line(&format!(
-                                "Rust: sched scene={} top={:?} procs={}/{} threads={} aff={} ({} ineffective) prio={} err={}",
+                                "Rust: sched scene={} top={:?} procs={}/{} threads={} aff={} ({} ineffective) prio={} err={} dry_would_change={}",
                                 applier.scene(),
                                 applier.top_app(),
                                 r.procs_matched,
@@ -347,7 +358,8 @@ impl SchedTask {
                                 r.affinity_changes,
                                 r.affinity_ineffective,
                                 r.policy_changes,
-                                r.errors
+                                r.errors,
+                                r.would_change
                             ));
                         }
                     }
@@ -409,6 +421,28 @@ mod tests {
         let name = self_name();
         let p = SchedPlanner::new(self_targeting_cfg(&name), "com.miui.home").unwrap();
         SchedApplier::new(p)
+    }
+
+    #[test]
+    fn dry_run_counts_what_it_would_have_changed() {
+        // A rule with a real effect, so the dry run has something to report.
+        let name = self_name();
+        let cfg = SchedConfig::from_value(&serde_json::json!({
+            "enable": true,
+            "cpumask": { "all": [0, 1] },
+            "affinity": { "ui": { "bg": "all", "idle": "all", "touch": "all", "boost": "all" } },
+            "prio": { "ui": { "bg": 0, "idle": 0, "touch": 0, "boost": 0 } },
+            "rules": [{ "name": "self", "regex": name, "pinned": false,
+                        "rules": [ { "k": ".", "ac": "ui", "pc": "ui" } ] }]
+        })).unwrap();
+        let mut a = SchedApplier::new(SchedPlanner::new(cfg, "com.miui.home").unwrap());
+        a.dry_run = true;
+        a.only = Some(self_name());
+        let r = a.scan();
+        assert!(r.procs_matched >= 1, "{r:?}");
+        assert!(r.would_change >= 1, "dry run must report what it would do: {r:?}");
+        assert_eq!(r.affinity_changes, 0, "and must not touch the kernel");
+        assert_eq!(r.policy_changes, 0, "and must not touch the kernel");
     }
 
     #[test]
