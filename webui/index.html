@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Uperf</title>
+    <!-- The manager serves these two files; every variable they define is also given a
+         literal fallback in theme.css, so the page is still correct with no network. -->
+    <link rel="stylesheet" href="https://mui.kernelsu.org/internal/insets.css">
+    <link rel="stylesheet" href="https://mui.kernelsu.org/internal/colors.css">
+    <link rel="stylesheet" href="theme.css">
+    <link rel="stylesheet" href="styles.css">
+    <script src="index.js" type="module"></script>
+</head>
+<body>
+    <div id="splash" class="splash"><div class="splash-mark" id="splash-mark"></div></div>
+
+    <div class="layout" unresolved>
+        <div class="top-bar">
+            <md-icon-button id="back-btn" aria-label="exit" class="hidden"><md-icon id="back-icon"></md-icon></md-icon-button>
+            <div class="title" id="title">Uperf</div>
+            <md-icon-button id="refresh-btn" aria-label="refresh"><md-icon id="refresh-icon"></md-icon></md-icon-button>
+        </div>
+
+        <div class="content" id="content">
+            <!-- ------------------------------------------------ 1. 首页 -->
+            <div id="home-page" class="page active">
+                <div class="page-content">
+                    <div class="card status-card" id="status-card">
+                        <md-ripple></md-ripple>
+                        <md-icon class="leading-icon" id="status-icon"></md-icon>
+                        <div class="card-text">
+                            <div class="card-title" id="status-title" data-i18n="state_unknown">…</div>
+                            <div class="card-subtitle" id="status-subtitle"></div>
+                        </div>
+                        <div class="badge" id="gov-badge"></div>
+                    </div>
+
+                    <div class="section-label" data-i18n="section_current_config">当前配置</div>
+                    <div class="card">
+                        <div class="row"><md-icon class="row-icon" id="cfg-icon"></md-icon>
+                            <div class="row-text">
+                                <div class="row-title" id="cfg-name"></div>
+                                <div class="row-detail" id="cfg-author"></div>
+                                <div class="row-detail" id="cfg-extra"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="section-label" data-i18n="section_device">设备</div>
+                    <div class="card" id="device-card"></div>
+
+                    <div class="section-label" data-i18n="section_module">模块</div>
+                    <div class="card" id="module-card"></div>
+                </div>
+            </div>
+
+            <!-- ------------------------------------------------ 2. 模式切换 -->
+            <div id="mode-page" class="page">
+                <div class="page-content">
+                    <div class="card current-card">
+                        <md-icon class="leading-icon" id="mode-icon"></md-icon>
+                        <div class="card-text">
+                            <div class="card-title" id="mode-current"></div>
+                            <div class="card-subtitle" id="mode-current-hint"></div>
+                        </div>
+                    </div>
+                    <div class="preset-list" id="preset-list"></div>
+                    <div class="hint" id="mode-note"></div>
+                </div>
+            </div>
+
+            <!-- ------------------------------------------------ 3. 更多 -->
+            <div id="more-page" class="page">
+                <div class="page-content">
+                    <div class="card list-card">
+                        <label class="list-item" id="restart-item">
+                            <md-ripple></md-ripple>
+                            <md-icon id="restart-icon"></md-icon>
+                            <div class="list-item-content">
+                                <div class="row-title" data-i18n="action_restart">重启 uperf daemon</div>
+                                <div class="row-detail" data-i18n="action_restart_detail">停止并按当前配置重新启动</div>
+                            </div>
+                        </label>
+                        <div class="list-item" id="language-item">
+                            <md-ripple></md-ripple>
+                            <md-icon id="language-icon"></md-icon>
+                            <div class="list-item-content">
+                                <div class="row-title" data-i18n="action_language">语言</div>
+                                <div class="row-detail" id="current-language"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="section-label" data-i18n="section_log">日志</div>
+                    <div class="card log-card">
+                        <div class="log-toolbar">
+                            <md-text-button id="log-refresh"><md-icon slot="icon" id="log-refresh-icon"></md-icon><span data-i18n="button_refresh">刷新</span></md-text-button>
+                            <div class="log-lines">
+                                <md-text-button data-lines="100">100</md-text-button>
+                                <md-text-button data-lines="500">500</md-text-button>
+                                <md-text-button data-lines="2000">2000</md-text-button>
+                            </div>
+                        </div>
+                        <pre class="log" id="log-view"></pre>
+                    </div>
+
+                    <div class="section-label" data-i18n="section_about">关于项目</div>
+                    <div class="card" id="about-card"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="bottom-bar">
+            <div class="bottom-bar-item" id="home" selected>
+                <md-icon class="bottom-icon" data-icon="home"></md-icon>
+                <div class="bottom-bar-item-text" data-i18n="tab_home">首页</div>
+            </div>
+            <div class="bottom-bar-item" id="mode">
+                <md-icon class="bottom-icon" data-icon="tune"></md-icon>
+                <div class="bottom-bar-item-text" data-i18n="tab_mode">模式切换</div>
+            </div>
+            <div class="bottom-bar-item" id="more">
+                <md-icon class="bottom-icon" data-icon="more_horiz"></md-icon>
+                <div class="bottom-bar-item-text" data-i18n="tab_more">更多</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="dialog-wrapper" unresolved>
+        <md-dialog id="confirm-dialog">
+            <div slot="headline" id="confirm-title"></div>
+            <div slot="content" id="confirm-body"></div>
+            <div slot="actions">
+                <md-text-button id="confirm-cancel" data-i18n="button_cancel">取消</md-text-button>
+                <md-text-button id="confirm-ok" data-i18n="button_ok">确定</md-text-button>
+            </div>
+        </md-dialog>
+    </div>
+</body>
+</html>

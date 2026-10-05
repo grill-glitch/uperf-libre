@@ -11,6 +11,10 @@ This project incorporates components from the projects listed below. The origina
 4.	eliaskosunen/scnlib version 0.4.0 (https://github.com/eliaskosunen/scnlib)
 5.	gabime/spdlog version 1.9.2 (https://github.com/gabime/spdlog)
 6.	osm0sis/android-busybox-ndk 1.31.1 (https://github.com/osm0sis/android-busybox-ndk)
+7.	material-components/material-web (@material/web) version 2.5.0 (https://github.com/material-components/material-web)
+8.	google/material-design-icons (@material-symbols/svg-400) version 0.40.2 (https://github.com/google/material-design-icons)
+9.	lit/lit version 3.3.3 (https://github.com/lit/lit) — bundled dependency of @material/web
+10.	KOWX712/kernelsu-alt version 3.1.2 (https://github.com/KOWX712/kernelsu-alt) — WebUI shell bridge
 
 %% jpcre2/jpcre2 NOTICES AND INFORMATION BEGIN HERE
 =========================================
@@ -878,3 +882,57 @@ this distribution. `build.sh pack` stages a copy of the module tree and overwrit
 the rewrite. `build.sh check` additionally refuses to accept a module tree whose
 `bin/uperf` is the upstream binary. Any upstream binary kept by a developer for
 behaviour comparison lives outside the repository and outside the archive.
+
+%% NOTICES AND INFORMATION for the bundle in magisk/webroot BEGIN HERE
+=========================================================================
+
+The KernelSU WebUI under `magisk/webroot/` is built from `webui/` and bundles the
+following components. Only `@material/web`, its `lit` dependency, the Material Symbols
+outlined glyphs (inlined at build time by `webui/tools/gen-icons.mjs`) and
+`kernelsu-alt` are shipped; `vite` and `esbuild` are build-time only and are not part
+of the module.
+
+@material/web 2.5.0 — Apache License 2.0
+    Copyright Google LLC. Components of Material 3 for the web.
+    https://github.com/material-components/material-web
+    The Apache License 2.0 text appears above in this file (see the spdlog and
+    scnlib notices); it applies to this component unchanged.
+
+@material-symbols/svg-400 0.40.2 — Apache License 2.0
+    Copyright Google LLC. Material Symbols outlined icon set; the glyphs are inlined
+    into the built bundle rather than shipped as files.
+    https://github.com/google/material-design-icons
+
+lit 3.3.3 — BSD 3-Clause License
+    Copyright (c) 2017 Google LLC. All rights reserved.
+    https://github.com/lit/lit
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+    1. Redistributions of source code must retain the above copyright notice, this
+       list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright notice,
+       this list of conditions and the following disclaimer in the documentation
+       and/or other materials provided with the distribution.
+
+    3. Neither the name of the copyright holder nor the names of its contributors
+       may be used to endorse or promote products derived from this software without
+       specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+    ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+    WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+    DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+    ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+    (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+    ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+kernelsu-alt 3.1.2 — Apache License 2.0
+    By KOWX712, a modified version of the `kernelsu` npm package.
+    https://github.com/KOWX712/kernelsu-alt
+    The Apache License 2.0 text appears above in this file and applies unchanged.

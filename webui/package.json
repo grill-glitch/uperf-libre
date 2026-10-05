@@ -1,0 +1,21 @@
+{
+  "name": "uperf-webui",
+  "version": "0.1.0",
+  "description": "KernelSU WebUI for the uperf Rust rewrite",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "icons": "node tools/gen-icons.mjs",
+    "build": "node tools/gen-icons.mjs && vite build --emptyOutDir",
+    "dev": "vite"
+  },
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "vite": "^7.3.1"
+  },
+  "dependencies": {
+    "@material-symbols/svg-400": "^0.40.0",
+    "@material/web": "^2.4.1",
+    "kernelsu-alt": "^3.1.1"
+  }
+}
