@@ -1,10 +1,14 @@
 //! uperf-core — the Rust half of the rewrite (AGENT.md §3, §5).
 //!
-//! M1 scope:
-//!   * Export the C ABI declared in `cpp/include/uperf_rs.h`.
-//!   * Subscribe to the platform's events via the C++ bridge, log every event on
-//!     stdout (actually through the same spdlog file sink as the C++ side), and
-//!     survive `start()` / `reload()` / `stop()` cycles. No policy yet (M2+).
+//! M1+M2+M3+M4:
+//!   * C ABI bridge + topic event dispatcher (`topic_dispatch`, `ffi`).
+//!   * Hint state machine (`hint`) — `SfHint` enum values 0..5 derived from the
+//!     upstream binary's two parallel jump tables (`docs/m1-static-reverse.md`
+//!     §1.3).
+//!   * Sysfs writer dispatch (`sysfs`) — SoC-specific per-cluster paths
+//!     extracted from upstream's real device fd trace.
+//!   * Orchestrator (`orchestrator`) — events → hint FSM → scene transition →
+//!     sysfs write sequence (M4; `Sink` trait + `CollectingSink` test double).
 //!
 //! Lifetime rules (AGENT.md §5.1):
 //!   * `data` passed to `on_event` is valid ONLY for the duration of the call.
@@ -13,16 +17,20 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-mod ffi;
-mod topic_dispatch;
+pub mod ffi;
+pub mod hint;
+pub mod orchestrator;
+pub mod sysfs;
+pub mod topic_dispatch;
 
 use std::ffi::CStr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex as PMutex;
 
 use ffi::{Bridge, BRIDGE, DISPATCH_TX, TOPICS};
+use orchestrator::Orchestrator;
 use topic_dispatch::Dispatcher;
 
 /// Single-line log buffer shared by the dispatcher + ad-hoc log helpers.
@@ -52,7 +60,6 @@ pub(crate) unsafe extern "C" fn uperf_rs_on_event(
 
     if let Some(ev) = topic_dispatch::Event::parse(topic, payload) {
         if let Some(tx) = DISPATCH_TX.get() {
-            // Send and ignore errors (receiver gone = dispatcher exited cleanly).
             let _ = tx.send(ev);
         }
     }
@@ -77,28 +84,32 @@ pub(crate) extern "C" fn uperf_rs_start(
     let cfg = unsafe { CStr::from_ptr(config_path) };
     let log = unsafe { CStr::from_ptr(log_path) };
 
-    // (Re)start the dispatcher.
+    let (loaded_cfg, mode) = load_config_and_mode(&cfg.to_string_lossy());
+    let has_cfg = loaded_cfg.is_some();
     {
         let mut guard = dispatcher_slot().lock();
         if let Some(mut prev) = guard.take() {
             prev.join_timeout(std::time::Duration::from_secs(2));
         }
-        *guard = Some(topic_dispatch::spawn());
+        let orch = match loaded_cfg {
+            Some(c) => Orchestrator::with_config(c, &mode),
+            None => Orchestrator::new(hint::HintDurations::default(), &mode),
+        };
+        let orch = Arc::new(PMutex::new(orch));
+        let _ = ORCHESTRATOR.set(orch.clone());
+        *guard = Some(topic_dispatch::spawn(orch));
     }
 
-    // Subscribe to every topic we cover in M1.
     let bridge = match BRIDGE.get() {
         Some(b) => b,
-        None => {
-            return 1;
-        }
+        None => return 1,
     };
     for topic in TOPICS.iter() {
         bridge.subscribe(topic);
     }
 
     log_msg(&format!(
-        "uperf_rs_start: cfg={} log={} (M1: log-only, no policy yet)",
+        "uperf_rs_start: cfg={} log={} (M4: orchestrator wired)",
         cfg.to_string_lossy(),
         log.to_string_lossy()
     ));
@@ -107,7 +118,7 @@ pub(crate) extern "C" fn uperf_rs_start(
 
 #[no_mangle]
 pub(crate) extern "C" fn uperf_rs_reload() {
-    log_msg("uperf_rs_reload: re-subscribing (M1 just re-subscribes)");
+    log_msg("uperf_rs_reload: re-subscribing");
     if let Some(bridge) = BRIDGE.get() {
         for topic in TOPICS.iter() {
             bridge.subscribe(topic);
@@ -124,19 +135,46 @@ pub(crate) extern "C" fn uperf_rs_stop() {
     log_msg("uperf_rs_stop: dispatcher joined");
 }
 
-// ---------------------------------------------------------------------------
-//  Globals
-// ---------------------------------------------------------------------------
-
 static DISPATCHER: OnceLock<PMutex<Option<Dispatcher>>> = OnceLock::new();
+static ORCHESTRATOR: OnceLock<Arc<PMutex<Orchestrator>>> = OnceLock::new();
+
+/// Read + parse the config and derive the initial preset.
+///
+/// Mode comes from `modules.switcher.switchInode` (default
+/// `/sdcard/Android/yc/uperf/cur_powermode.txt`), matching upstream's
+/// `Preset inode -> '<mode>'` startup behaviour.
+fn load_config_and_mode(cfg_path: &str) -> (Option<uperf_config::Config>, String) {
+    let text = match std::fs::read_to_string(cfg_path) {
+        Ok(t) => t,
+        Err(e) => {
+            log_msg(&format!("Rust: cannot read config '{cfg_path}': {e}"));
+            return (None, "balance".into());
+        }
+    };
+    let cfg = match uperf_config::Config::from_slice(text.as_bytes()) {
+        Ok(c) => c,
+        Err(e) => {
+            log_msg(&format!("Rust: config parse failed: {e}"));
+            return (None, "balance".into());
+        }
+    };
+    let inode = cfg
+        .modules_map()
+        .and_then(|m| m.get("switcher"))
+        .and_then(|s| s.get("switchInode"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("/sdcard/Android/yc/uperf/cur_powermode.txt");
+    let mode = std::fs::read_to_string(inode)
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "balance".into());
+    (Some(cfg), mode)
+}
 
 fn dispatcher_slot() -> &'static PMutex<Option<Dispatcher>> {
     DISPATCHER.get_or_init(|| PMutex::new(None))
 }
-
-// ---------------------------------------------------------------------------
-//  Helpers
-// ---------------------------------------------------------------------------
 
 fn log_msg(s: &str) {
     let mut buf = log_buf().lock().unwrap();

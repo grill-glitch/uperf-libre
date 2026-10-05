@@ -9,7 +9,7 @@
 //!
 //! AGENT.md §10.2: we must reproduce the same lines so log parity matches.
 
-use crate::config::{Config, HINT_SCENES};
+use uperf_config::{Config, HINT_SCENES};
 
 const KNOWN_MODULES: &[&str] = &[
     "switcher", "atrace", "sfanalysis", "sysfs", "sched", "cpu", "anim", "input", "log",
