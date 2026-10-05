@@ -86,7 +86,31 @@ uperf_stop() {
     uperf_restore_governors
 }
 
+# The user directory is seeded exactly once, at install time (`script/setup.sh`),
+# and the installed module deliberately keeps no copy of `config/` (setup.sh removes
+# it). Nothing else recreates it — so if the directory is ever lost, the daemon starts
+# with no config, logs `Config file not found`, and the module sits there doing nothing
+# forever, with no way back short of a reinstall. Measured on alioth: exactly that,
+# after the user directory was removed. Keep a pristine copy at install time and
+# restore it here, loudly, so the failure is recoverable without a reinstall.
+uperf_ensure_config() {
+    mkdir -p "$USER_PATH" 2>/dev/null
+    # /sdcard is an emulated view: creating the directory through it is what the
+    # module's own paths need, and it is also what keeps the view consistent.
+    [ -d "$USER_PATH" ] || mkdir -p /data/media/0/Android/yc/uperf 2>/dev/null
+    [ -f "$USER_PATH/uperf.json" ] && return 0
+    if [ -f "$USER_PATH/uperf.json.default" ]; then
+        cp -f "$USER_PATH/uperf.json.default" "$USER_PATH/uperf.json"
+        echo "uperf: no config at $USER_PATH/uperf.json, restored the installed default"
+        return 0
+    fi
+    echo "uperf: no config and no installed default to restore — reinstall the module"
+    return 1
+}
+
 uperf_start() {
+    uperf_ensure_config
+
     # A previous run may have died without disarming (SIGKILL). Undo that first,
     # then record the originals we are about to replace.
     uperf_restore_governors
@@ -102,7 +126,20 @@ uperf_start() {
         ASAN_LIB="$(ls $BIN_PATH/libclang_rt.asan-*-android.so)"
         export LD_PRELOAD="$ASAN_LIB $BIN_PATH/libc++_shared.so"
     fi
-    $BIN_PATH/uperf $USER_PATH/uperf.json -o $USER_PATH/uperf_log.txt
+    # Detach the daemon's stdio from whoever called us.
+    #
+    # The log file is the daemon's interface, but spdlog's default logger writes to
+    # stdout as well, and at this point stdout is the caller's pipe: an interactive
+    # shell at boot, or the WebUI's `exec`, whose read end disappears the moment the
+    # command returns. A write to that broken pipe raises SIGPIPE and took the daemon
+    # down ~90s after a WebUI-style restart (see app_main.cpp and
+    # docs/m7-evidence.md §7). The daemon also ignores SIGPIPE; this keeps the failure
+    # impossible rather than merely survivable, and keeps `-o` the only sink.
+    #
+    # `setsid()` inside the daemon is what makes it outlive this script; the
+    # redirections below only concern stdio.
+    $BIN_PATH/uperf $USER_PATH/uperf.json -o $USER_PATH/uperf_log.txt \
+        </dev/null >/dev/null 2>&1
 
     # waiting for uperf initialization
     sleep 2

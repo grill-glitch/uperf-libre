@@ -241,3 +241,83 @@ The daemon's steady-state cost is ~9% of a core, and ~0 of that is the Rust engi
 (`uperf-sched` is idle between scans, `uperf-watch` is now negligible). The remainder
 is the vendored platform layer's listeners, which are upstream's own code and the
 thing this project deliberately reuses. **[I]** — not separated further.
+
+## 7. Four defects found while wiring the WebUI [V]
+
+The WebUI's control path is the first code that *restarts* the daemon from a
+short-lived shell, and it surfaced four real faults — three of them in the module's
+own scripts, one in the entry point. All four are fixed and re-verified on alioth.
+
+### 7.1 A lost user directory silently kills the module, permanently
+
+`script/setup.sh` seeds `$USER_PATH/{uperf.json,perapp_powermode.txt}` **once**, at
+install time, and then deletes the only other copy (`rm -rf $MODULE_PATH/config`).
+`script/initsvc.sh` only launches. So with `$USER_PATH` gone the daemon starts, logs
+
+```text
+23:30:40 E Config file not found
+```
+
+and exits — every boot, forever, with no in-product way back short of a reinstall.
+Reproduced for real: the directory was removed during test cleanup, and the module was
+dead until it was hand-restored.
+
+Fix: `setup.sh` also writes `uperf.json.default`, and
+`libuperf.sh::uperf_ensure_config()` (called from `uperf_start`) recreates the
+directory and restores that copy, loudly. The module now recovers from a wiped
+`/sdcard/Android/yc` on its own.
+
+### 7.2 Restarting from a shell killed the daemon via SIGPIPE
+
+`uperf_start` runs the daemon in the foreground of whoever called it, and spdlog's
+default logger keeps a **stdout** sink alongside the `-o` file sink. When the caller's
+stdout is a pipe that goes away — an adb shell, or the WebUI's `exec` — the next
+buffered flush writes to a closed pipe:
+
+```text
+23:34:44 I init : Untracked process (pid: 9601 name: (uperf) ppid: 1 pgrp: 9601
+                 state: Z) received SIGPIPE
+23:34:44 I init : ... did not have an associated service entry and will not be reaped
+```
+
+Measured: started 23:31:28, last log line 23:32:55, dead as a zombie by 23:34:44 — no
+tombstone, no error line, nothing in the log. At boot this never appeared because
+`service.sh`'s stdout is not a short-lived pipe, which is exactly why a WebUI restart
+would have introduced it.
+
+Fix, both halves: the daemon ignores `SIGPIPE` (nothing in it depends on one), and
+`uperf_start` runs it with `</dev/null >/dev/null 2>&1` so the `-o` file is the only
+sink. Re-verified: after the same shell-scoped restart the daemon was still alive at
+120s with the log grown 1240 → 17767 lines.
+
+### 7.3 The module's private busybox shadows `ps`, so status lied
+
+`pathinfo.sh` prepends `$BIN_PATH/busybox` to `PATH`, and the installer's
+`busybox --install -s` declares an applet there for **every** command — including
+`ps`, which then rejects the tool's own arguments:
+
+```text
+$ /data/adb/modules/uperf/bin/busybox/ps -A -o PID,STAT,NAME
+ps: bad -o argument 'PID', supported arguments: user,group,comm,...
+```
+
+The empty output read as `daemon.count=0` next to a daemon that was demonstrably
+running, and made `restart.ok` report failure for a restart that had worked — a status
+line lying in the direction that looks like "the module is broken". The control entry
+now uses `/system/bin/ps` explicitly.
+
+### 7.4 `ps` column layout: a two-character state broke the pid match
+
+`ps -A -o PID,STAT,NAME` prints ` 9837 Ss    uperf` — the state is `Ss`, not `S`, so a
+positional pattern assuming one character matched nothing. Matching on the last column
+(`$NF == "uperf"`, with `Z` excluded so a lingering zombie is not "running") is correct
+for both `S` and `Ss`.
+
+### 7.5 Restoring a deleted user directory needs the *emulated* path
+
+After the directory was removed behind the emulated-storage layer's back, the `/sdcard`
+view kept a stale dentry for it: reads worked and new files in the *parent* worked, but
+creating any file inside `/sdcard/Android/yc/uperf/` failed with `ENOENT` while the
+same write through `/data/media/0/Android/yc/uperf/` succeeded. `mv` + `mkdir` through
+`/sdcard` (so the FUSE layer owns the new inode) restored it without a reboot. Worth
+remembering before concluding "the module cannot write its own state".
