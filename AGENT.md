@@ -436,11 +436,13 @@ M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（conf
 ### 12.2 其它未知
 | 项 | 状态 | 处理 |
 |---|---|---|
-| `sfanalysis.hint` 的状态码语义 | UNKNOWN | 真机抓取（M2） |
-| **`offscreen.state` 在 alioth 上从未触发**：vendored 判据是 `/dev/cpuset/restricted` pid 数 > 10，而该集合在本机恒为 0 | **已解（M1 真验）**——电源键物理熄屏后 `restricted` 立即从 0 涨到 221，`Rust: offscreen.state = true` 出现。`input keyevent 26` 在某些场景下不会真正熄屏，必须真的按电源键。 | M2：物理电源键熄屏后读 `/dev/cpuset/restricted/cgroup.procs`；并用**原版二进制**同机抓日志确定 v3 的真实熄屏判据。详见 `docs/m0-evidence.md` §3.2 |
-| `/dev/cpuset` 在本机是 **cgroup v1 形态**（有 `tasks`/`notify_on_release`），`/sys/fs/cgroup` 是 v2（只有 `apps`/`system`） | 未定 | M2 钉死"哪个是真正的任务分组视图"，否则 cgroup 事件可能读到陈旧数据 |
-| `topapp.pkgName` 的 `|Δpid| > 10` 门槛（`TOP_TASK_NR_DIFF_MIN`）是否与原版一致 | 未定 | M2 用原版对照小应用切换场景 |
-| NDK r30（clang 21）下 vendored scnlib / spdlog 需要非侵入式 shim | 已解决 | `cpp/CMakeLists.txt` 三处注释 + `docs/m0-evidence.md` §1（未改动 `cpp/dfps/**` 任何字节） |
+| `sfanalysis.hint` 的状态码语义 | UNKNOWN | 真机抓取（M5 SfAnalysisListener 落地时同步做） |
+| **`offscreen.state` 在 alioth 上从未触发**：vendored 判据是 `/dev/cpuset/restricted` pid 数 > 10，而该集合在本机恒为 0 | **已解（M1 真验）**——电源键物理熄屏后 `restricted` 立即从 0 涨到 221，`Rust: offscreen.state = true` 出现。`input keyevent 26` 在某些场景下不会真正熄屏，必须真的按电源键。 |
+| `/dev/cpuset` 在本机是 **cgroup v1 形态**（有 `tasks`/`notify_on_release`），`/sys/fs/cgroup` 是 v2（只有 `apps`/`system`） | **已解（静态+真机）**——v3 二进制只读 `tasks`，写 `cpus`（不是 `tasks`！），fd 15-19 = `cpuset/{background,foreground,restricted,system-background,top-app}/cpus`，所以 cgroup v1 是真视图。**M3 的 sysfs 写入器必须新增 cpuset cpus (cpu mask) 子类型。** |
+| `topapp.pkgName` 的 `|Δpid| > 10` 门槛（`TOP_TASK_NR_DIFF_MIN`）是否与原版一致 | **已解**——dfps vendored `topapp_monitor.cpp` 与原版同源，原版**不复写**该模块，门槛=10 与 dfps 一致 |
+| NDK r26（clang 21）下 vendored scnlib / spdlog 需要非侵入式 shim | 已解决 | `cpp/CMakeLists.txt` 三处注释 + `docs/m0-evidence.md` §1（未改动 `cpp/dfps/**` 任何字节） |
+| **新增**：原版写 `/dev/cpuset/<g>/cpus`（cpu mask），不是 cgroup v2 cpu.max | 已发现 | M3 sysfs 写入器必须新增 cpu-mask 子类型（详见 `docs/m1-static-reverse.md` §3-§4） |
+| **SfHint 枚举值 ↔ 字符串映射** | **已静态推导出（6 值：idle/switch/trigger/gesture/touch/junk，对应 0..5；≥6 = unknown）** | 见 `docs/m1-static-reverse.md` §1.3；M3 hint state machine 按此实现
 | v3 的 Hint 命名与日志文案（v2 文档不可信） | UNKNOWN | 以原版真机日志为准（M2 起逐条采集） |
 | `.data` 4 条不透明记录 | UNKNOWN | 不影响本项目（不重写该库） |
 | 原版 `CpufreqWriter` 各平台子类的确切分支条件 | 部分未知 | 用 63 份配置反推 + 真机写入对照 |
