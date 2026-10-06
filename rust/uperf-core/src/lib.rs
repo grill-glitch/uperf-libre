@@ -291,6 +291,7 @@ pub(crate) extern "C" fn uperf_rs_start(
             *guard = Some(watch_task::WatchTask::spawn(
                 plan,
                 orch,
+                dfps.clone(),
                 fake_root,
                 |m: &str| log_msg(m),
             ));

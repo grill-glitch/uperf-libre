@@ -106,7 +106,7 @@ pub fn effective_mode(
     (Some(chosen), logs)
 }
 
-/// The three paths plus the preset names a value is validated against.
+/// The watched paths plus the preset names a value is validated against.
 pub struct WatchPlan {
     pub switch_inode: Option<PathBuf>,
     pub perapp: Option<PathBuf>,
@@ -114,6 +114,10 @@ pub struct WatchPlan {
     /// `SfAnalysisListener disabled by config` and does not listen at all, so the
     /// byte is not even polled.
     pub sf_hint: Option<PathBuf>,
+    /// `<USER_PATH>/dfps.txt` — the dfps-rs rule table. Always derived (dfps.txt
+    /// is zero-config from uperf's point of view: it either exists and is
+    /// reloaded on write, or it does not and dfps is disabled at start).
+    pub dfps_txt: Option<PathBuf>,
     pub known_presets: Vec<String>,
 }
 
@@ -149,6 +153,9 @@ impl WatchPlan {
             switch_inode: sw.switch_inode.map(PathBuf::from),
             perapp: sw.perapp.map(PathBuf::from),
             sf_hint,
+            dfps_txt: config_path
+                .parent()
+                .map(|d| d.join(crate::dfps_rs::DFPS_CONFIG_FILE)),
             known_presets: cfg.preset_names(),
         }
     }
@@ -161,9 +168,14 @@ pub struct WatchTask {
 
 impl WatchTask {
     /// Spawn the watcher. `log` receives the upstream-format log lines.
+    ///
+    /// `dfps` is the optional dfps-rs scheduler: when present, a write to
+    /// `dfps.txt` re-parses the table and installs it, so a rule edit takes
+    /// effect without a daemon restart.
     pub fn spawn(
         plan: WatchPlan,
         orch: Arc<PMutex<Orchestrator>>,
+        dfps: Option<crate::dfps_rs::DfpsScheduler>,
         fake_root: Option<String>,
         mut log: impl FnMut(&str) + Send + 'static,
     ) -> Self {
@@ -221,7 +233,11 @@ impl WatchTask {
                 if plan.sf_hint.is_none() {
                     log("SfAnalysisListener disabled by config");
                 }
-                if plan.switch_inode.is_none() && plan.perapp.is_none() && plan.sf_hint.is_none() {
+                if plan.switch_inode.is_none()
+                    && plan.perapp.is_none()
+                    && plan.sf_hint.is_none()
+                    && plan.dfps_txt.is_none()
+                {
                     log("Rust: nothing to watch, preset watcher exiting");
                     return;
                 }
@@ -229,6 +245,7 @@ impl WatchTask {
                     plan.switch_inode.as_deref(),
                     plan.perapp.as_deref(),
                     plan.sf_hint.as_deref(),
+                    plan.dfps_txt.as_deref(),
                 ]
                 .into_iter()
                 .flatten()
@@ -241,6 +258,12 @@ impl WatchTask {
                 // ---- loop ---------------------------------------------------
                 let mut last_gen = orch.lock().generation();
                 let mut last_sf_byte: Option<u8> = None;
+                // Seed with what is on disk now, so the first wakeup does not
+                // re-install the table the boot path already loaded.
+                let mut last_dfps_text: Option<String> = plan
+                    .dfps_txt
+                    .as_deref()
+                    .and_then(|p| std::fs::read_to_string(p).ok());
                 // 1 s, not 250 ms. Measured: this thread was the daemon's dominant CPU
                 // consumer (cumulative ticks an order of magnitude above every other
                 // thread, while the vendored C++ modules were at ~0). The files it
@@ -267,6 +290,7 @@ impl WatchTask {
                             plan.switch_inode.as_deref(),
                             plan.perapp.as_deref(),
                             plan.sf_hint.as_deref(),
+                            plan.dfps_txt.as_deref(),
                         ]
                         .into_iter()
                         .flatten()
@@ -295,6 +319,17 @@ impl WatchTask {
                     // `last_sf_byte` dedup is cheap and cannot miss a hint.
                     if let Some(hint_path) = plan.sf_hint.as_deref() {
                         handle_sf_hint(hint_path, &orch, &mut last_sf_byte, &mut log);
+                    }
+
+                    // dfps.txt, same reasoning as the hint byte above: a
+                    // `/sdcard` write can be missed by inotify entirely, so this
+                    // is checked on every tick and deduped by content. The read
+                    // is a few hundred bytes at 1 Hz; `last_dfps_text` means the
+                    // parse + install only runs on a real edit.
+                    if let Some(dfps_path) = plan.dfps_txt.as_deref() {
+                        if let Some(sched) = dfps.as_ref() {
+                            poll_dfps_txt(dfps_path, sched, &mut last_dfps_text, &mut log);
+                        }
                     }
 
                     // The scene / top app may have moved, which changes what the
@@ -328,6 +363,45 @@ impl WatchTask {
     }
     pub fn is_running(&self) -> bool {
         self.thread.is_some()
+    }
+}
+
+/// Read `<USER_PATH>/dfps.txt` every tick and install it when the bytes changed.
+///
+/// Tick-based rather than event-driven for the same reason as the hint byte
+/// above: `/sdcard` is a FUSE view and writes there are not reliably delivered
+/// to inotify — a rename-into-place (`adb push`, `mv`, most editors) surfaces on
+/// the *directory* watch, so the reported path is the directory and a
+/// file-path match misses exactly the writes that matter. Content dedup makes
+/// the tick-based read idempotent.
+///
+/// The keep-on-error rule lives in `DfpsScheduler::reload_from_text` (in the
+/// dfps-rs subtree, unit-tested), so a mistyped edit logs once and leaves the
+/// previous table in force.
+fn poll_dfps_txt(
+    path: &Path,
+    sched: &crate::dfps_rs::DfpsScheduler,
+    last_text: &mut Option<String>,
+    log: &mut impl FnMut(&str),
+) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        // Missing is normal: dfps is optional and the file appears on install.
+        Err(_) => return,
+    };
+    if last_text.as_deref() == Some(text.as_str()) {
+        return;
+    }
+    // Remember it either way, so a bad edit does not re-log every tick.
+    *last_text = Some(text.clone());
+    match sched.reload_from_text(&text) {
+        Ok((n, u)) => log(&format!(
+            "Dfps: dfps.txt reloaded ({} rules, universal={}/{})",
+            n, u.idle, u.active
+        )),
+        Err(e) => log(&format!(
+            "Dfps: keeping the previous rules, dfps.txt does not parse: {e}"
+        )),
     }
 }
 
