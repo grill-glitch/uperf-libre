@@ -184,6 +184,13 @@ pack_uperf() {
     cp -a $BASEDIR/magisk/. $STAGE_DIR/
     cp -f $BINARY $STAGE_DIR/bin/uperf
     cp -f $BASEDIR/LICENSE $BASEDIR/NOTICE $STAGE_DIR/
+    # Remove the previous archive first. `zip -r` *updates* an existing archive:
+    # it adds and replaces entries but never drops ones that are gone from the
+    # staging tree — so every pack left its predecessor's hashed WebUI bundle
+    # behind. Caught before publishing rc2: the zip carried four bundles, three
+    # of them stale, one of them the build whose dfps tab rendered an empty list.
+    # (`zip -FS` would also sync, but deleting is unambiguous.)
+    rm -f $PKG_DIR/uperf-magisk.zip
     (cd $STAGE_DIR && zip -q -9 -r $PKG_DIR/uperf-magisk.zip .)
     # Also refresh the in-tree copy, so the repository never carries the
     # closed-source upstream binary and `check` can assert the two agree.
