@@ -40,11 +40,16 @@ use parking_lot::{Condvar, Mutex};
 use crate::dfps_rs::config::{RuleTable, OFFSCREEN_PKG, UNIVERSAL_PKG};
 use crate::dfps_rs::task::DfpsTask;
 
-/// Where an effective refresh-rate change lands. Production writes the
-/// SettingsProvider keys and `dfps_cur.txt`; tests record.
+/// Where an effective refresh-rate change lands, and where the brightness
+/// sample comes from. Production writes the SettingsProvider keys and
+/// `dfps_cur.txt`; tests record and return a fixed brightness.
 pub trait RefreshSink: Send + Sync {
     /// Called once per *actual* change (the dedupe gate already ran).
     fn on_switch(&self, from: Option<i32>, to: i32);
+
+    /// `screen_brightness` for the anti-flicker gate. `None` means the read
+    /// failed; the task maps that to upstream's `-1` (treated as "low").
+    fn screen_brightness(&self) -> Option<i32>;
 }
 
 /// The production sink: upstream `SysPeakRefreshRate` + `NotifyRefreshRate`.
@@ -67,17 +72,34 @@ impl RefreshSink for RealSink {
             crate::log_msg("Dfps: settings put did not spawn (no /system/bin/cmd?)");
         }
     }
+
+    fn screen_brightness(&self) -> Option<i32> {
+        crate::dfps_rs::sys_settings::get_screen_brightness()
+    }
 }
 
-/// Test double: records every switch, touches nothing.
-#[derive(Default)]
+/// Test double: records every switch, touches nothing. Brightness defaults to
+/// `Some(255)` (bright → not low), so idle behaviour is the default in tests.
 pub struct RecordingSink {
     pub events: Mutex<Vec<(Option<i32>, i32)>>,
+    pub brightness: Mutex<Option<i32>>,
+}
+
+impl Default for RecordingSink {
+    fn default() -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            brightness: Mutex::new(Some(255)),
+        }
+    }
 }
 
 impl RefreshSink for RecordingSink {
     fn on_switch(&self, from: Option<i32>, to: i32) {
         self.events.lock().push((from, to));
+    }
+    fn screen_brightness(&self) -> Option<i32> {
+        *self.brightness.lock()
     }
 }
 
@@ -99,6 +121,16 @@ struct State {
     gesture_deadline: Option<Instant>,
     wakeup_deadline: Option<Instant>,
     shutting_down: bool,
+}
+
+impl State {
+    /// Earliest pending deadline across the three handles.
+    fn earliest(&self) -> Option<Instant> {
+        [self.input_deadline, self.gesture_deadline, self.wakeup_deadline]
+            .into_iter()
+            .flatten()
+            .min()
+    }
 }
 
 struct Inner {
@@ -189,8 +221,7 @@ impl DfpsScheduler {
             s.input_deadline = None;
             s.task.set_override(UNIVERSAL_PKG);
             s.task.set_active(true);
-            let ev = s.task.tick(false);
-            dispatch(&*self.inner.sink, ev);
+            tick_with_brightness(&mut s, &*self.inner.sink, false);
         } else {
             let slack = s.task.tunables().gesture_slack_ms;
             s.gesture_deadline = Some(Instant::now() + ms(slack));
@@ -203,8 +234,8 @@ impl DfpsScheduler {
     pub fn on_top_app(&self, pkg: &str) {
         let mut s = self.inner.state.lock();
         if s.task.set_top_app(pkg) {
-            let ev = s.task.tick(true); // upstream :259 SwitchRefreshRate(true)
-            dispatch(&*self.inner.sink, ev);
+            // upstream :259 SwitchRefreshRate(true)
+            tick_with_brightness(&mut s, &*self.inner.sink, true);
         }
         drop(s);
         self.inner.cv.notify_all();
@@ -219,8 +250,7 @@ impl DfpsScheduler {
         if off {
             s.wakeup_deadline = None;
             s.task.set_override(OFFSCREEN_PKG);
-            let ev = s.task.tick(true);
-            dispatch(&*self.inner.sink, ev);
+            tick_with_brightness(&mut s, &*self.inner.sink, true);
         } else {
             let slack = s.task.tunables().gesture_slack_ms;
             s.wakeup_deadline = Some(Instant::now() + ms(slack));
@@ -253,22 +283,19 @@ impl DfpsScheduler {
                 Handle::Input => {
                     if !s.task.pressed() {
                         s.task.set_active(false);
-                        let ev = s.task.tick(false);
-                        dispatch(&*self.inner.sink, ev);
+                        tick_with_brightness(&mut s, &*self.inner.sink, false);
                         fired += 1;
                     }
                 }
                 Handle::Gesture => {
                     if s.task.clear_override_if(UNIVERSAL_PKG) {
-                        let ev = s.task.tick(false);
-                        dispatch(&*self.inner.sink, ev);
+                        tick_with_brightness(&mut s, &*self.inner.sink, false);
                         fired += 1;
                     }
                 }
                 Handle::Wakeup => {
                     if s.task.clear_override_if(OFFSCREEN_PKG) {
-                        let ev = s.task.tick(true);
-                        dispatch(&*self.inner.sink, ev);
+                        tick_with_brightness(&mut s, &*self.inner.sink, true);
                         fired += 1;
                     }
                 }
@@ -277,14 +304,28 @@ impl DfpsScheduler {
         fired
     }
 
-    /// Earliest pending deadline, or `None`.
-    fn next_deadline(&self) -> Option<Instant> {
-        let s = self.inner.state.lock();
-        [s.input_deadline, s.gesture_deadline, s.wakeup_deadline]
-            .into_iter()
-            .flatten()
-            .min()
+    /// Earliest pending deadline, or `None`. Public for the status surface and
+    /// tests; the timer loop calls `State::earliest` under its own lock so it
+    /// can go straight to the condvar wait without a second acquisition.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.inner.state.lock().earliest()
     }
+}
+
+/// Run a tick with upstream's brightness gate: only when the task is idle
+/// (not active, not offscreen) does it sample `screen_brightness`, and only
+/// every 10 s. Mirrors the `else` branch of `SwitchRefreshRate(bool)`
+/// (`dynamic_fps.cpp:291-300`) without moving the I/O into the state machine.
+fn tick_with_brightness(s: &mut State, sink: &dyn RefreshSink, force: bool) {
+    if !s.task.active() && !s.task.is_offscreen() {
+        let now = Instant::now();
+        if s.task.needs_brightness_sample(now) {
+            let b = sink.screen_brightness();
+            s.task.note_brightness_sample(now, b);
+        }
+    }
+    let ev = s.task.tick(force);
+    dispatch(sink, ev);
 }
 
 /// Upstream `OnInput()`: press -> active now; release -> idle after slack.
@@ -294,8 +335,7 @@ fn apply_press(s: &mut State, sink: &dyn RefreshSink) {
         // (upstream `DwSetWork(dwInput_, nullptr, SLEEP_TS)`).
         s.input_deadline = None;
         s.task.set_active(true);
-        let ev = s.task.tick(false);
-        dispatch(sink, ev);
+        tick_with_brightness(s, sink, false);
     } else {
         let slack = s.task.tunables().touch_slack_ms;
         s.input_deadline = Some(Instant::now() + ms(slack));
@@ -334,10 +374,7 @@ fn timer_loop(inner: Arc<Inner>) {
         // that arrives between the two cannot be lost.
         let mut s = inner.state.lock();
         let now = Instant::now();
-        let next: Option<Instant> = [s.input_deadline, s.gesture_deadline, s.wakeup_deadline]
-            .into_iter()
-            .flatten()
-            .min();
+        let next: Option<Instant> = s.earliest();
         let wait = next
             .map(|d| d.saturating_duration_since(now))
             // Nothing pending: park until an event notifies. The cap is a
@@ -451,5 +488,37 @@ mod tests {
         s.inner.state.lock().wakeup_deadline = Some(Instant::now() - Duration::from_millis(1));
         s.run_due(Instant::now());
         assert_eq!(s.inner.state.lock().task.override_app(), UNIVERSAL_PKG);
+    }
+
+    #[test]
+    fn dim_screen_keeps_active_rate_when_idle() {
+        // Upstream: when not active, a brightness below enableMinBrightness
+        // (default 8) makes the idle path emit `active` instead of `idle`.
+        let (s, sink) = sched();
+        *sink.brightness.lock() = Some(3); // below the default 8
+        // Force the sample interval to have elapsed.
+        {
+            let mut g = s.inner.state.lock();
+            g.task
+                .note_brightness_sample(Instant::now() - Duration::from_secs(60), Some(255));
+        }
+        s.on_top_app("com.example.app");
+        // Idle path, but dim -> the active Hz (144), not the idle 90.
+        assert_eq!(s.cur_hz(), Some(144));
+        assert!(s.inner.state.lock().task.low_brightness());
+    }
+
+    #[test]
+    fn bright_screen_uses_idle_rate() {
+        let (s, sink) = sched();
+        *sink.brightness.lock() = Some(200);
+        {
+            let mut g = s.inner.state.lock();
+            g.task
+                .note_brightness_sample(Instant::now() - Duration::from_secs(60), Some(255));
+        }
+        s.on_top_app("com.example.app");
+        assert_eq!(s.cur_hz(), Some(90));
+        assert!(!s.inner.state.lock().task.low_brightness());
     }
 }
