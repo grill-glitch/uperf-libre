@@ -52,8 +52,13 @@ print_status() {
 print_info() {
     local n=0 rules=""
     if [ -f "$DFPS_CONFIG" ]; then
-        n=$(grep -c -v '^[[:space:]]*$\|^#\|^/' "$DFPS_CONFIG" 2>/dev/null || echo 0)
-        rules="$(grep -v '^[[:space:]]*$\|^#\|^/' "$DFPS_CONFIG" 2>/dev/null | sed 's/[[:space:]]\+/ /g' | tr '\n' '|')"
+        # `-E`, not `\|`: Android's grep is toybox, whose BRE parser has no
+        # alternation, so `'$ \| ^# \| ^/'` matches nothing and `-v` filters
+        # nothing out — the rule list came back with the comments and the
+        # `/tunable` lines included (caught on the device: 7 lines instead of
+        # 3). ERE is what toybox implements.
+        n=$(grep -c -v -E '^[[:space:]]*$|^#|^/' "$DFPS_CONFIG" 2>/dev/null || echo 0)
+        rules="$(grep -v -E '^[[:space:]]*$|^#|^/' "$DFPS_CONFIG" 2>/dev/null | sed 's/[[:space:]]\+/ /g' | tr '\n' '|')"
     fi
     echo "lines=$n"
     echo "rules=$rules"
