@@ -148,6 +148,46 @@ pub(crate) extern "C" fn uperf_rs_start(
     }
     let has_cfg = loaded_cfg.is_some();
     let cfg_for_governor = loaded_cfg.clone();
+
+    // dfps-rs (mounted from grill-glitch/dfps-rewrite as a subtree at
+    // rust/uperf-core/src/dfps_rs/). Built BEFORE the dispatcher so the
+    // dispatcher can route the five dfps topics into it from the first event.
+    // A missing/broken dfps.txt disables dfps and logs once — uperf itself
+    // still starts.
+    let dfps = {
+        let cfg_path = std::path::Path::new(cfg.to_str().unwrap_or(""));
+        let dfps_path = cfg_path.parent().map(|d| d.join("dfps.txt"));
+        let table = dfps_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|txt| crate::dfps_rs::config::RuleTable::parse(&txt).ok());
+        match table {
+            Some(t) => {
+                let u = t.universal;
+                let minus = t.offscreen;
+                let n = t.rules.len();
+                let sched = crate::dfps_rs::DfpsScheduler::new(t);
+                log_msg(&format!(
+                    "Rust: dfps loaded ({} rules, universal={}/{}, offscreen={}/{})",
+                    n, u.idle, u.active, minus.idle, minus.active
+                ));
+                sched.spawn();
+                log_msg("Rust: dfps timer thread started");
+                let _ = DFPS_SCHED.set(sched.clone());
+                Some(sched)
+            }
+            None => {
+                log_msg(&format!(
+                    "Rust: dfps disabled (no usable '{}')",
+                    dfps_path
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(no config dir)".into())
+                ));
+                None
+            }
+        }
+    };
+
     {
         let mut guard = dispatcher_slot().lock();
         if let Some(mut prev) = guard.take() {
@@ -159,7 +199,7 @@ pub(crate) extern "C" fn uperf_rs_start(
         };
         let orch = Arc::new(PMutex::new(orch));
         let _ = ORCHESTRATOR.set(orch.clone());
-        *guard = Some(topic_dispatch::spawn(orch));
+        *guard = Some(topic_dispatch::spawn(orch, dfps.clone()));
     }
 
     let bridge = match BRIDGE.get() {
@@ -233,45 +273,9 @@ pub(crate) extern "C" fn uperf_rs_start(
         }
     }
 
-    // Start the dfps business logic (mounted from grill-glitch/dfps-rewrite as a
-    // subtree). Reads dfps.txt from the same directory as the uperf config,
-    // parses it, and registers the task. The dispatcher threads will route
-    // input.touch / input.btn / topapp.pkgName / offscreen.state events into
-    // the task via topic_dispatch::spawn_for_dfps (M1 wires the dispatch
-    // path; M3 adds the heavy-worker scheduler + watch_task reload).
-    {
-        let cfg_path = std::path::Path::new(cfg.to_str().unwrap_or(""));
-        let dfps_path = cfg_path.parent().map(|d| d.join("dfps.txt"));
-        if let Some(p) = dfps_path {
-            let parsed = std::fs::read_to_string(&p)
-                .ok()
-                .and_then(|txt| crate::dfps_rs::config::RuleTable::parse(&txt).ok());
-            match parsed {
-                Some(table) => {
-                    let rules_n = table.rules.len();
-                    let universal = table.universal;
-                    let offscreen = table.offscreen;
-                    let task = crate::dfps_rs::DfpsTask::new(table);
-                    let task = std::sync::Arc::new(parking_lot::Mutex::new(task));
-                    let _ = DFPS_TASK.set(task);
-                    log_msg(&format!(
-                        "Rust: dfps loaded ({} rules, universal={}/{}, offscreen={}/{})",
-                        rules_n,
-                        universal.idle,
-                        universal.active,
-                        offscreen.idle,
-                        offscreen.active,
-                    ));
-                }
-                None => {
-                    log_msg(&format!(
-                        "Rust: dfps disabled (cannot load '{}')",
-                        p.display()
-                    ));
-                }
-            }
-        }
-    }
+    // (dfps-rs is set up above, before the dispatcher, so events route into it
+    // from the first message.)
+
 
     // Start the file watcher: cur_powermode.txt / perapp_powermode.txt preset
     // switching and the single-byte sfanalysis.hint feed.
@@ -338,6 +342,11 @@ pub(crate) extern "C" fn uperf_rs_stop() {
             t.stop();
         }
     }
+    // Stop the dfps timer thread. The scheduler itself stays in its OnceLock;
+    // `uperf_rs_start` on a reload replaces the dispatcher's clone.
+    if let Some(s) = DFPS_SCHED.get() {
+        s.stop();
+    }
     log_msg("uperf_rs_stop: dispatcher joined");
 }
 
@@ -346,9 +355,10 @@ static ORCHESTRATOR: OnceLock<Arc<PMutex<Orchestrator>>> = OnceLock::new();
 static CPU_TASK: OnceLock<PMutex<Option<cpu_task::CpuTask>>> = OnceLock::new();
 static SCHED_TASK: OnceLock<PMutex<Option<sched_task::SchedTask>>> = OnceLock::new();
 static WATCH_TASK: OnceLock<PMutex<Option<watch_task::WatchTask>>> = OnceLock::new();
-/// dfps-rs task state, mounted from grill-glitch/dfps-rewrite as a subtree at
-/// `rust/uperf-core/src/dfps_rs/`. See that dir's mod.rs.
-static DFPS_TASK: OnceLock<Arc<PMutex<crate::dfps_rs::DfpsTask>>> = OnceLock::new();
+/// dfps-rs scheduler, mounted from grill-glitch/dfps-rewrite as a subtree at
+/// `rust/uperf-core/src/dfps_rs/`. Held so `uperf_rs_stop` can stop its timer
+/// thread; the dispatcher holds its own clone.
+static DFPS_SCHED: OnceLock<crate::dfps_rs::DfpsScheduler> = OnceLock::new();
 
 fn watch_task_slot() -> &'static PMutex<Option<watch_task::WatchTask>> {
     WATCH_TASK.get_or_init(|| PMutex::new(None))
