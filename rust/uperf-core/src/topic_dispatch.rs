@@ -151,14 +151,21 @@ fn decode_pid_list(payload: &[u8]) -> Option<Vec<i32>> {
 /// Spawn the dispatcher thread. The thread reads from `rx` and writes each
 /// event as a single log line through the C++ spdlog sink. It exits when both
 /// senders (the FFI sender in DISPATCH_TX and the keep-alive) are dropped.
-pub(crate) fn spawn(orch: std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>) -> Dispatcher {
+///
+/// `dfps` carries the optional dfps-rs scheduler: when present, the five
+/// refresh-rate topics are routed into it in addition to the orchestrator
+/// (upstream `DynamicFps::AddReactor`, `dynamic_fps.cpp:202-209`).
+pub(crate) fn spawn(
+    orch: std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
+    dfps: Option<crate::dfps_rs::DfpsScheduler>,
+) -> Dispatcher {
     let (tx, rx): (Sender<Event>, Receiver<Event>) = std::sync::mpsc::channel();
     // Install a clone so the FFI entry point can also send events.
     let tx_for_ffi = tx.clone();
     DISPATCH_TX.get_or_init(|| tx_for_ffi);
     let thread = thread::Builder::new()
         .name("uperf-rs".into())
-        .spawn(move || run(rx, orch))
+        .spawn(move || run(rx, orch, dfps))
         .expect("spawn uperf-rs dispatcher");
     Dispatcher {
         _keep_alive: tx,
@@ -197,6 +204,7 @@ fn dummy_sender() -> Sender<Event> {
 fn run(
     rx: Receiver<Event>,
     orch: std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
+    dfps: Option<crate::dfps_rs::DfpsScheduler>,
 ) {
     // M4: writes go under a fake root so device validation never touches the
     // real sysfs. Set `UPERF_FAKE_ROOT` to enable file emission (e.g.
@@ -210,6 +218,28 @@ fn run(
             g.on_event(&ev);
         }
         apply_pending(&orch, fake_root.as_deref());
+
+        // Refresh-rate topics fan out to dfps-rs as a second subscriber
+        // (T03: same process, no IPC). Ordering after the orchestrator is
+        // deliberate — the orchestrator owns sysfs/CPU knobs, dfps owns the
+        // refresh rate, and nothing is shared between them.
+        if let Some(d) = dfps.as_ref() {
+            route_dfps(&ev, d);
+        }
+    }
+}
+
+/// Upstream `DynamicFps::AddReactor` subscribes to exactly these five topics
+/// (`dynamic_fps.cpp:202-209`). Payload shapes come from `Event::parse`.
+fn route_dfps(ev: &Event, d: &crate::dfps_rs::DfpsScheduler) {
+    match ev {
+        Event::Touch(pressed) => d.on_touch(*pressed),
+        Event::Btn(pressed) => d.on_btn(*pressed),
+        Event::InputState { gesture, .. } => d.on_input_state(*gesture),
+        Event::Topapp(pkg) => d.on_top_app(pkg),
+        Event::Offscreen(off) => d.on_offscreen(*off),
+        // cgroup.* topics are the orchestrator's; dfps does not read them.
+        _ => {}
     }
 }
 
