@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::dfps_rs::config::{RuleTable, OFFSCREEN_PKG, UNIVERSAL_PKG};
+use crate::dfps_rs::config::{FpsRule, RuleTable, OFFSCREEN_PKG, UNIVERSAL_PKG};
 use crate::dfps_rs::task::DfpsTask;
 
 /// Where an effective refresh-rate change lands, and where the brightness
@@ -265,6 +265,22 @@ impl DfpsScheduler {
         s.task.reload(table);
         drop(s);
         self.inner.cv.notify_all();
+    }
+
+    /// Parse and install a new rule table from raw `dfps.txt` text.
+    ///
+    /// On a parse error the **current table is kept** and the error is
+    /// returned. Upstream throws and the daemon dies; a live refresh-rate
+    /// controller must survive a half-written or mistyped config, so this is
+    /// deliberately more forgiving than the boot path.
+    ///
+    /// Returns `(rule_count, universal_rule)` on success.
+    pub fn reload_from_text(&self, text: &str) -> Result<(usize, FpsRule), String> {
+        let table = crate::dfps_rs::parse_config(text).map_err(|e| e.to_string())?;
+        let n = table.rules.len();
+        let universal = table.universal;
+        self.reload(table);
+        Ok((n, universal))
     }
 
     // ---- timer internals ----
@@ -520,5 +536,40 @@ mod tests {
         s.on_top_app("com.example.app");
         assert_eq!(s.cur_hz(), Some(90));
         assert!(!s.inner.state.lock().task.low_brightness());
+    }
+
+    #[test]
+    fn reload_from_text_installs_a_new_table() {
+        let (s, _) = sched();
+        s.on_top_app("com.example.app");
+        assert_eq!(s.cur_hz(), Some(90)); // old table: idle 90
+
+        let (n, universal) = s
+            .reload_from_text("* 0 240\n- 0 240\ncom.example.app 30 240\n")
+            .expect("parses");
+        assert_eq!(n, 1);
+        assert_eq!(universal, FpsRule { idle: 0, active: 240 });
+        // The new table's idle for the same app.
+        s.on_top_app("com.example.other");
+        assert_eq!(s.cur_hz(), Some(0));
+    }
+
+    #[test]
+    fn reload_from_text_keeps_the_old_table_on_a_bad_edit() {
+        let (s, _) = sched();
+        s.on_top_app("com.example.app");
+        assert_eq!(s.cur_hz(), Some(90));
+
+        // Missing the offscreen rule -> ParseError::NoOffscreen.
+        let err = s
+            .reload_from_text("* 0 240\ncom.example.app 30 240\n")
+            .unwrap_err();
+        assert!(err.contains("offscreen"), "got: {err}");
+
+        // The old table is still in force.
+        s.on_top_app("com.example.other");
+        assert_eq!(s.cur_hz(), Some(60)); // old universal idle
+        s.on_top_app("com.example.app");
+        assert_eq!(s.cur_hz(), Some(90)); // old per-app idle
     }
 }
