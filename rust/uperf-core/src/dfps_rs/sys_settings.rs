@@ -76,6 +76,35 @@ fn put(namespace: &str, key: &str, value: &str) -> bool {
         .is_ok()
 }
 
+/// Read `settings get system screen_brightness` — upstream
+/// `misc_android.cpp:216-228 GetScreenBrightness`.
+///
+/// Returns `None` when the command fails or the output is not an integer. The
+/// caller treats `None` as "unknown", and upstream's comparison
+/// (`brightness < enableMinBrightness_`) with `-1` lands on "low" — i.e. a
+/// failed read keeps the *active* rate rather than dropping to idle. We
+/// preserve that by mapping `None` to `-1` at the call site, not here, so the
+/// distinction stays visible in the type.
+///
+/// Upstream notes this costs ~100 ms, hence the 10 s sample interval. It runs
+/// on the dfps timer thread, never on the dispatcher's hot path.
+pub fn get_screen_brightness() -> Option<i32> {
+    let out = Command::new(CMD_BIN)
+        .args(["settings", "get", "system", "screen_brightness"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    std::str::from_utf8(&out.stdout)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

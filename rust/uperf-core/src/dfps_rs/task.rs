@@ -145,15 +145,40 @@ impl DfpsTask {
     /// `force` — true on topapp switch + offscreen transitions, false on
     /// every input event.
     ///
+    /// Mirrors upstream `SwitchRefreshRate(bool)` (`dynamic_fps.cpp:284-302`):
+    /// when active (or offscreen) the rule's `active` Hz is used; otherwise
+    /// `active` is *also* used when the last brightness sample came back below
+    /// `enableMinBrightness`, which is upstream's anti-flicker rule for a dim
+    /// screen. The sample itself is the scheduler's job (it owns the clock and
+    /// the I/O); this only consumes `low_brightness`.
+    ///
     /// Returns the transition when a switch happened.
     pub fn tick(&mut self, force: bool) -> Option<(Option<i32>, i32)> {
         let rule = self.resolve_current();
-        let hz = if self.active || self.is_offscreen {
+        let hz = if self.active || self.is_offscreen || self.low_brightness {
             rule.active
         } else {
             rule.idle
         };
         self.switch_refresh_rate(hz, force)
+    }
+
+    /// True when the 10 s brightness sample interval has elapsed — upstream
+    /// `BRIGHTNESS_SAMPLE_INTERVAL_S` (`dynamic_fps.cpp:31`, `:294`).
+    pub fn needs_brightness_sample(&self, now: Instant) -> bool {
+        now.duration_since(self.last_brightness_sample) > BRIGHTNESS_SAMPLE_INTERVAL
+    }
+
+    /// Record a brightness sample. `None` (command failed) is treated as `-1`,
+    /// which upstream's `brightness < enableMinBrightness_` maps to "low" — a
+    /// failed read keeps the active rate rather than dropping to idle.
+    pub fn note_brightness_sample(&mut self, now: Instant, brightness: Option<i32>) {
+        self.last_brightness_sample = now;
+        self.low_brightness = brightness.unwrap_or(-1) < self.tunables.enable_min_brightness;
+    }
+
+    pub fn low_brightness(&self) -> bool {
+        self.low_brightness
     }
 
     // ---- mutators used by the scheduler (mirror upstream event bodies) ----
