@@ -32,7 +32,16 @@ async function refresh() {
         const parts = line.trim().split(/\s+/);
         if (parts.length !== 3) continue;
         const [pkg, idle, active] = parts;
-        list.append(ruleRow(pkg, parseInt(idle, 10), parseInt(active, 10)));
+        try {
+            list.append(ruleRow(pkg, parseInt(idle, 10), parseInt(active, 10)));
+        } catch (err) {
+            // One row that cannot be built must not blank the whole list. That is
+            // exactly how a missing icon presented: `icon()` throws on an
+            // unlisted name, the throw escaped this loop, and the page showed a
+            // painted header over an empty list — indistinguishable from "no
+            // rules". Degrade to a missing row and keep the rest.
+            console.error(`dfps: cannot render rule row "${line}"`, err);
+        }
     }
 }
 
