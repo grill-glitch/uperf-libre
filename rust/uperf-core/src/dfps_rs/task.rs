@@ -120,34 +120,107 @@ impl DfpsTask {
         self.rules.get(pkg).copied().unwrap_or(self.universal)
     }
 
-    /// Run the dedupe gate and, if the new Hz differs, write it through.
+    /// Run the dedupe gate and, if the new Hz differs, report the transition.
     ///
-    /// `force` is captured by closure (T04: avoid module-level scratch).
-    /// M1 emits via the existing uperf-rs log_msg sink; M3 replaces with
-    /// `settings put system peak_refresh_rate ...` via the notifier helper.
-    pub fn switch_refresh_rate(&mut self, hz: i32, force: bool) {
+    /// Pure: no I/O. The caller (the scheduler) hands the returned transition
+    /// to its [`crate::dfps_rs::scheduler::RefreshSink`], which is the real
+    /// `settings put` + `dfps_cur.txt` writer in production and a recording
+    /// stub in tests. That split is what lets the device smoke and the unit
+    /// tests exercise different halves of the same rule.
+    ///
+    /// The dedupe gate is upstream's, verbatim (`dynamic_fps.cpp:308-310`):
+    /// `if force == false && hz == curHz_ { return; }`.
+    ///
+    /// Returns `(previous, new)` when a switch actually happened, else `None`.
+    pub fn switch_refresh_rate(&mut self, hz: i32, force: bool) -> Option<(Option<i32>, i32)> {
         if !force && Some(hz) == self.cur_hz {
-            return;
+            return None;
         }
+        let prev = self.cur_hz;
         self.cur_hz = Some(hz);
-        crate::log_msg(&format!(
-            "Dfps: switching to {hz} Hz (force={force})"
-        ));
-        // M3: spawn the settings put + write_cur_hz. For M1 we only log so
-        // the dedupe logic is visible in daemon logs.
+        Some((prev, hz))
     }
 
     /// Drive a refresh-rate emission based on current state. Caller chooses
     /// `force` — true on topapp switch + offscreen transitions, false on
     /// every input event.
-    pub fn tick(&mut self, force: bool) {
+    ///
+    /// Returns the transition when a switch happened.
+    pub fn tick(&mut self, force: bool) -> Option<(Option<i32>, i32)> {
         let rule = self.resolve_current();
         let hz = if self.active || self.is_offscreen {
             rule.active
         } else {
             rule.idle
         };
-        self.switch_refresh_rate(hz, force);
+        self.switch_refresh_rate(hz, force)
+    }
+
+    // ---- mutators used by the scheduler (mirror upstream event bodies) ----
+
+    /// `input.touch` / `input.btn` -> upstream `OnInputTouch`/`OnInputBtn`
+    /// then `OnInput()`: any press marks active; release clears it.
+    /// The *idle timeout* is the scheduler's job (upstream `DwSetWork`).
+    pub fn set_pressed(&mut self, touch: Option<bool>, btn: Option<bool>) {
+        if let Some(t) = touch {
+            self.touch_pressed = t;
+        }
+        if let Some(b) = btn {
+            self.btn_pressed = b;
+        }
+    }
+
+    pub fn pressed(&self) -> bool {
+        self.touch_pressed || self.btn_pressed
+    }
+
+    pub fn set_active(&mut self, v: bool) {
+        self.active = v;
+    }
+
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
+    /// `topapp.pkgName` -> upstream `OnTopAppSwitch`: switch only when the
+    /// package actually changed (`:257 if (topApp != curApp_)`).
+    /// Returns true when the app changed and a force switch is warranted.
+    pub fn set_top_app(&mut self, pkg: &str) -> bool {
+        if pkg == self.cur_app {
+            return false;
+        }
+        self.cur_app = pkg.to_string();
+        true
+    }
+
+    /// `offscreen.state` -> upstream `OnOffscreen`: ignores a repeat of the
+    /// current value (`:265-267`). Returns true when the state flipped.
+    pub fn set_offscreen_state(&mut self, off: bool) -> bool {
+        if off == self.is_offscreen {
+            return false;
+        }
+        self.is_offscreen = off;
+        true
+    }
+
+    pub fn is_offscreen(&self) -> bool {
+        self.is_offscreen
+    }
+
+    pub fn set_override(&mut self, pkg: &str) {
+        self.override_app = pkg.to_string();
+    }
+
+    /// Clear the override only if it is still `expect` — upstream's guard
+    /// (`:246 if (overridedApp_ == UNIVERSIAL_PKG_NAME)`), so a stale timer
+    /// cannot clobber a newer override.
+    pub fn clear_override_if(&mut self, expect: &str) -> bool {
+        if self.override_app == expect {
+            self.override_app.clear();
+            true
+        } else {
+            false
+        }
     }
 
     pub fn tunables(&self) -> &Tunables {

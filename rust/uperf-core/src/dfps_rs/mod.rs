@@ -20,10 +20,13 @@
 
 pub mod config;
 pub mod notifier;
+pub mod scheduler;
+pub mod sys_settings;
 pub mod task;
 
 pub use config::{FpsRule, RuleTable, Tunables, OFFSCREEN_PKG, UNIVERSAL_PKG};
 pub use notifier::write_cur_hz;
+pub use scheduler::{DfpsScheduler, RealSink, RecordingSink, RefreshSink};
 pub use task::DfpsTask;
 
 /// T06: reuse uperf-rs's USER_PATH so dfps state lives next to uperf state.
