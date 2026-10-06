@@ -1,10 +1,15 @@
 # uperf — Rust policy engine (M1+) linked against the vendored dfps C++ platform.
 #
 # Source policy (see AGENT.md §3, §4):
-#   cpp/dfps/source/**   vendored, byte-identical to upstream dfps, NOT modified here.
-#                        We only *select* files: dfps' own main.cpp, dfps.cpp/h and
-#                        dynamic_fps.{h,cpp} (dfps' business layer) are excluded.
-#   cpp/uperf/**         this project: uperf app assembly + (M1) the Rust bridge.
+#   cpp/dfps/source/**   vendored. We only *select* files: the platform layer,
+#                        the four shared event sources and utils/ are compiled;
+#                        dfps' own executable (main.cpp, dfps.{h,cpp},
+#                        modules/dynamic_fps.{h,cpp}) has been REMOVED from the
+#                        tree — see cpp/dfps/DFPS_VENDOR.md "Files removed".
+#                        dynamic_fps was the variable-refresh-rate policy, now
+#                        reimplemented as `dfps_rs` (rust/uperf-core/src/dfps_rs,
+#                        mounted from grill-glitch/dfps-rewrite).
+#   cpp/uperf/**         this project: uperf app assembly + the Rust bridge.
 
 cmake_minimum_required(VERSION 3.13)
 
