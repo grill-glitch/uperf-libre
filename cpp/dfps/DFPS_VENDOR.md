@@ -11,8 +11,9 @@ that Uperf v3's platform layer was split from (dfps `README.md`: *"Splited from 
 | Commit date | 2023-01-15 (`Bump version 23.01.15`) |
 | License | Apache-2.0 (`LICENSE` + `NOTICE` kept in place, original file headers untouched) |
 | Extracted with | `git -C <dfps> archive HEAD \| tar -x -C cpp/dfps` |
-| Files | 210 |
+| Files (as extracted) | 210 |
 | Local modifications | **one**, `source/modules/input_listener.{h,cpp}` — see below |
+| Local removals | the dfps executable and its packaging — see "Files removed from the vendored copy" |
 
 ## Verification
 
@@ -25,6 +26,10 @@ diff -rq --exclude=.git /tmp/dfps cpp/dfps
 #   文件 .../input_listener.cpp 和 .../input_listener.cpp 不同
 #   文件 .../input_listener.h   和 .../input_listener.h   不同
 # i.e. exactly the two files described below; every other vendored byte is upstream's.
+#
+# After the M5 removals the output additionally reports the deleted paths
+# (source/main.cpp, source/dfps.{h,cpp}, source/modules/dynamic_fps.{h,cpp},
+# magisk/**, CMakeLists.txt, source/CMakeLists.txt) as 只在 /tmp/dfps 中存在.
 ```
 
 ## The one local modification
@@ -79,19 +84,33 @@ are visible in the device log.
 
 ## What is used, and what is not
 
-`cpp/uperf/CMakeLists.txt` selects files explicitly (no `GLOB`), so the following
-vendored files are present but **not** compiled into `uperf`:
-
-| Path | Why it is excluded |
-|---|---|
-| `source/main.cpp` | dfps' process supervisor; reimplemented for uperf in `cpp/uperf/app_main.cpp` (kept as the reference we derived from) |
-| `source/dfps.{h,cpp}` | dfps' business layer (module assembly). uperf's equivalent is the Rust `app` module from M1 on |
-| `source/modules/dynamic_fps.{h,cpp}` | dfps' only real policy module (variable refresh rate). Uperf's policy modules are Rust |
-| `magisk/**` | dfps' own Magisk packaging; uperf uses the module skeleton already in this repo |
-| `build.sh`, root `CMakeLists.txt` | dfps' build entry points; this repo has its own `build.sh` / `CMakeLists.txt` that reuse the same compiler and linker flags |
+`cpp/uperf/CMakeLists.txt` selects files explicitly (no `GLOB`). The platform
+layer, the four shared event sources, and the utilities that `UPERF_SRCS` lists
+are compiled into `uperf`. Everything else was dfps' own executable, and is
+**removed** from this tree — see the next section.
 
 `source/version.c.in` **is** used (via `configure_file`), which is why `version.h` /
 `GetGitCommitHash()` work in `app_main.cpp`.
+
+## Files removed from the vendored copy
+
+`git rm`'d once the Rust rewrite made them dead. Nothing built or referenced
+them; this is recorded here because it means the tree is no longer a verbatim
+copy of dfps.
+
+| Path | Why it went |
+|---|---|
+| `source/main.cpp` | dfps' process supervisor. Reimplemented in `cpp/uperf/app_main.cpp`; the Rust daemon is the entry point now |
+| `source/dfps.{h,cpp}` | dfps' module assembly. Superseded by the Rust `orchestrator` + `dfps_rs` |
+| `source/modules/dynamic_fps.{h,cpp}` | dfps' only policy module (variable refresh rate). **Replaced by `dfps_rs`** (`rust/uperf-core/src/dfps_rs/`, mounted from grill-glitch/dfps-rewrite) — this is the rewrite's whole subject |
+| `magisk/**` | dfps' own Magisk packaging. Superseded by this repo's `magisk/`, and shipping a second module would be the "independent dfps module" the map rules out of scope |
+| `CMakeLists.txt`, `source/CMakeLists.txt` | Built the `dfps` executable from a `GLOB_RECURSE`, i.e. they existed only for the files above. Left in place they would re-glob the deleted sources if anyone ever added this directory as a subdirectory |
+
+`build.sh`, `.clang-format` and `.gitignore` are kept: dead as build entry
+points (`build.sh` at the repo root is the one used) but harmless, and they
+document the flags `cpp/uperf/CMakeLists.txt` was derived from.
+
+The four shared event sources (`modules/{cgroup_listener,input_listener,` `offscreen_monitor,topapp_monitor}`), the whole `platform/` tree, and `utils/` **stay** — `UPERF_SRCS` compiles them, and `dfps_rs` consumes the events they emit. Likewise `thirdparty/{spdlog,scnlib}`: `spdlog` is used by `cpp/uperf/*`, and `scnlib` by `source/modules/cgroup_listener.cpp` and `source/utils/misc.cpp`. Removing them would mean rewriting uperf's C++ layer, which `AGENT.md` §7.4 forbids.
 
 ## Rule
 
