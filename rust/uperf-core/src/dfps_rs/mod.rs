@@ -31,3 +31,15 @@ pub use task::DfpsTask;
 
 /// T06: reuse uperf-rs's USER_PATH so dfps state lives next to uperf state.
 pub const DFPS_NOTIFY_PATH: &str = "/sdcard/Android/yc/uperf/dfps_cur.txt";
+
+/// Basename of the dfps rule table. Lives in the same directory as
+/// `uperf.json` (AGENT.md §7.1); uperf-rs resolves the directory from its own
+/// config path, so only the name lives here.
+pub const DFPS_CONFIG_FILE: &str = "dfps.txt";
+
+/// Parse `dfps.txt` text into a table. The one entry point uperf-rs uses when
+/// the inotify watcher reports a write, so the boot and reload paths cannot
+/// drift.
+pub fn parse_config(text: &str) -> Result<config::RuleTable, config::ParseError> {
+    config::RuleTable::parse(text)
+}
