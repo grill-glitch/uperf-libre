@@ -40,7 +40,7 @@ go through the original author.
 | Schema           | v3 (`config/*.json`)                  | v3, **byte-compatible** — all 63 platform configs are accepted                               |
 | Logs             | dfps-style `H:M:S L message`          | Same line format                                                                             |
 | SoC coverage      | 63 configs (`sdm855`, `kirin980`, …)   | Same 63 configs (`config/*.json`); new configs can be added without touching existing values  |
-| SfAnalysis       | Vendored proprietary `libsfanalysis.so` | Same vendor .so (not re-implemented; see AGENT.md §12.1)                                  |
+| SfAnalysis       | Vendored proprietary `libsfanalysis.so` | `libsfanalysis_rs.so` (Rust cdylib, M8) — mprotect + inline patch on `xh_refresh_loop`, byte-compatible with the hint file protocol |
 
 What stays identical:
 
@@ -129,11 +129,15 @@ A short list of the supported scenes; the full enumeration is in
 
 ### What's intentionally out of scope
 
-- **SfAnalysis** is still the upstream-proprietary `libsfanalysis.so` (see
-  `AGENT.md §12.1`). The injected version's surface is not re-implemented in
-  `uperf-libre`; if you want a fully-free build, you can drop the
-  `libsfanalysis.so` step entirely (the daemon still runs and the CPU governor
-  works, you just lose the 66 ms SfLag hint).
+- **SfAnalysis** is now self-hosted: the closed-source `libsfanalysis.so` is
+  replaced by `libsfanalysis_rs.so` (Rust cdylib, M8). The injection mechanism
+  (mprotect + inline patch of `xh_refresh_loop` inside `libandroidfw.so`) is
+  reimplemented in Rust, and the hint file protocol (`<USER_PATH>/sfanalysis.hint`,
+  single byte 0..5) is byte-compatible with the upstream consumer. Vendor bytes
+  are no longer shipped in the published module. See
+  [`docs/spec/sfanalysis.md`](./docs/spec/sfanalysis.md) for the rewrite
+  boundary and `docs/m8-sfanalysis-reverse.md` for the static reverse.
+  Real-device byte-sequence parity is the remaining acceptance step.
 - **APK install acceleration** is upstream-supported through a separate
   event; not ported.
 
@@ -268,6 +272,10 @@ warning set drifts.
 - The closed Uperf v3 binary, configs, and platform scripts at
   [yinwanxi/Uperf-Game-Turbo](https://github.com/yinwanxi/Uperf-Game-Turbo)
   (`b13d54a`).
+- The SfAnalysis injection source at
+  [yc9559/surfaceflinger-analysis](https://github.com/yc9559/surfaceflinger-analysis);
+  the static reverse (`docs/m8-sfanalysis-reverse.md`) is built from the
+  `dev-22.09.04` release binary on that project.
 - The dfps C++ platform layer, vendored under
   [cpp/dfps/](./cpp/dfps) from [yc9559/dfps](https://github.com/yc9559/dfps)
   (Apache-2.0); see `cpp/dfps/DFPS_VENDOR.md` for the vendoring rules.

@@ -72,9 +72,21 @@ build_rust() {
     (cd $BASEDIR/rust && cargo build -p uperf-core --release --target $ARM64_TARGET)
 }
 
+# M8: SfAnalysis injection library (cdylib). Replaces the vendor's
+# closed-source `libsfanalysis.so` with our `libsfanalysis_rs.so`.
+# Documented in docs/spec/sfanalysis.md and AGENT.md §12.1.
+build_sfanalysis() {
+    echo ">>> Making libsfanalysis_rs.so (Rust cdylib, $ARM64_TARGET)"
+    (cd $BASEDIR/rust && cargo build -p uperf-sfanalysis --release --target $ARM64_TARGET)
+    local so="$BASEDIR/rust/target/$ARM64_TARGET/release/libsfanalysis_rs.so"
+    [ -f "$so" ] || { echo " !! libsfanalysis_rs.so was not produced"; exit 1; }
+    echo "    -> $so ($(stat -c %s "$so") bytes)"
+}
+
 make_uperf() {
     echo ">>> Making uperf ($BUILD_TYPE, $ARM64_PREFIX)"
     build_rust
+    build_sfanalysis
     build_targets $ARM64_PREFIX uperf
 }
 
@@ -173,6 +185,35 @@ check_uperf() {
         exit 1
     fi
     echo "    webui     : index.html + $(basename "$bundle") ($(stat -c %s "$bundle") bytes), imports resolved"
+
+    # M8: 0 closed-source blobs in the published module tree (AGENT.md §1).
+    # The shipped `libsfanalysis.so` from yc9559/uperf is replaced by
+    # `libsfanalysis_rs.so`. Assert both:
+    #   - libsfanalysis_rs.so exists and matches this build
+    #   - no vendor libsfanalysis.so sneaks back into magisk/bin
+    local vendor_so="$BASEDIR/magisk/bin/libsfanalysis.so"
+    if [ -f "$vendor_so" ]; then
+        echo " !! vendor libsfanalysis.so is still in magisk/bin (M8 0-blob invariant violated)"
+        exit 1
+    fi
+    local rs_so="$BASEDIR/magisk/bin/libsfanalysis_rs.so"
+    local rs_build="$BASEDIR/rust/target/$ARM64_TARGET/release/libsfanalysis_rs.so"
+    if [ ! -f "$rs_build" ]; then
+        echo " !! libsfanalysis_rs.so was not built (run 'sh build.sh $BUILD_TYPE make')"
+        exit 1
+    fi
+    if [ -f "$rs_so" ] && ! cmp -s "$rs_so" "$rs_build"; then
+        echo " !! magisk/bin/libsfanalysis_rs.so differs from the built artifact"
+        exit 1
+    fi
+    # Sanity: the .so must be a stripped aarch64 ELF with our xh_refresh_loop
+    # hint byte protocol — verify the .rodata contains the path the consumer
+    # in uperf-core reads from.
+    if ! LC_ALL=C strings "$rs_build" | grep -q "xh_refresh_loop"; then
+        echo " !! libsfanalysis_rs.so does not advertise hooking xh_refresh_loop"
+        exit 1
+    fi
+    echo "    sfanalysis: libsfanalysis_rs.so matches build, vendor libsfanalysis.so absent"
     echo "    -> OK"
 }
 
@@ -183,6 +224,17 @@ pack_uperf() {
     mkdir -p $STAGE_DIR $PKG_DIR
     cp -a $BASEDIR/magisk/. $STAGE_DIR/
     cp -f $BINARY $STAGE_DIR/bin/uperf
+    # M8: ship the new SfAnalysis injection library, replacing vendor's
+    # closed-source `libsfanalysis.so`. The customization phase
+    # (`magisk/customize.sh`) will `patchelf --add-needed` it onto
+    # `/system/bin/surfaceflinger`.
+    local rs_so="$BASEDIR/rust/target/$ARM64_TARGET/release/libsfanalysis_rs.so"
+    if [ -f "$rs_so" ]; then
+        cp -f "$rs_so" $STAGE_DIR/bin/libsfanalysis_rs.so
+        # Mirror into the in-tree magisk/bin so `check` can assert identity.
+        cp -f "$rs_so" $BASEDIR/magisk/bin/libsfanalysis_rs.so
+        echo "    -> bin/libsfanalysis_rs.so ($(stat -c %s "$rs_so") bytes)"
+    fi
     cp -f $BASEDIR/LICENSE $BASEDIR/NOTICE $STAGE_DIR/
     # Remove the previous archive first. `zip -r` *updates* an existing archive:
     # it adds and replaces entries but never drops ones that are gone from the
