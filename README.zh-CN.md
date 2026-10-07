@@ -24,7 +24,7 @@ uperf-libre 是同样的对外表面，重写实现：
 | Schema          | v3（`config/*.json`）                    | v3，**字节级兼容** —— 63 份平台配置全部接受                                                  |
 | 日志            | dfps 风格 `H:M:S L message`              | 同一 line 格式                                                                               |
 | 平台覆盖        | 63 份配置（`sdm855`、`kirin980` 等）    | 同一 63 份配置（`config/*.json`）；新增配置不影响既有数值                                    |
-| SfAnalysis      | vendored 闭源 `libsfanalysis.so`         | 同一闭源 .so（未重写，参见 `AGENT.md §12.1`）                                                |
+| SfAnalysis      | vendored 闭源 `libsfanalysis.so`         | `libsfanalysis_rs.so`（Rust cdylib，M8）—— mprotect + 内联 patch 钩 `xh_refresh_loop`，hint 文件协议字节兼容 |
 
 不变的部分：
 
@@ -75,7 +75,14 @@ uperf-libre 是同样的对外表面，重写实现：
 
 ### 故意未覆盖的部分
 
-- **SfAnalysis** 仍是上游闭源的 `libsfanalysis.so`（见 `AGENT.md §12.1`），注入部分未在 uperf-libre 中重写。如果想要完全自由的构建，可以直接跳过 `libsfanalysis.so` 步骤（守护进程照常运行、CPU 调频照常工作，只是失去 66 ms SfLag hint）。
+- **SfAnalysis** 已自研：上游闭源的 `libsfanalysis.so` 被替换为本仓库的
+  `libsfanalysis_rs.so`（Rust cdylib，M8）。注入机制（mprotect + 内联 patch
+  `libandroidfw.so` 内的 `xh_refresh_loop`）以 Rust 重写，hint 文件协议
+  （`<USER_PATH>/sfanalysis.hint`，单字节 0..5）与上游消费端字节兼容。
+  发布产物中不再携带任何闭源 .so。重写边界见
+  [`docs/spec/sfanalysis.md`](./docs/spec/sfanalysis.md)，r2 静态逆向记录见
+  [`docs/m8-sfanalysis-reverse.md`](./docs/m8-sfanalysis-reverse.md)。剩余的
+  真机 byte 序列一致性对账是 M8 的最后一道验收。
 - **APK 安装加速** 是上游通过一个独立事件支持的；未移植。
 
 ---
@@ -604,6 +611,7 @@ CPU 调频器通过将每个 `cpufreq` policy 的 `scaling_governor` 切到 `use
 ## 致谢
 
 - 闭源的 Uperf v3 二进制、配置与平台脚本：[yinwanxi/Uperf-Game-Turbo](https://github.com/yinwanxi/Uperf-Game-Turbo)（`b13d54a`）。
+- SfAnalysis 注入源码来自 [yc9559/surfaceflinger-analysis](https://github.com/yc9559/surfaceflinger-analysis)；r2 静态逆向（`docs/m8-sfanalysis-reverse.md`）基于该项目 `dev-22.09.04` release 二进制完成。
 - dfps C++ 平台层，vendored 自 [cpp/dfps/](./cpp/dfps)（取自 [yc9559/dfps](https://github.com/yc9559/dfps)，Apache-2.0）；vendoring 规则见 `cpp/dfps/DFPS_VENDOR.md`。
 - 63 份平台配置由各自作者贡献，署名见每份配置的 `meta.author` 字段。
 

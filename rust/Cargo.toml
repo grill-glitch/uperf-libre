@@ -4,6 +4,7 @@ members = [
     "uperf-config",
     "uperf-core",
     "uperf-cli",
+    "uperf-sfanalysis",
 ]
 
 [profile.release]
