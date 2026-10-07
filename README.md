@@ -64,6 +64,81 @@ What changes:
 
 ---
 
+## Features
+
+A userspace CPU-governor + context-scheduler with a hint-driven state machine.
+Below is what the daemon does on every tick; the per-feature details are in
+[`config/README.md`](./config/README.md) and the device-evidence files at
+[`docs/`](./docs).
+
+### CPU & memory control
+
+- **CPU-frequency scaling via `userspace` governor + `scaling_setspeed`**. On
+  alioth (`qcom-cpufreq-hw`, `scaling_max_freq` locked at the driver level)
+  this is the only path that works; every policy is taken over per cluster.
+  See [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md).
+- **Energy-model-driven OPP selection**. The per-cluster power / cost curves
+  fit the upstream printout to <0.0015 across 25 OPPs on three clusters; the
+  marginal-cost budget then allocates the OPP table across clusters under a
+  shared PL1/PL2 pool.
+- **Devfreq and LLCC boost** — `min_freq` / `max_freq` writes to DDR-bandwidth,
+  L3-latency, CPU-LLCC-bandwidth, and the UFS devfreq governor.
+- **cgroup, cpuset, and devfreq knob writes** with dedup — repeated writes
+  with identical values are skipped to keep the daemon's own wakeup overhead
+  low.
+- **Cluster affinity / dynamic-stune-style binding** — UI threads of the
+  foreground app are moved to big cores; idle and background work is
+  restricted from them.
+
+### Hint state machine
+
+A short list of the supported scenes; the full enumeration is in
+[`config/README.md`](./config/README.md).
+
+- `None` — idle baseline.
+- `Tap` / `Swipe` / `Touch` / `Pressed` — derived from `/dev/input/*` events
+  with end-velocity hint for swipe duration.
+- `HeavyLoad` — promoted from a touch hint when the system-load metric
+  `Σ efficiency(i) × load_pct(i) × freq_mhz(i)` exceeds `heavyLoad` for ≥
+  `requestBurstSlack` ms. Released as soon as the metric falls back below
+  `idleLoad`; this filters games (sustained high load) from short spikes
+  (app launch, photo open).
+- `SfLag` / `SfBoost` — reported by the SfAnalysis module injected into
+  `surfaceflinger`; rate-limited through a token-bucket so a long-running
+  GPU stall does not pin the cluster.
+- `AmSwitch` — front-app changes, detected via `ActivityManager` activity;
+  used to bind the new app's UI threads early (≈100 ms faster load migration).
+- `Standby` — screen-off hint detected through wake-lock updates, not via
+  the framework broadcast.
+- `WakeUp` — fingerprint / wake-up unlock sequence; promoted to a
+  maximum-performance hint for the duration of the unlock animation.
+- `SsAnim` — system animation playing (e.g. transition).
+- `RenderEnd` / `RenderRestart` — based on surfaceflinger frame-submit
+  activity polled every sample. Lets a hint end 200–300 ms after the last
+  frame (66 ms with SfAnalysis), reducing waste when the user's input ends
+  before the rendering finishes.
+
+### Configuration & UX
+
+- **`config/*.json` schema v3**, byte-compatible with upstream.
+- **`magisk/script/libuperf.sh` script contracts** preserved.
+- **Inotify-driven hot reload** of `cur_powermode.txt` and
+  `perapp_powermode.txt`; per-app presets configurable via `Scene` or
+  `sh /data/powercfg.sh <mode>`.
+- **WebUI** (KernelSU) shipped at `webui/` and built into the Magisk zip.
+
+### What's intentionally out of scope
+
+- **SfAnalysis** is still the upstream-proprietary `libsfanalysis.so` (see
+  `AGENT.md §12.1`). The injected version's surface is not re-implemented in
+  `uperf-libre`; if you want a fully-free build, you can drop the
+  `libsfanalysis.so` step entirely (the daemon still runs and the CPU governor
+  works, you just lose the 66 ms SfLag hint).
+- **APK install acceleration** is upstream-supported through a separate
+  event; not ported.
+
+---
+
 ## Build
 
 ```sh
