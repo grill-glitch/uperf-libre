@@ -57,7 +57,7 @@
 
 static constexpr char PROC_NAME[] = "uperf";
 static constexpr char AUTHOR[] = "grill-glitch (Rust rewrite project)";
-static constexpr char VERSION[] = "m0(rs-rewrite)";
+static constexpr char VERSION[] = "m0(rs-libre)";
 // The help text is the original uperf v3 string (verified present in the upstream
 // dev-22.09.04 binary), because magisk/script/libuperf.sh and user tooling rely on it.
 static constexpr char HELP_DESC[] =

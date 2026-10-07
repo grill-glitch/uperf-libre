@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 
-project(uperf-rewrite LANGUAGES C CXX)
+project(uperf-libre LANGUAGES C CXX)
 
 # The vendored thirdparty tree (scnlib) declares cmake_minimum_required(VERSION 3.4),
 # which CMake >= 4.0 refuses to configure. This is the documented escape hatch; it does
