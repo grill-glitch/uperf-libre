@@ -1,132 +1,120 @@
-# Uperf Game Turbo（uperf-libre 项目基线说明）
+# uperf-libre
 
-> **uperf-libre 项目说明在 [`README.md`](./README.md)**
-> 
-> 本文件保留为上游基线文档，便于参照原汁原味的功能描述。uperf-libre 在保留全部调用契约、配置 schema 与日志 line 格式的前提下，把闭源 `magisk/bin/uperf` 替换为 Rust 重写 + 复用 dfps C++ 平台层。
+> 本文件是 uperf-libre 项目的**中文说明**。英文版见 [`README.md`](./README.md)。
+
+## 简介
+
+uperf-libre 是 [Uperf Game Turbo](https://github.com/yc9559/uperf)（闭源二进制，谱系：[Project WIPE](https://github.com/yc9559/cpufreq-interactive-opt) → [Project WIPE v2](https://github.com/yc9559/wipe-v2) → [Perfd-opt](https://github.com/yc9559/perfd-opt) → [QTI-mem-opt](https://github.com/yc9559/qti-mem-opt) → [Uperf v3](https://github.com/yc9559/uperf) → [Uperf Game Turbo](https://github.com/yinwanxi/Uperf-Game-Turbo)）的自由重写：用 Rust 替换闭源的 `magisk/bin/uperf` 二进制，C++ 平台层则直接复用上游同源的 [dfps](https://github.com/yc9559/dfps)（Apache-2.0）事件总线、worker 框架、inotify glue。
+
+uperf-libre 保留原有的所有调用契约（`bin/uperf <USER_PATH>/uperf.json -o <USER_PATH>/uperf_log.txt`，`USER_PATH=/sdcard/Android/yc/uperf`），配置文件 schema v3 完整兼容，[`config/`](./config) 目录下 63 份平台配置可直接使用，不做任何修改。
 
 ---
 
-一个Android用户态性能控制器，实现大部分内核态升频功能，并支持更多情景识别。
+## Why
 
-## 主要功能
+Uperf v3（`dev-22.09.04`）是一个用户态 CPU 调频器 + 上下文调度器，并附带内核态升频做不到的一些特性（touch/swipe/SfAnalysis hint 状态机、动态 stune 风格 cluster 绑定、devfreq / LLCC boost）。原版以一个 stripped aarch64 PIE 二进制分发，意味着策略和能耗模型不可见，源代码永远无法在发布后重新审计，任何修改都得过原作者。
 
-- 根据识别的场景类型，动态设定参数控制性能释放，支持所有`sysfs`节点
-- 支持动态绑定正在操作的APP的UI相关线程到大核集群
-- 从Linux层面读取Android的触摸屏输入信号，识别点击和滑动
-- 主动采样系统负载，识别例如APP启动的瞬间重负载
-- 监听cpuset分组更新操作，识别正在操作的APP发生切换
-- 监听唤醒锁更新操作，识别屏幕是否熄灭
-- 监听注入到Surfaceflinger的hook发送的通知，识别渲染开始、滞后、结束
-- 支持Android 6.0+
-- 支持arm64-v8a
-- 支持Magisk方式一键安装，版本不低于20.4+
-- 不依赖于Magisk，可以手动方式安装
-- 除非SfAnalysis注入失败，大多数情况SELinux可保持`enforcing`
-- 不依赖于任何Android应用层框架以及第三方内核
-- 为大多数热门硬件平台提供了调参后的配置文件
+uperf-libre 是同样的对外表面，重写实现：
 
-## 下载
+| 层              | 上游                                     | uperf-libre                                                                                  |
+| --------------- | ---------------------------------------- | -------------------------------------------------------------------------------------------- |
+| 二进制 `bin/uperf` | 闭源 C++，NDK r24，stripped              | Rust staticlib（`uperf-core`）+ dfps C++ 平台层（vendored, Apache-2.0）                       |
+| 许可证          | 版权所有                                 | Apache-2.0                                                                                   |
+| 源码            | 未公开                                   | 本仓库全量                                                                                   |
+| Schema          | v3（`config/*.json`）                    | v3，**字节级兼容** —— 63 份平台配置全部接受                                                  |
+| 日志            | dfps 风格 `H:M:S L message`              | 同一 line 格式                                                                               |
+| 平台覆盖        | 63 份配置（`sdm855`、`kirin980` 等）    | 同一 63 份配置（`config/*.json`）；新增配置不影响既有数值                                    |
+| SfAnalysis      | vendored 闭源 `libsfanalysis.so`         | 同一闭源 .so（未重写，参见 `AGENT.md §12.1`）                                                |
 
-https://github.com/yinwanxi/Uperf-Game-Turbo/releases
+不变的部分：
 
-## 安装
+- 调用契约：`bin/uperf <config> -o <log>`。
+- `USER_PATH=/sdcard/Android/yc/uperf` 以及 `magisk/script/libuperf.sh` 的所有调用契约。
+- 进程名（`uperf`）、`killall uperf` 停止路径、以及 `cur_powermode.txt` / `perapp_powermode.txt` 切换文件。
 
-### Magisk方式
+变化的部分：
 
-1. 下载后通过Magisk Manager刷入，Magisk版本不低于18.0
-2. 重启后查看`/sdcard/Android/yc/uperf/uperf_log.txt`检查uperf是否正常自启动
+- Rust 内核可审计、可重新编译。
+- 能耗模型、OPP → 频率策略、PL1/PL2 池算术、延迟平滑均有单元测试（`cargo test --release`）；闭源二进制的逐位取整/逐节拍选点无法复现，所以 uperf-libre 匹配 **配置语义** 与 **可观测行为**，不保证 1:1 重放。
+- `AGENT.md §2` 基线默认配置使用偏保守的 PL1=2W。在 alioth 上会把小 cluster 钉到比 stock `schedutil` 更低的频点；可通过现有平台配置或自行编写调整。
 
-### 手动安装
+---
 
-1. 如果你的设备无法安装Magisk，并且已经获取到ROOT权限
-2. 下载后手动解压缩，例如解压缩到`/data/uperf`
-3. 修改`setup_uperf.sh`，`run_uperf.sh`，`initsvc_uperf.sh`权限为755
-4. 执行`setup_uperf.sh`完成安装，检查输出信息是否有报错
-5. 执行`run_uperf.sh`启动uperf，检查输出信息是否有报错
-6. 打开`/data/cache/injector.log`，检查sfanalysis注入是否成功
-7. 如果关联自启动到第三方APP，设置在开机完成后执行`run_uperf.sh`
-8. 如果关联自启动到系统启动脚本，插入`sh /data/uperf/initsvc_uperf.sh`
-9. 重启后查看`/sdcard/yc/uperf/uperf_log.txt`检查uperf是否正常自启动
+## 功能与特性
 
-### 性能模式切换
+这是一个用户态 CPU 调频器 + 上下文调度器，配合一个 hint 驱动的状态机。下文是每个 tick 的行为概述，参数定义详见 [`config/README.md`](./config/README.md)，真机证据见 [`docs/`](./docs)。
 
-#### 修改启动时的默认性能模式
+### CPU 与内存控制
 
-1. 打开`/sdcard/Android/yc/uperf/cur_powermode.txt`
-2. 修改`auto`, 其中`auto`为开机后使用的默认性能模式，可选的模式有:
-   - `auto`根据正在使用的App进行动态响应
-   - `balance`均衡模式，比原厂略流畅的同时略省电
-   - `powersave`卡顿模式，保证基本流畅的同时尽可能降低功耗
-   - `performance`费电模式，保证费电的同时多一点流畅度
-   - `fast`性能模式，相对于均衡模式更加激进
-3. 重启
+- **CPU 频率通过 `userspace` 调速器 + `scaling_setspeed` 接管**。在 alioth（`qcom-cpufreq-hw`，`scaling_max_freq` 驱动级只读）上这是唯一可工作的路径；每个 policy 逐个被接管。详见 [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md)。
+- **能耗模型驱动的 OPP 选择**。每个 cluster 的 power / cost 曲线在三个 cluster × 25 个 OPP 上与上游 printout 的拟合误差 <0.0015；然后在共享 PL1/PL2 池下做最优 OPP 选择。
+- **Devfreq 与 LLCC boost** —— 对 DDR-bandwidth、L3-latency、CPU-LLCC-bandwidth、UFS devfreq 调速器的 `min_freq` / `max_freq` 写入。
+- **cgroup、cpuset、devfreq 节点去重写入** —— 相同值重复写入会被跳过，从而把守护进程自身的 wakeup 开销压到最低。
+- **Cluster 亲和性 / 动态 stune 风格绑定** —— 前台 App 的 UI 线程迁到大核，idle 与后台工作被排除在大核外。
 
-#### 启动完成后切换性能模式
+### Hint 状态机
 
-方法1:  
-执行`sh /data/powercfg.sh balance`，其中`balance`是想要切换到的性能模式名称。  
+支持的场景简表，完整枚举见 [`config/README.md`](./config/README.md)。
 
-方法2:  
-安装[Scene](https://www.coolapk.com/apk/com.omarea.vtools)为APP绑定对应的性能模式。  
+- `None` —— idle 基线。
+- `Tap` / `Swipe` / `Touch` / `Pressed` —— 从 `/dev/input/*` 事件派生，附带末端速度用于估算 swipe 持续时间。
+- `HeavyLoad` —— 当系统负载度量 `Σ efficiency(i) × load_pct(i) × freq_mhz(i)` 超过 `heavyLoad` 至少 `requestBurstSlack` ms 时，从 touch hint 提升上来；负载降到 `idleLoad` 以下立即退出，过滤掉游戏（持续高负载）而保留短尖峰（App 启动、看图）。
+- `SfLag` / `SfBoost` —— 来自注入到 `surfaceflinger` 的 SfAnalysis 模块；通过 token bucket 限频，避免长 GPU 停顿把 cluster 钉住。
+- `AmSwitch` —— 前台 App 切换，通过 `ActivityManager` 活动检测；用于提前绑定新 App 的 UI 线程（负载迁移加快 ~100 ms）。
+- `Standby` —— 屏幕熄灭 hint，通过 wake-lock 更新检测，不走框架广播。
+- `WakeUp` —— 指纹 / 亮屏解锁序列；解锁动画期间升级到最大性能 hint。
+- `SsAnim` —— 系统动画播放中（例：转场）。
+- `RenderEnd` / `RenderRestart` —— 基于 surfaceflinger frame-submit 活动（每 sample 轮询）。让 hint 在最后一帧之后 200–300 ms 结束（用 SfAnalysis 可降到 66 ms），避免用户输入已结束而渲染未完成时的电费浪费。
 
-## 常见问题
+### 配置与 UX
 
-Q：是否对待机功耗有负面影响？  
-A：Uperf的实现做了不少低功耗的优化，自身运行的功耗开销很低。此外预制配置文件的待机模式中，减少了待机时唤醒的核心数量并使用了保守的升频参数。待机功耗的优化主要靠减少唤醒时长比例，在此基础上Uperf可进一步降低一点待机功耗。  
+- **`config/*.json` schema v3**，与上游字节级兼容。
+- **`magisk/script/libuperf.sh` 脚本契约**保留。
+- **inotify 热重载** `cur_powermode.txt` 与 `perapp_powermode.txt`；分应用预设可通过 `Scene` 或 `sh /data/powercfg.sh <mode>` 配置。
+- **WebUI**（KernelSU）位于 `webui/`，会被打入发布包。
 
-Q：为什么使用了Uperf还是很费电？  
-A：SOC的AP部分功耗主要取决于计算量以及使用的频点。Uperf只能控制性能释放，改进频点的选择从而降低功耗，如果后台APP的计算量很大是无法得到显著的续航延长的。这一问题可以通过Scene工具箱的进程管理器来定位。  
+### 故意未覆盖的部分
 
-Q：是否需要关闭系统的温度控制？  
-A：系统温度控制是一种硬件保护措施，或者用于改善高负载下的用户体验。大多数情况下无需关闭它，如果你遇到性能严重受限的情况，例如运行竞技游戏CPU最大频率限制在1.4Ghz，请提升温控介入的阈值或者关闭系统温度控制。  
+- **SfAnalysis** 仍是上游闭源的 `libsfanalysis.so`（见 `AGENT.md §12.1`），注入部分未在 uperf-libre 中重写。如果想要完全自由的构建，可以直接跳过 `libsfanalysis.so` 步骤（守护进程照常运行、CPU 调频照常工作，只是失去 66 ms SfLag hint）。
+- **APK 安装加速** 是上游通过一个独立事件支持的；未移植。
 
-Q：Uperf和Scene工具箱是什么关系？  
-A：这两个软件独立运作，没有互相依赖。Uperf实现了接口可供Scene工具箱调用，例如性能模式切换以及分APP性能模式。如果不安装Scene工具箱也可以实现性能模式切换，详情见使用方式。  
+---
 
-Q：是否还需要关闭系统的performance boost？  
-A：Uperf模块内脚本已经关闭了大部分主流的用户态和内核态升频，如果有非常规的升频需要用户自己关闭。  
+## 上游基线文档（保留原样）
 
-Q：我遇到了一些奇怪的系统故障，是怎么回事？  
-A：Uperf在大多数平台可以正常工作，在测试阶段收集到了以下可能发生的故障：
-- 桌面启动器不响应触摸。这个目前只在MIUI 12遇到，如果遇到了此问题请删除`/data/adb/modules/uperf/enable_sfanalysis`
-- 触摸屏报点间断丢失。请检查是否使用了自动跳过之类的APP，特别是支持坐标点击的
-- 睡死。用户态应用程序理论上不会影响系统稳定性，请更换为官方内核和ROM
+以下章节保留 yinwanxi 撰写的 Uperf Game Turbo 原文档作为**实现细节参考**，便于对照原始意图理解每一项功能。uperf-libre 的对外身份声明以上文为准。
 
-Q：使用Magisk安装时提示`not supported`，这是为什么？  
-A：此硬件平台没有预制的配置文件，可能需要自行适配。  
+> 这是在 [Project WIPE](https://github.com/yc9559/cpufreq-interactive-opt)、[Project WIPE v2](https://github.com/yc9559/wipe-v2)、[Perfd-opt](https://github.com/yc9559/perfd-opt)、[QTI-mem-opt](https://github.com/yc9559/qti-mem-opt)之后的一个新项目。在之前的工作中，往往是基于一个现有的性能控制器做调参，这也意味着最后究竟能做到多好取决于控制器本身的上限。在EAS调度器成为主流之后无法应用WIPE系列的思路，因为EAS的参数自由度实在太少，等到借助了高通Boost框架才实现了更广范围的调整，才有了Perfd-opt。一方面受制于现有的性能控制器的功能限制，一方面还有一部分老设备没有这些新的性能控制器。没有条件就要创造条件，编写了一个安卓全平台的用户态性能控制器。
+>
+> 用户态性能控制通常有着较高的延迟（因为修改sysfs节点消耗相对较多的时间），但是距离实际应用场景很近可以在一些已知的重负载开始之前主动提升性能减少卡顿。一般的工作模式是在系统框架Java层发送Hint，由Native层的服务接收Hint并执行对应的sysfs修改，例如高通CAF Boost Framework、Power-libperfmgr。
+>
+> 与其他用户态性能控制器不同的是，Uperf没有Java层的部分，只有Native层接收时间通知和主动采样，这也就没有了系统框架层面的依赖。因此她不需要重新编译内核，也不需要修改Android框架源码，她也没有几乎硬件平台的限制。她的修改范围涵盖了所有内核态性能控制能够做到的，也就是说不用换掉没啥bug的官方内核，就能使用输入升频（没错，少部分老内核没有这个）、Dynamic Stune Boost、Devfreq Boost这些花式Boost。
 
-## 详细介绍
+下表为几个主要的性能优化方案的功能对比：
 
-这是在[Project WIPE](https://github.com/yc9559/cpufreq-interactive-opt)、[Project WIPE v2](https://github.com/yc9559/wipe-v2)、[Perfd-opt](https://github.com/yc9559/perfd-opt)、[QTI-mem-opt](https://github.com/yc9559/qti-mem-opt)之后的一个新项目。在之前的工作中，往往是基于一个现有的性能控制器做调参，这也意味着最后究竟能做到多好取决于控制器本身的上限。在EAS调度器成为主流之后无法应用WIPE系列的思路，因为EAS的参数自由度实在太少，等到借助了高通Boost框架才实现了更广范围的调整，才有了Perfd-opt。一方面受制于现有的性能控制器的功能限制，一方面还有一部分老设备没有这些新的性能控制器。没有条件就要创造条件，编写了一个安卓全平台的用户态性能控制器。
-
-用户态性能控制通常有着较高的延迟（因为修改sysfs节点消耗相对较多的时间），但是距离实际应用场景很近可以在一些已知的重负载开始之前主动提升性能减少卡顿。一般的工作模式是在系统框架Java层发送Hint，由Native层的服务接收Hint并执行对应的sysfs修改，例如高通CAF Boost Framework、Power-libperfmgr。
-
-与其他用户态性能控制器不同的是，Uperf没有Java层的部分，只有Native层接收时间通知和主动采样，这也就没有了系统框架层面的依赖。因此她不需要重新编译内核，也不需要修改Android框架源码，她也没有几乎硬件平台的限制。她的修改范围涵盖了所有内核态性能控制能够做到的，也就是说不用换掉没啥bug的官方内核，就能使用输入升频（没错，少部分老内核没有这个）、Dynamic Stune Boost、Devfreq Boost这些花式Boost。
-
-下表为几个主要的性能优化方案的功能对比：   
-|          功能          | Project WIPE | Perfd-opt(CAF) | libperfmgr | Uperf |
-| :--------------------: | :----------: | :------------: | :--------: | :---: |
-|    HMP+interactive     |      ✔️       |                |            |   ✔️   |
-|     EAS+schedutil      |              |       ✔️        |     ✔️      |   ✔️   |
-|       非高通平台       |      ✔️       |                |            |   ✔️   |
-|     Android < 8.0      |      ✔️       |                |            |   ✔️   |
-|    HMP模型自动调参     |      ✔️       |                |            |   ✔️   |
-|   UI线程的CPU亲和性    |              |                |            |   ✔️   |
-|        点击升频        |              |                |     ✔️      |   ✔️   |
-|      列表滚动升频      |              |       ✔️        |     ✔️      |   ✔️   |
-|      APP启动加速       |              |       ✔️        |     ✔️      |   ✔️   |
-|      APK安装加速       |              |       ✔️        |            |       |
-|        待机优化        |              |                |            |   ✔️   |
-|       帧渲染滞后       |              |                |            |   ✔️   |
-|     渲染开始、结束     |              |                |            |   ✔️   |
-| surfaceflinger复杂合成 |              |                |     ✔️      |       |
-|      视频录制情景      |              |                |     ✔️      |       |
-|       多性能模式       |      ✔️       |       ✔️        |            |   ✔️   |
+| 功能                  | Project WIPE | Perfd-opt(CAF) | libperfmgr | Uperf |
+| --------------------- | :----------: | :------------: | :--------: | :---: |
+| HMP+interactive       | ✔️          |            |        | ✔️   |
+| EAS+schedutil         |              | ✔️          | ✔️      | ✔️   |
+| 非高通平台            | ✔️          |            |        | ✔️   |
+| Android < 8.0         | ✔️          |            |        | ✔️   |
+| HMP模型自动调参       | ✔️          |            |        | ✔️   |
+| UI线程的CPU亲和性     |              |            |        | ✔️   |
+| 点击升频              |              |            | ✔️      | ✔️   |
+| 列表滚动升频          |              | ✔️          | ✔️      | ✔️   |
+| APP启动加速           |              | ✔️          | ✔️      | ✔️   |
+| APK安装加速           |              | ✔️          |        |       |
+| 待机优化              |              |            |        | ✔️   |
+| 帧渲染滞后            |              |            |        | ✔️   |
+| 渲染开始、结束        |              |            |        | ✔️   |
+| surfaceflinger复杂合成 |              |            | ✔️      |       |
+| 视频录制情景          |              |            | ✔️      |       |
+| 多性能模式            | ✔️          | ✔️          |        | ✔️   |
 
 ### 情景识别
 
 注：v3版本已经修改，此部分不适用
-Uperf支持如下几种情景识别：  
+Uperf支持如下几种情景识别：
 - `None`，无Hint的常规状态
 - `Touch`，触摸到屏幕切换的Hint
 - `Pressed`，长按时切换的的Hint
@@ -138,8 +126,6 @@ Uperf支持如下几种情景识别：
 - `Standby`，屏幕熄灭时的Hint，一般滞后20秒(隐藏Hint)
 - `SsAnim`，系统动画播放切换的Hint
 - `WakeUp`，亮屏解锁切换的Hint
-
-
 
 #### 触摸信号识别
 
@@ -165,7 +151,7 @@ Uperf支持如下几种情景识别：
 
 #### SfAnalysis
 
-Sfanalysis是一个独立于Uperf的模块，注入到surfaceflinger进行修改，从这个负责Android所有帧渲染提交的进程发出信号，通知Uperf调整性能输出，在观察到卡顿之前就提升性能，真正做到未卜先知，这是所有内核态升频所不能企及的。然而想要她的实现有诸多限制，OEM可以改源码，做内核的可以改内核源码，Uperf为了普适性不能修改源码。如果使用注入方式，surfaceflinger是native进程，使用C++编写，相比system_server这类Java写成的hook位点更少，更不用提不同Android版本的实现还不一样。就算注入成功，由于Android对系统进程设置了很多SELinux规则，防止被注入攻击后取得太多的权限，通知信号也难以发出。绕过了这些限制后，Sfanalysis具有以下功能：  
+Sfanalysis是一个独立于Uperf的模块，注入到surfaceflinger进行修改，从这个负责Android所有帧渲染提交的进程发出信号，通知Uperf调整性能输出，在观察到卡顿之前就提升性能，真正做到未卜先知，这是所有内核态升频所不能企及的。然而想要她的实现有诸多限制，OEM可以改源码，做内核的可以改内核源码，Uperf为了普适性不能修改源码。如果使用注入方式，surfaceflinger是native进程，使用C++编写，相比system_server这类Java写成的hook位点更少，更不用提不同Android版本的实现还不一样。就算注入成功，由于Android对系统进程设置了很多SELinux规则，防止被注入攻击后取得太多的权限，通知信号也难以发出。绕过了这些限制后，Sfanalysis具有以下功能：
 
 - hook关键调用，推测并向外部传递渲染开始、渲染提交滞后、渲染结束事件
 - 自适应动态刷新率、自适应vsync信号滞后间隔
@@ -173,7 +159,8 @@ Sfanalysis是一个独立于Uperf的模块，注入到surfaceflinger进行修改
 
 ![检测到渲染延迟立即拉升CPU频率](./media/sflag.png)
 
-渲染提交滞后对应的Hint`SfLag`与重负载一样，有调用频率限制避免长时间拉升高频，相关参数暂时没有开放更改。`SfLag`使用可用次数缓冲池控制调用频率，每满400ms间隔可用次数+1，最大到20次。为了避免不必要的频率拉升，只允许从`Tap`、`Swipe`、`Touch`、`Pressed`转移到`SfLag`。SfAnalysis正常工作后在日志以如下方式体现：  
+渲染提交滞后对应的Hint`SfLag`与重负载一样，有调用频率限制避免长时间拉升高频，相关参数暂时没有开放更改。`SfLag`使用可用次数缓冲池控制调用频率，每满400ms间隔可用次数+1，最大到20次。为了避免不必要的频率拉升，只允许从`Tap`、`Swipe`、`Touch`、`Pressed`转移到`SfLag`。SfAnalysis正常工作后在日志以如下方式体现：
+
 ```
 [13:03:36][I] SfAnalysis: Surfaceflinger analysis connected
 ```
@@ -191,7 +178,7 @@ Sfanalysis是一个独立于Uperf的模块，注入到surfaceflinger进行修改
 
 ### 写入器
 
-写入器基本功能是把目标字符串值写入到`sysfs`节点，除此以外，Uperf还内建了多种写入器实现了其他功能和更加紧凑的参数序列。在切换动作时，Uperf会比对与上一动作参数值的差异，跳过写入重复的值来减少自身功耗开销。Uperf支持的`knob`有如下几种类型：  
+写入器基本功能是把目标字符串值写入到`sysfs`节点，除此以外，Uperf还内建了多种写入器实现了其他功能和更加紧凑的参数序列。在切换动作时，Uperf会比对与上一动作参数值的差异，跳过写入重复的值来减少自身功耗开销。Uperf支持的`knob`有如下几种类型：
 - `string`，最基础的写入器。效果等同于`echo "val" > /path`。
 - `percluster`，分集群紧凑型写入器。使用配置文件中`platform/clusterCpuId`的CPU序号替换`path`中的`%d`，各个值由逗号分隔，使得按集群做区分的值更加紧凑，改善可读性。
 - `percpu`，分核心紧凑型写入器。根据配置文件中`platform/efficiency`的列表长度，生成CPU序号替换`path`中的`%d`，各个值由逗号分隔，使得按CPU核心做区分的值更加紧凑，改善可读性。
@@ -213,7 +200,7 @@ Sfanalysis是一个独立于Uperf的模块，注入到surfaceflinger进行修改
 
 ### 外围改进
 
-本模块除了Uperf本体以及SfAnalysis注入，还配合一些外围的改进共同改进用户体验。  
+本模块除了Uperf本体以及SfAnalysis注入，还配合一些外围的改进共同改进用户体验。
 - Uperf启动前其他参数统一化，包括：
   - schedtune置零
   - 使用CFQ调速器，降低多任务运行时前台任务的IO延迟
@@ -247,7 +234,8 @@ Sfanalysis是一个独立于Uperf的模块，注入到surfaceflinger进行修改
 | author   | string   | 配置文件的作者信息                             |
 | features | string   | 配置文件支持的功能列表，目前是保留字段不起作用 |
 
-`name`与`author`在日志以如下方式体现：  
+`name`与`author`在日志以如下方式体现：
+
 ```
 [13:03:33][I] CfgMgr: Using [sdm855/sdm855+ v20200516] by [yc@coolapk]
 ```
@@ -292,21 +280,27 @@ Sfanalysis是一个独立于Uperf的模块，注入到surfaceflinger进行修改
 | action            | string   | 绑定的动作名称，可以自定义                                                      |
 | maxDuration       | int      | 单位毫秒，动作保持的最大时长                                                    |
 
-在Uperf启动时会读取`switchInode`对应路径的文件获取默认性能模式,在日志以如下方式体现：  
+在Uperf启动时会读取`switchInode`对应路径的文件获取默认性能模式,在日志以如下方式体现：
+
 ```
 [13:03:33][I] CfgMgr: Read default powermode from /sdcard/yc/uperf/cur_powermode
 [13:03:33][I] CfgMgr: Powermode "(null)" -> "balance"
 ```
-`switchInode`对应路径的文件，监听新模式名称的写入完成模式切换：  
+
+`switchInode`对应路径的文件，监听新模式名称的写入完成模式切换：
+
 ```shell
 echo "powersave" > /sdcard/yc/uperf/cur_powermode
 ```
+
 在日志以如下方式体现：
-``` 
+
+```
 [13:06:45][I] CfgMgr: Powermode "balance" -> "powersave"
 ```
 
-`dispatch`的绑定关系，在日志以如下方式体现：  
+`dispatch`的绑定关系，在日志以如下方式体现：
+
 ```
 [13:03:33][I] CfgMgr: Bind HintNone -> normal
 [13:03:33][I] CfgMgr: Bind HintTap -> interaction
@@ -317,7 +311,8 @@ echo "powersave" > /sdcard/yc/uperf/cur_powermode
 [13:03:33][I] CfgMgr: Bind HintSflag -> sfLag
 ```
 
-`UxAffinity`和`SfAnalysis`这两项功能在日志以如下方式体现：  
+`UxAffinity`和`SfAnalysis`这两项功能在日志以如下方式体现：
+
 ```
 [13:03:33][I] CfgMgr: UX affinity enabled
 ...
@@ -361,7 +356,8 @@ echo "powersave" > /sdcard/yc/uperf/cur_powermode
 | efficiency   | int list    | 每个CPU核心的的相对同频性能，以Cortex-A53@1.0g为100，顺序与CPU ID对应 |
 | knobs        | object list | `sysfs`节点列表                                                       |
 
-`knobs`中的每个对象为`knob`，有以下属性：  
+`knobs`中的每个对象为`knob`，有以下属性：
+
 | 字段名 | 数据类型 | 描述                                   |
 | ------ | -------- | -------------------------------------- |
 | name   | string   | `sysfs`节点名称                        |
@@ -369,12 +365,14 @@ echo "powersave" > /sdcard/yc/uperf/cur_powermode
 | type   | string   | `sysfs`节点类型，详见[写入器](#写入器) |
 | enable | bool     | 是否启用，方便调试时一键禁用           |
 
-当`enable`字段为false时，在日志以如下方式体现：  
+当`enable`字段为false时，在日志以如下方式体现：
+
 ```
 [13:03:33][I] CfgMgr: Ignored root/platform/knobs/topCSProcs [Disabled by config file]
 ```
 
-当`path`字段对应的`sysfs`节点不存在或者不可写入时，在日志以如下方式体现：  
+当`path`字段对应的`sysfs`节点不存在或者不可写入时，在日志以如下方式体现：
+
 ```
 [13:03:33][I] CfgMgr: Ignored root/platform/knobs/bigHifreq [Path is not writable]
 ```
@@ -412,17 +410,19 @@ echo "powersave" > /sdcard/yc/uperf/cur_powermode
 | `knob`名称 | string   | 与`platform/knobs`中定义的`sysfs`节点名称 |
 | `knob`值   | string   | 值的格式详见[写入器](#写入器)             |
 
-一个动作应该为所有在`platform/knobs`定义的`knob`设置值。某些时候需要故意跳过某些值的设定，或者复用大部分前一动作的设定值，可以省略部分`knob`设置值，但不能全部。Uperf在加载配置文件时会提示哪些值没有设定会被跳过，在日志以如下方式体现：  
+一个动作应该为所有在`platform/knobs`定义的`knob`设置值。某些时候需要故意跳过某些值的设定，或者复用大部分前一动作的设定值，可以省略部分`knob`设置值，但不能全部。Uperf在加载配置文件时会提示哪些值没有设定会被跳过，在日志以如下方式体现：
+
 ```
 [13:03:33][I] CfgMgr: Ignored knobs in action root/powermodes/balance/actions/amSwitch:
-[13:03:33][I] CfgMgr: cpuFreqMin llccBwMax llccBwMin ddrBwMax ddrBwMin l3LatBig ddrLatBig 
+[13:03:33][I] CfgMgr: cpuFreqMin llccBwMax llccBwMin ddrBwMax ddrBwMin l3LatBig ddrLatBig
 ```
 
 ### 示例
 
-利用Uperf为交互和重负载添加关闭UFS节能，以此降低性能关键场景的IO瓶颈问题。  
+利用Uperf为交互和重负载添加关闭UFS节能，以此降低性能关键场景的IO瓶颈问题。
 
-UFS节能开关的`sysfs`节点路径为`/sys/devices/platform/soc/1d84000.ufshc/clkgate_enable`，接收字符串类型写入，写入"0"为关闭UFS节能，写入"1"为开启UFS节能，把这一节点取名为`ufsClkGateEnable`。在配置文件添加如下文本完成`knob`定义：  
+UFS节能开关的`sysfs`节点路径为`/sys/devices/platform/soc/1d84000.ufshc/clkgate_enable`，接收字符串类型写入，写入"0"为关闭UFS节能，写入"1"为开启UFS节能，把这一节点取名为`ufsClkGateEnable`。在配置文件添加如下文本完成`knob`定义：
+
 ```json
 "platform": {
     ...
@@ -440,7 +440,8 @@ UFS节能开关的`sysfs`节点路径为`/sys/devices/platform/soc/1d84000.ufshc
 }
 ```
 
-根据[情景识别](#情景识别)中的定义，交互的hint名称为`Tap`和`Swipe`，重负载的hint名称为`HeavyLoad`。   
+根据[情景识别](#情景识别)中的定义，交互的hint名称为`Tap`和`Swipe`，重负载的hint名称为`HeavyLoad`。
+
 ```json
 "dispatch": [
     ...
@@ -460,10 +461,11 @@ UFS节能开关的`sysfs`节点路径为`/sys/devices/platform/soc/1d84000.ufshc
         "maxDuration": 2000
     },
     ...
-}
+]
 ```
 
-根据配置文件内定义的hint与动作的绑定关系，需要给动作`interaction`和`heavyLoad`设置关闭UFS节能，其他动作保持开启UFS节能。在配置文件添加如下文本完成动作定义：     
+根据配置文件内定义的hint与动作的绑定关系，需要给动作`interaction`和`heavyLoad`设置关闭UFS节能，其他动作保持开启UFS节能。在配置文件添加如下文本完成动作定义：
+
 ```json
 "powermodes": [
     {
@@ -512,11 +514,100 @@ UFS节能开关的`sysfs`节点路径为`/sys/devices/platform/soc/1d84000.ufshc
 ]
 ```
 
-更改配置文件后保存，Uperf会自动创建新的子进程加载新的配置文件，如果新的配置文件格式存在问题，会终止新的子进程保留老的子进程。接下来验证配置文件中设定动作是否能如期执行，对应路径的值是否发生更改。  
+更改配置文件后保存，Uperf会自动创建新的子进程加载新的配置文件，如果新的配置文件格式存在问题，会终止新的子进程保留老的子进程。接下来验证配置文件中设定动作是否能如期执行，对应路径的值是否发生更改。
+
+## 构建与安装
+
+```sh
+export ANDROID_NDK=~/Android/Sdk/ndk/android-ndk-r30
+sh build.sh Release make check
+```
+
+产物落到 `build/aarch64-linux-android23/runnable/uperf`。`make check` 目标**先**跑 `cargo test --release`（Rust 内核）再调 CMake，因为 FFI 签名变更后若 `libuperf_core.a` 是旧版本会在 `memcpy` 里 segfault（见 `AGENT.md §10` 与 [`docs/`](./docs) 中的真机证据）。
+
+Magisk 模块打包命令沿用上游约定；`build.sh pack` 产出一个 KernelSU 兼容 zip，落到下次开机时的 `/data/adb/modules_update/uperf-libre`。模块 id、路径、以及 `libuperf.sh` 脚本契约全部保留。
+
+手动安装：把 zip 解到设备的任意目录，给 `setup_uperf.sh` 列出的脚本 `chmod 755`，再跑 `setup_uperf.sh` 与 `run_uperf.sh`。
+
+### 验证
+
+装完后，确认守护进程已起：
+
+```sh
+cat /sdcard/Android/yc/uperf/uperf_log.txt | tail
+echo powersave > /sdcard/Android/yc/uperf/cur_powermode   # 热重载
+```
+
+优雅停止（唯一安全的路径；SIGKILL 会让 userspace 调速器停在最后一次 `scaling_setspeed` 的频点上）：
+
+```sh
+killall uperf
+```
+
+如果设备因为崩溃卡在 `userspace`，恢复：
+
+```sh
+for d in /sys/devices/system/cpu/cpufreq/policy*; do
+  echo powersave > $d/scaling_governor
+done
+```
+
+启动脚本在启动时把替换的 governor 记到 `<USER_PATH>/orig_governor.txt`，所以正常 `killall uperf` 会自动恢复 `schedutil`。
+
+## 平台覆盖
+
+63 份平台配置位于 [`config/`](./config)。每份都是上游二进制的直接替换：`setup.sh build.sh sdm888.json` 与原 `yinwanxi/Uperf-Game-Turbo` Magisk 模块的调用完全一致。
+
+不在列表里的设备，二进制仍能运行，但会跳过 SoC 专属 knob（`modules.sysfs.knob` 解析为 `None`）；新增 SoC 配置方法见 `AGENT.md §11`。
+
+## 架构
+
+详见 [`AGENT.md`](./AGENT.md)（整体方案 + 验收标准）与 [`docs/`](./docs)（每个里程碑的真机证据）。
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ C++（vendored dfps, Apache-2.0, 进程骨架）                    │
+│  main.cpp        监督器：fork worker, SIGCHLD tombstone      │
+│                  SIGUSR1 优雅重启, spdlog                    │
+│  platform/       ModuleBase, CoBridge, DelayedWorker,        │
+│                  HeavyWorker, Inotifier, Singleton           │
+│  modules/        InputListener CgroupListener OffscreenMonitor│
+│                  TopappMonitor      ← 事件源                 │
+│  utils/          inotify input_reader sched_ctrl atrace …   │
+├─────────────────────────────────────────────────────────────┤
+│ extern "C" 桥（cpp/include/uperf_rs.h）                      │
+├─────────────────────────────────────────────────────────────┤
+│ Rust（本项目重写, staticlib libuperf_rs.a）                   │
+│  app      模块装配（替代 uperf.cpp）                         │
+│  config   JSON 解析 + 点号键覆盖 + 兼容告警                  │
+│  switcher hint FSM + preset/perapp 切换 + 时长               │
+│  profile  preset/scene → 各模块参数表下发                    │
+│  sysfs    6 类写入器 + 去重 + fd 缓存                        │
+│  governor 负载采样 + 能耗模型 + PL1/PL2 池 + 频点决策       │
+│  sched    上下文调度规则引擎（PCRE2 语义的 ERE）             │
+│  sf       sfanalysis.hint 消费 + 渲染结束/Hint 提前结束     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+CPU 调频器通过将每个 `cpufreq` policy 的 `scaling_governor` 切到 `userspace`、然后每 ~20 ms 通过 `scaling_setspeed` 发布下一个 OPP 目标来接管。在驱动层锁住 `scaling_max_freq` 的场景（例：`qcom-cpufreq-hw` on alioth —— mode 444，root 写入返回 EACCES），这是唯一可工作的路径；详见 [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md) 与 [`rust/uperf-config/src/freq_target.rs`](./rust/uperf-config/src/freq_target.rs) 中的解析顺序。
+
+## 状态
+
+- **稳定**：上游基础参考（25 个 OPP 上与 printout 拟合误差 <0.0015）、能耗模型、PL1/PL2 池算术、scene → sysfs 写入流水线，以及基于 inotify 的 `cur_powermode.txt` / `perapp_powermode.txt` 热重载。
+- **尽力而为**：延迟平滑（每采样最多一步，除非 predict 触发 —— 上游描述的是连续共享延迟预算，离散近似无法做到逐节拍匹配），以及 guideCap / limitEfficiency 的容量裁剪表（不可直接从闭源二进制观测）。
+- **真机验证**：alioth（crDroid Android 16 / KernelSU Next 3.3.0）与 polaris（LineageOS 22.2 working；Android 16 / 4.19 内核 —— axion 配置 + `KERNEL_CLANG_TRIPLE`）。
+
+## 贡献
+
+提交 PR 前请阅读 [`AGENT.md §10 验收清单`](./AGENT.md)。项目内置 parity 工具（`rust/uperf-cli`）会逐字节比对 `Config '{}' by '{}'` 与 `Knob '{}' not writeable` 日志行与闭源二进制期望输出，覆盖所有内置配置，警告集合一旦漂移 CI 即失败。
 
 ## 致谢
 
-感谢以下用户或项目的源码对本项目的帮助：  
+- 闭源的 Uperf v3 二进制、配置与平台脚本：[yinwanxi/Uperf-Game-Turbo](https://github.com/yinwanxi/Uperf-Game-Turbo)（`b13d54a`）。
+- dfps C++ 平台层，vendored 自 [cpp/dfps/](./cpp/dfps)（取自 [yc9559/dfps](https://github.com/yc9559/dfps)，Apache-2.0）；vendoring 规则见 `cpp/dfps/DFPS_VENDOR.md`。
+- 63 份平台配置由各自作者贡献，署名见每份配置的 `meta.author` 字段。
+
+感谢以下用户或项目的源码对本项目的帮助：
 - [@AndroidDumps](https://github.com/AndroidDumps)
 - [TinyInjector](https://github.com/shunix/TinyInjector)
 - [xHook](https://github.com/iqiyi/xHook)
@@ -525,38 +616,42 @@ UFS节能开关的`sysfs`节点路径为`/sys/devices/platform/soc/1d84000.ufshc
 - [@osm0sis](https://github.com/osm0sis)
 - @YMJ
 
-感谢以下用户的测试反馈和错误定位：  
-- @HEX_Stan(coolapk)  
-- @僞裝灬(coolapk)  
-- @Yoooooo(coolapk)  
-- @我愿你安i(coolapk)  
-- @鹰雏(coolapk)  
-- @yishisanren(coolapk)  
-- @asd821385525(coolapk)  
-- @倚楼醉听曲(coolapk)  
-- @NepPoseidon(coolapk)  
-- @寻光丿STLD(coolapk)  
-- @比企谷の雪乃(coolapk)  
-- @非洲咸鱼(coolapk)  
-- @哔哩哔哩弹慕网(coolapk)  
-- @我心飞翔的安(coolapk)  
-- @浏泽仔(coolapk)  
-- @〇MH1031(coolapk)  
-- @今天我头条了吗(coolapk)  
-- @瓜瓜皮(coolapk)  
-- @Universes(coolapk)  
-- @Superpinkcat(coolapk)  
-- @asto18089(coolapk)  
-- @顺其自然的肥肉(coolapk)  
-- @酷斗吧(coolapk)  
-- @何为永恒(coolapk)  
-- @我为啥叫这个(coolapk)  
-- @goddard(coolapk)  
-- @正果sss(coolapk)  
-- @Cowen(coolapk)  
-- @瞬光飞翔(coolapk)  
-- @kuiot(coolapk)  
-- @常凯申将军(coolapk)  
-- emptybot08(github)  
-- ahzhi(github)  
-- Saumer7(github)  
+感谢以下用户的测试反馈和错误定位：
+- @HEX_Stan(coolapk)
+- @僞裝灬(coolapk)
+- @Yoooooo(coolapk)
+- @我愿你安i(coolapk)
+- @鹰雏(coolapk)
+- @yishisanren(coolapk)
+- @asd821385525(coolapk)
+- @倚楼醉听曲(coolapk)
+- @NepPoseidon(coolapk)
+- @寻光丿STLD(coolapk)
+- @比企谷の雪乃(coolapk)
+- @非洲咸鱼(coolapk)
+- @哔哩哔哩弹慕网(coolapk)
+- @我心飞翔的安(coolapk)
+- @浏泽仔(coolapk)
+- @〇MH1031(coolapk)
+- @今天我头条了吗(coolapk)
+- @瓜瓜皮(coolapk)
+- @Universes(coolapk)
+- @Superpinkcat(coolapk)
+- @asto18089(coolapk)
+- @顺其自然的肥肉(coolapk)
+- @酷斗吧(coolapk)
+- @何为永恒(coolapk)
+- @我为啥叫这个(coolapk)
+- @goddard(coolapk)
+- @正果sss(coolapk)
+- @Cowen(coolapk)
+- @瞬光飞翔(coolapk)
+- @kuiot(coolapk)
+- @常凯申将军(coolapk)
+- emptybot08(github)
+- ahzhi(github)
+- Saumer7(github)
+
+## 许可证
+
+Apache-2.0。详见 [`LICENSE`](./LICENSE) 与 [`NOTICE`](./NOTICE)。
