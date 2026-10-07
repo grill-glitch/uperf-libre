@@ -6,7 +6,7 @@ import { MODULE_DIR, USER_PATH, readLog, restart, openUrl } from '../ctl.js';
 const LOG_STEPS = [100, 500, 2000];
 let logLines = 100;
 
-const REPO = 'https://github.com/grill-glitch/uperf-rewrite';
+const REPO = 'https://github.com/grill-glitch/uperf-libre';
 const UPSTREAM = 'https://github.com/yc9559/uperf';
 const DFPS = 'https://github.com/yc9559/dfps';
 
@@ -16,7 +16,7 @@ export function render(data, onRestart) {
     about.textContent = '';
     addLink(about, 'layers', getString('label_platform'), 'dfps (yc9559) — Apache-2.0', DFPS);
     addLink(about, 'open_in_new', getString('label_upstream'), 'uperf (yc9559)', UPSTREAM);
-    addLink(about, 'open_in_new', getString('label_source_repo'), 'uperf-rewrite', REPO);
+    addLink(about, 'open_in_new', getString('label_source_repo'), 'uperf-libre', REPO);
 
     const license = document.createElement('div');
     license.className = 'row';

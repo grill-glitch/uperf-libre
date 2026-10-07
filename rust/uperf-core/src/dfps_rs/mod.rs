@@ -1,13 +1,13 @@
 //! dfps-rs — dfps business logic, owned by dfps-rewrite, mounted into
-//! uperf-rewrite as a subtree at this exact path.
+//! uperf-libre as a subtree at this exact path.
 //!
-//! **Do not edit in uperf-rewrite.** Make changes here, then
-//! `git subtree pull` from uperf-rewrite (or `git subtree push` from dfps-rewrite to
+//! **Do not edit in uperf-libre.** Make changes here, then
+//! `git subtree pull` from uperf-libre (or `git subtree push` from dfps-rewrite to
 //! reverse-sync). See `docs/subtree-workflow.md` in this repo for the full recipe.
 //!
 //! Round-trip verified: a change committed here, then `git subtree split` +
 //! push to `dfps-rs-split`, then `git subtree pull --prefix=rust/uperf-core/src/dfps_rs
-//! dfps-rs dfps-rs-split` in uperf-rewrite, lands the change. See
+//! dfps-rs dfps-rs-split` in uperf-libre, lands the change. See
 //! `docs/subtree-workflow.md` §Verification.
 //!
 //! Public surface (re-exported so uperf's `crate::dfps_rs::DfpsTask` etc.

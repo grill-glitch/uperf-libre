@@ -2,7 +2,7 @@
 //!
 //! Split out from `task.rs` so the notifier module path stays flat
 //! (`crate::dfps_rs::notifier`) whether the crate is built standalone
-//! (in dfps-rewrite) or mounted as a subtree (in uperf-rewrite).
+//! (in dfps-rewrite) or mounted as a subtree (in uperf-libre).
 
 use std::fs::OpenOptions;
 use std::io::Write;

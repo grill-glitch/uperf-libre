@@ -14,7 +14,7 @@ use std::path::PathBuf;
 fn run(dir_name: &str) -> Vec<PathBuf> {
     let cfg_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap()           // rust/
-        .parent().unwrap()           // uperf-rewrite/
+        .parent().unwrap()           // uperf-libre/
         .join("docs")
         .join(dir_name);
     let cfg_dir = match std::fs::canonicalize(&cfg_dir) {

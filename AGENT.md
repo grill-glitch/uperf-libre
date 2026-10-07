@@ -3,7 +3,7 @@
 > 本文件是本仓库的**施工说明与验收标准**。任何在本仓库工作的 agent 必须先读完本文件，
 > 并在提交时对照第 10 节的验收条目自查。**禁止把"应该能"写成"已验证"。**
 
-- 仓库：`grill-glitch/uperf-rewrite`（fork，网络根 `yc9559/uperf`）
+- 仓库：`grill-glitch/uperf-libre`（fork，网络根 `yc9559/uperf`）
 - 内容基线：`yinwanxi/Uperf-Game-Turbo` @ `b13d54a`（= Uperf v3 `dev-22.09.04` 二进制 + 63 份平台配置 + 平台集成脚本）
 - 上游同步分支：`master`（== `upstream/master`，只用于同步，不受本项目改动）
 - 本项目工作分支：`game-turbo`（默认分支）
