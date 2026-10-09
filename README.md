@@ -163,8 +163,16 @@ a KernelSU-compatible zip that drops into `/data/adb/modules_update/uperf-libre`
 on next boot. The module id, paths, and the `libuperf.sh` script contracts
 are all preserved.
 
-Manual install: unpack the zip anywhere on the device, `chmod 755` the scripts
-listed in `setup_uperf.sh`, then run `setup_uperf.sh` and `run_uperf.sh`.
+Without Magisk/KernelSU: unpack the zip somewhere on the device and run
+`sh <unpacked>/script/setup.sh`. That seeds the matched SoC config into
+`$USER_PATH/uperf.json` and prints author, license and the warranty notice before it
+changes anything. Start the daemon the same way the module does:
+
+```sh
+<unpacked>/bin/uperf /sdcard/Android/yc/uperf/uperf.json -o /sdcard/Android/yc/uperf/uperf_log.txt
+```
+
+(`script/initsvc.sh` is the boot-time entry and does the same plus the platform fixups.)
 
 ## Verify
 
@@ -281,6 +289,23 @@ warning set drifts.
   (Apache-2.0); see `cpp/dfps/DFPS_VENDOR.md` for the vendoring rules.
 - The 63 per-platform configs are author-contributed and credited in each
   config's `meta.author` field.
+
+## Disclaimer
+
+**No warranty. Use entirely at your own risk.** This module runs as root and writes
+kernel and system tunables (cpufreq, cpusets, scheduler placement, thermal and devfreq
+knobs). A bad configuration, a kernel that rejects a write, or an unexpected shutdown
+can leave the device in a state only a reboot, recovery, or a reflash fixes. Before
+installing, make sure you can boot without it (Magisk/KernelSU safe mode).
+
+It is distributed under Apache-2.0 **as-is**, without even the implied warranty of
+merchantability or fitness for a particular purpose (Apache-2.0 §7-8). The installer
+prints the same notice before it changes anything. This project is not affiliated with,
+or endorsed by, Matt Yang (yc9559) or yinwanxi, the authors of the upstream projects.
+
+The module ships **no closed-source third-party binaries**: the only non-text files in
+the zip are our own build from this repository and the GPL-2.0 Android busybox declared
+in [`NOTICE`](./NOTICE).
 
 ## License
 

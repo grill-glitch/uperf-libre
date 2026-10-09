@@ -4,4 +4,3 @@ version=1.0.0-rc2 based on uperf 904 / UGT 1.35
 versionCode=26000002
 author=grill-glitch (rewrite) · Matt Yang & 吟惋兮 (original uperf / Game Turbo)
 description=uperf with the policy engine rewritten in Rust on the dfps C++ platform. Same configs, same CLI contract. /// 策略引擎用 Rust 重写、平台层复用 dfps 的 uperf，配置与 CLI 契约不变。
-ASOPT_VERSIONCODE=260
