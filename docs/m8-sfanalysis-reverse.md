@@ -260,7 +260,59 @@ A16 上 SF 不 map libandroidfw，但这两个文件在盘上存在，所以 `op
 
 ---
 
-## 7. 引用
+## 8. SF 侧注入实测（2026-10-09，alioth/A16，SELinux enforcing）
+
+用 `ssanalysis` 模块自带的 `injector`（ptrace + 远程 `dlopen`，见
+`docs/spec/sfanalysis.md §8`）把库注入**正在运行**的 surfaceflinger —— 纯内存，
+无需 patchelf、无需改磁盘。
+
+**路径铺垫**（两个都必要，否则 `dlopen` 返回 0）：
+
+1. `/data/local/tmp` 不行：SF 的 SELinux 域读不了 `shell_data_file`
+   （实测 `avc denied { search } … name="tmp" … scontext=u:r:surfaceflinger:s0`）。
+2. 改放 `/data/misc/surfaceflinger/`（`surfaceflinger_data_file`，system:system 0700，
+   SF 自己的目录），但 `avc denied { **execute** } … surfaceflinger_data_file` ——
+   加载 .so 需要 `execute`。`chcon u:object_r:system_file:s0` 后才放行
+   （SF 本来就执行一堆 `system_file` 的 .so）。namespace 这边没问题：
+   `namespace.default.permitted.paths += /data`。
+
+**我们的库注入后**：
+
+```
+comm="xh_refresh_loop" 出现 → ctor 真的跑了、worker 线程建起来了
+avc: denied { execmem } scontext=u:r:surfaceflinger:s0 tcontext=u:r:surfaceflinger:s0 tclass=process
+   ×4  ← 正好是 4 个 trampoline 的 mmap(PROT_READ|WRITE|EXEC)
+libc.so 仍是 r-xp，没有 rwxp
+```
+
+**vendor 库注入后**（同一路径、同一 injector）：
+
+```
+SF 里出现 fd 114 -> /system/bin/surfaceflinger
+        fd 245 -> /system/lib64/libandroidfw.so
+        fd 262 -> /system/lib64/libandroid.so
+   ← fcn.00004d58 确实执行了
+无任何 avc 记录、libc 未被 patch、没有 xh_refresh_loop 线程
+```
+
+**结论**：两条路在 enforcing 的 A16 上都**装不上 hook**，但卡点不同：
+
+| | 卡在哪 | 结果 |
+|---|---|---|
+| vendor | SF 的 maps 里**没有** `libandroidfw.so`（§2 已证），它的目标库选择落空 | 静默 no-op |
+| 本仓库 | 目标是 libc（处处都在），找到并走到补丁步 → SELinux `execmem` 拒绝匿名 RWX | no-op + 1 条 avc |
+
+**vendor 模块没有发布任何 `sepolicy.rule`**（模块内容只有 `post-fs-data.sh`/
+`service.sh`/`system.prop`/`patchelf`/`libsfanalysis.so`），所以它自己也没解决
+`execmem`；这个特性在 enforcing 的新 Android 上本来就是死的。
+
+**可选 opt-in**（未实现，属主动增强而非复刻）：模块带一条
+`allow surfaceflinger self:process execmem`（Magisk/KernelSU 的 `sepolicy.rule`），
+本仓库的库就能真的把 hook 装上。
+
+---
+
+## 9. 引用
 
 - `scripts/sfanalysis-deobf.py`：§1.3/§1.4 的解密器（可复现）
 - `docs/spec/sfanalysis.md`：M8 边界 spec

@@ -236,5 +236,28 @@ calls: ioctl=-1 ioctl2=-1 epoll=-1
 exit=0
 ```
 
-**未做**：把库真的注入 SF 并观察长期稳定性（harness 已验证机制，SF 侧留待下一次；
-SF 崩了要重启时会连带 zygote，风险高，需单独一轮）。
+### SF 侧注入实测（2026-10-09，见 m8-sfanalysis-reverse.md §8）
+
+用 `ssanalysis` 模块自带的 `injector`（ptrace + 远程 dlopen）把库注入**运行中的**
+surfaceflinger，纯内存、无磁盘改动：
+
+* 先把库放 `surfaceflinger_data_file` 目录并 `chcon u:object_r:system_file:s0`
+  （`/data/local/tmp` 读不了；`surfaceflinger_data_file` 不可 `execute`）；
+* 我们的库：`comm="xh_refresh_loop"` 出现（ctor 与 worker 都跑了），但
+  **SELinux 拒绝 `execmem` ×4** —— 正好 4 个 trampoline 的匿名 RWX mmap；
+  libc 仍是 `r-xp`。
+* vendor 库：同样注入成功，SF 里出现它打开的 `fd → surfaceflinger /
+  libandroidfw.so / libandroid.so`（`fcn.00004d58` 确实执行），但**无任何 avc、
+  无补丁、无 worker 线程** —— 它在 SF 的 maps 里找不到 `libandroidfw.so`，
+  目标库选择落空，静默 no-op。
+
+**所以 enforcing 的 A16 上两者都装不上 hook**，只是卡点不同（vendor 卡在目标库
+不存在；本仓库卡在 `execmem` 策略）。vendor 模块没发布任何 `sepolicy.rule`，
+它自己也没解决这个问题 —— 该特性在 enforcing 的新 Android 上本来就是死的。
+
+**可选 opt-in**（未实现，属主动增强而非复刻）：模块加一条
+`allow surfaceflinger self:process execmem`，本仓库的库即可真正安装 hook。
+
+**回滚**：注入是纯内存的，SF 重启即恢复。注意 `setprop ctl.restart surfaceflinger`
+在本 ROM 上会经 `onrestart restart zygote` 级联成**整机重启**（实测 uptime 归零），
+比预期重。
