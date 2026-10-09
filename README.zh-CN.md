@@ -534,7 +534,13 @@ sh build.sh Release make check
 
 Magisk 模块打包命令沿用上游约定；`build.sh pack` 产出一个 KernelSU 兼容 zip，落到下次开机时的 `/data/adb/modules_update/uperf-libre`。模块 id、路径、以及 `libuperf.sh` 脚本契约全部保留。
 
-手动安装：把 zip 解到设备的任意目录，给 `setup_uperf.sh` 列出的脚本 `chmod 755`，再跑 `setup_uperf.sh` 与 `run_uperf.sh`。
+不使用 Magisk/KernelSU 时：把 zip 解到设备任意目录，执行 `sh <解压目录>/script/setup.sh`，它会把匹配到的 SoC 配置播种到 `$USER_PATH/uperf.json`，并在改动任何东西之前打印作者、许可证与免责声明。然后用模块相同的方式启动守护进程：
+
+```sh
+<解压目录>/bin/uperf /sdcard/Android/yc/uperf/uperf.json -o /sdcard/Android/yc/uperf/uperf_log.txt
+```
+
+（`script/initsvc.sh` 是开机入口，做同样的事并额外完成平台修正。）
 
 ### 验证
 
@@ -659,6 +665,14 @@ CPU 调频器通过将每个 `cpufreq` policy 的 `scaling_governor` 切到 `use
 - emptybot08(github)
 - ahzhi(github)
 - Saumer7(github)
+
+## 免责声明
+
+**无任何担保，使用风险自行承担。** 本模块以 root 身份运行，并写入内核与系统可调项（cpufreq、cpuset、调度器放置、温控与 devfreq 节点）。配置不当、内核拒绝某次写入，或异常关机，都可能让设备停在只有重启、recovery 或重刷才能恢复的状态。安装前请确认你能在没有本模块的情况下开机（Magisk/KernelSU 安全模式）。
+
+本项目以 Apache-2.0 **按原样**分发，不提供任何明示或默示担保，包括对适销性或特定用途适用性的默示担保（Apache-2.0 §7-8）。安装脚本在改动任何东西之前会打印同样的声明。本项目与上游作者 Matt Yang（yc9559）、yinwanxi 没有隶属或背书关系。
+
+模块**不附带任何闭源第三方二进制**：zip 里仅有的非文本文件是本仓库自行构建的产物，以及在 [`NOTICE`](./NOTICE) 中声明的 GPL-2.0 Android busybox。
 
 ## 许可证
 

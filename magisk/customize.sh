@@ -18,7 +18,7 @@
 # Per-module customization. Runs at install time (Magisk/KSU module install).
 #
 # Order matters:
-#   1. Seed dfps.txt BEFORE setup.sh runs — see comment below.
+#   1. Seed dfps.txt BEFORE setup.sh runs - see comment below.
 #   2. Run setup.sh (this copies the matched SoC config out and then
 #      `rm -rf`s $MODULE_PATH/config/, which would wipe our dfps default).
 #   3. Patchelf surfaceflinger to pull in libsfanalysis_rs.so. This MUST
@@ -35,8 +35,8 @@ SKIPUNZIP=0
 # and the refresh-rate tab shows nothing).
 #
 # Only on a fresh install: an existing dfps.txt belongs to the user. That also
-# covers someone migrating from the separate yc_dfps module — their own rules
-# stay put, which AGENT.md §12.2 accepts as the cost of the embedded mode.
+# covers someone migrating from the separate yc_dfps module - their own rules
+# stay put, which AGENT.md section 12.2 accepts as the cost of the embedded mode.
 USER_PATH_DFPS="/sdcard/Android/yc/uperf"
 mkdir -p "$USER_PATH_DFPS" 2>/dev/null
 if [ ! -e "$USER_PATH_DFPS/dfps.txt" ] && [ -f "$MODPATH/config/dfps.default.txt" ]; then
@@ -48,7 +48,7 @@ sh $MODPATH/script/setup.sh
 [ "$?" != "0" ] && abort
 
 # M8: SfAnalysis injection. Replace vendor's closed-source libsfanalysis.so
-# (AGENT.md §1 / §12.1) with our Rust-built libsfanalysis_rs.so.
+# (AGENT.md section 1 / 12.1) with our Rust-built libsfanalysis_rs.so.
 #
 # Vendor's mechanism is documented in
 #   https://github.com/yc9559/surfaceflinger-analysis/
@@ -79,9 +79,9 @@ if [ -n "$PATCHELF" ] && [ -f "$MODPATH/bin/libsfanalysis_rs.so" ]; then
             "$PATCHELF" --add-needed libsfanalysis_rs.so "$SF_OUT" 2>/dev/null && \
             chmod 755 "$SF_OUT" && \
             chcon "$(ls -Zl "$SF_SRC" | cut -d' ' -f5)" "$SF_OUT" 2>/dev/null
-        # Tell the daemon which path to read hint bytes from. AGENT.md §7.4
+        # Tell the daemon which path to read hint bytes from. AGENT.md section 7.4
         # hard-codes the hint path next to uperf.json, so this is informational
-        # only — kept here as a single point of truth for diagnostics.
+        # only - kept here as a single point of truth for diagnostics.
         USER_PATH_HINT="/sdcard/Android/yc/uperf"
         export UPERF_SF_HINT_FILE="$USER_PATH_HINT/sfanalysis.hint"
     fi
