@@ -1,0 +1,21 @@
+# Cargo configuration for cross-compiling to aarch64-linux-android.
+# NDK r30 ships clang + lld; rustc needs to be told which linker to use.
+# The host gcc/ld cannot link aarch64 ELF (it would print
+# "Relocations in generic ELF").
+#
+# We use the NDK's `clang` as the linker driver instead of bare `ld.lld`
+# because clang already knows the NDK target triple and how to map
+# `-lunwind` to `-lc++abi` (NDK r30 ships no libunwind.so). Bare lld
+# would fail with "unable to find library -lunwind".
+#
+# clang's default search path is host-relative, so we explicitly point
+# it at the NDK sysroot via `--target=aarch64-linux-android24` and
+# `--sysroot=...` in rustflags. Without these, clang looks for -llog in
+# the host glibc, not the NDK tree, and fails.
+[target.aarch64-linux-android]
+linker = "/home/bigbang/Android/Sdk/ndk/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+ar = "/home/bigbang/Android/Sdk/ndk/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+rustflags = [
+    "-C", "link-arg=--target=aarch64-linux-android24",
+    "-C", "link-arg=--sysroot=/home/bigbang/Android/Sdk/ndk/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/sysroot",
+]

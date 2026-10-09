@@ -518,7 +518,7 @@ uperf-cli plan   <config.json> <mode> <scene>   # 层叠后的键值 + 来源（
 | **M7-crit** ✅ | **上线前修掉两个真 bug**（见 `docs/m7-evidence.md` §1） | `uperf-core/src/{inotify,watch_task,cpu_task}.rs`、`rust/uperf-core/src/lib.rs`、`magisk/script/libuperf.sh`、`magisk/uninstall.sh` | **已达成**：① watcher 的目录 watch 与 daemon 自己的日志形成反馈闭环 → worker **1065 → 68 ticks/10s**（15.7 倍），这正是手机卡顿主因；② 调频器接管改为**默认关闭**（实测把小核钉在 691200 最低档 vs 系统 schedutil 的满频 1804800），且**永不臆造 governor**、记录真实原值、模块脚本在启动/停止/卸载时还原 |
 | **M7c** ✅ | 控制入口 `webui.sh`（WebUI 与 adb 共用同一契约）+ 重启路径暴露的 4 个真 bug | `magisk/script/webui.sh`、`cpp/uperf/app_main.cpp`、`magisk/script/{libuperf,setup}.sh`、`docs/m7-evidence.md` §7 | **已达成**：① 用户目录丢失曾使模块**永久静默失效**（`Config file not found` 后每boot一次；现 `uperf_ensure_config` 自愈）；② daemon 继承调用者 stdout 管道，**SIGPIPE** 使 shell/WebUI 重启后 ~90s 自杀（init 只看到 zombie 9601）；现忽略 SIGPIPE + 启动器 `</dev/null >/dev/null 2>&1`，实测 120s 存活、日志 1240→**17767 行**；③ 模块自带 busybox 的 `ps` 影子（不支持 `-o`）使 status 谎报 `daemon.count=0`、`restart.ok=0`（改用 `/system/bin/ps`）；④ `ps` 的 STAT 是 `Ss` 两字符，位置匹配全失配 |
 | **M7d** ✅ | KernelSU WebUI：底部三标签（首页 / 模式切换 / 更多）+ 构建与闸门 | `webui/**`（Vite + `@material/web` + `kernelsu-alt` + XML i18n + 管理器主题变量）、`magisk/webroot`（产物，`.gitignore`）、`build.sh`（`build_webui` + webroot 闸门）、`docs/webui.md` | **已达成（管理器内实测除外）**：真机数据驱动的渲染/交互测试 **0 JS 报错**；模式列表取自**已加载配置**（sdm865 实为 5 个预设含 `crazy`）；写路径 adb 端到端验证（`preset.ok=1` → `preset.current=powersave`）；无 ksu 时如实提示；`check` 断言 webroot 必须引用控制脚本且 `kernelsu-alt` 已打包（`index.html + index-CkpJpgai.js 480543 bytes, imports resolved`）。**未验**：管理器 WebView 内的实际绘制 [U] |
-| **M8** 🚧 | **SfAnalysis 注入库 Rust 重写**：`libsfanalysis.so` → `libsfanalysis_rs.so`，0 闭源 blob | `magisk/bin/libsfanalysis_rs.so`、`rust/uperf-sfanalysis/`（cdylib）、`rust/uperf-sfanalysis/src/{lib.rs,hook.rs,fsm.rs,sink.rs}`、`docs/spec/sfanalysis.md`、`docs/m8-sfanalysis-reverse.md`、`magisk/customize.sh`（patchelf） | **代码完成**：[V] cdylib 在 `cargo test -p uperf-sfanalysis` 下 **20/20 单元测试通过**（host）；`build.sh make` 多 `build_sfanalysis` 步；`build.sh make check` 新增 0 闭源 blob 断言（vendor `libsfanalysis.so` 不能出现在 `magisk/bin/`，新 `libsfanalysis_rs.so` 必须含 `xh_refresh_loop` 字符串）；`magisk/customize.sh` patchelf SF 主程序并设 `UPERF_SF_HINT_FILE`。[U] 真机 byte 序列对账（AGENT.md §12.2 第 1 行）；[U] Frida trace hook handler（明确不做，AGENT.md §12.1）；[U] NDK r30 交叉编译 aarch64（host 没装 NDK r30，dev 流程留给真机集成） |
+| **M8** 🚧 | **SfAnalysis 注入库 Rust 重写**：`libsfanalysis.so` → `libsfanalysis_rs.so`，0 闭源 blob | `magisk/bin/libsfanalysis_rs.so`、`rust/uperf-sfanalysis/`（cdylib）、`rust/uperf-sfanalysis/src/{lib.rs,hook.rs,fsm.rs,sink.rs}`、`docs/spec/sfanalysis.md`、`docs/m8-sfanalysis-reverse.md`、`magisk/customize.sh`（patchelf） | **实现存在，但真机测试证明是错的**（2026-10-09）：[V] cdylib 在 `cargo test -p uperf-sfanalysis` 下 **20/20 单元测试通过**（host）；`build.sh make` 多 `build_sfanalysis` 步；`build.sh make check` 新增 0 闭源 blob 断言（vendor `libsfanalysis.so` 不能出现在 `magisk/bin/`，新 `libsfanalysis_rs.so` 必须含 `xh_refresh_loop` 字符串）；`magisk/customize.sh` patchelf SF 主程序并设 `UPERF_SF_HINT_FILE`。[U] 真机 byte 序列对账（AGENT.md §12.2 第 1 行）；[U] Frida trace hook handler（明确不做，AGENT.md §12.1）；[U] NDK r30 交叉编译 aarch64（host 没装 NDK r30，dev 流程留给真机集成） |
 
 M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（config/sysfs/governor/sched 互相独立）。
 
@@ -570,6 +570,19 @@ SfAnalysis 的 SF 注入库 `libsfanalysis.so`（26 KB / 47 函数、纯 C、静
 `docs/spec/sfanalysis.md`（边界 spec），AGENT.md §11 milestone 表 M8 行。
 **不做 Frida**：本仓库 §7.1 / §10.5 不要求动态验证，r2 静态 + 真机 byte 抓取已够。
 **状态码→语义映射**：M2 起逐条采集（与现有 §12.2 第 1 行同项，M8 完成后转为已解）。
+
+**M8 真机测试发现（2026-10-09，alioth/A16，见 `docs/m8-sfanalysis-reverse.md` §0/§1.4/§2）**：
+r2 深挖推翻了 M1 的 hook 目标结论——`xh_refresh_loop` 是 **xHook 自己的后台线程名**
+（`pthread_setname_np`），不是被 hook 的函数。真正的 4 个 hook 目标以
+TEA 变体加密在 `.data`，已解密：**`ioctl` / `epoll_wait` /
+`pthread_cond_timedwait` / `pthread_cond_wait`**（libc 函数，解密器见
+`scripts/sfanalysis-deobf.py`）。当前 `rust/uperf-sfanalysis` 的
+`HOOK_TARGET_SYM = "xh_refresh_loop"` **是错的**，且 `patch_target` 会写到
+libandroidfw 的 **ELF 头段**（maps 首条 r--p）而非 `.text`——真机 harness 已实证
+该段被 trampoline 覆写、perms 变 `rwxp`。**M8 未完成，需按新目标重写。**
+
+**另一条真机事实**：A16 的 `surfaceflinger` 根本不加载 `libandroidfw.so`
+（431 个 .so + DT_NEEDED 双证），故 vendor 件在这台设备上同样静默失效。
 
 ### 12.2 其它未知
 | 项 | 状态 | 处理 |

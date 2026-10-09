@@ -77,10 +77,15 @@ pub fn write_byte(path: &str, byte: u8) -> Result<(), i32> {
 
 #[inline]
 fn errno() -> i32 {
-    unsafe extern "C" {
-        fn __errno_location() -> *mut i32;
+    // See hook.rs for the rationale.
+    #[cfg(target_os = "android")]
+    unsafe {
+        *libc::__errno()
     }
-    unsafe { *__errno_location() }
+    #[cfg(not(target_os = "android"))]
+    unsafe {
+        *libc::__errno_location()
+    }
 }
 
 /// C-callable helper. Not strictly needed by the daemon, but useful for
