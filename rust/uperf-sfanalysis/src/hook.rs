@@ -351,12 +351,21 @@ fn page_size() -> usize {
     4096
 }
 
+/// Replace `errno()` with whatever libc actually provides.
+/// `libc` 0.2 picks the right symbol per target: `__errno` on bionic
+/// (Android), `__errno_location` on glibc (host). Host tests + the device
+/// build share the same source, which is exactly what we want — the
+/// target triple on cargo is what determines the call.
 #[inline]
 fn errno() -> i32 {
-    unsafe extern "C" {
-        fn __errno_location() -> *mut i32;
+    #[cfg(target_os = "android")]
+    unsafe {
+        *libc::__errno()
     }
-    unsafe { *__errno_location() }
+    #[cfg(not(target_os = "android"))]
+    unsafe {
+        *libc::__errno_location()
+    }
 }
 
 // We don't actually use every libc item at runtime; keep the imports

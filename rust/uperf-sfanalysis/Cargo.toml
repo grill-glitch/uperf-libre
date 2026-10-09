@@ -7,6 +7,12 @@ license = "Apache-2.0"
 publish = false
 
 [lib]
+# Force the cdylib output name to `libsfanalysis_rs.so` so it matches the
+# upstream vendor binary's naming convention. Without this, cargo would
+# emit `libuperf_sfanalysis.so` (auto-derived from the package name) and
+# every reference in `build.sh` / `magisk/customize.sh` would have to
+# track the rename.
+name = "sfanalysis_rs"
 crate-type = ["cdylib"]
 
 [dependencies]

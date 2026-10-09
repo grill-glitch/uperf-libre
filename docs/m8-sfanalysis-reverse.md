@@ -1,15 +1,26 @@
 # M8 SfAnalysis 静态逆向（r2，22.09.04 libsfanalysis.so）
 
-> 本节是 M8 重写的逆向起点。**所有静态已确认事实**写在这里，留待真机验证的
-> byte 序列一致性、FSM 触发时间、hook 触发频率留 `[待 M8 验收]`。
-> 验证由 §5 `build.sh make check` + §10.2 真机 byte 对账负责。
+> M8 重写的逆向起点。**静态已确认事实**写在这里；真机 byte 一致性留在 §7。
 
 **vendor 件来源**：`https://github.com/yc9559/uperf/releases/tag/dev-22.09.04`
-→ `sfanalysis-magisk-22.09.04.zip`（413 KB）。
+→ `sfanalysis-magisk-22.09.04.zip`。
 **sha256**：`386905b5e6237af09f61628f3a4feb257e17f47722a36b1c9a38eb0688987f31`
-**sha256-vendor 模块 id**：`sfanalysis`（作者 Matt Yang，描述指向 `yc9559/surfaceflinger-analysis/`）
-**大小**：25,952 B（≈ 26 KB 量级，与 `m1-static-reverse.md §1.5` 一致）
-**stripped, NDK r24, aarch64, full RELRO, dynamically linked**（无 xHook 静态链）
+**大小**：25,952 B（aarch64、stripped、NDK r24、full RELRO、静态链 xHook）
+
+---
+
+## 0. 结论速览（**推翻了 m1-static-reverse.md §1.5 的 hook 目标**）
+
+| 项 | m1 的结论（错） | 本节结论（r2 实证） |
+|---|---|---|
+| hook 目标 | `xh_refresh_loop`（以为是 libandroidfw 内的函数） | **`ioctl` / `epoll_wait` / `pthread_cond_timedwait` / `pthread_cond_wait`**（libc 函数） |
+| `xh_refresh_loop` 是什么 | “被 hook 的函数名” | **xHook 自己的后台线程名**（`pthread_setname_np(self, "xh_refresh_loop")`）——**不是 hook 目标** |
+| 那 4 条不透明 `.data` 记录 | 在 uperf 主二进制里、静态解不出 | **在 libsfanalysis.so 里**，是 **TEA 变体加密的 4 个符号名**，已解密（见 §1.5 / `scripts/sfanalysis-deobf.py`） |
+| `libandroidfw.so` / `libandroid.so` 字符串 | 被 hook 的函数所在库 | **hook 目标库的选择集合**（maps 扫描时匹配），不是被 hook 符号的所在 |
+
+**为什么重要**：重写必须 hook 那 4 个 libc 函数，而不是 `xh_refresh_loop`。
+`xh_refresh_loop` 在任何 libandroidfw 里都不存在，所以照 m1 结论写出来的 hook
+永远匹配不上（本仓库 `rust/uperf-sfanalysis` 的 `HOOK_TARGET_SYM` 就是错的）。
 
 ---
 
@@ -17,161 +28,152 @@
 
 ```
 arch:           ARM aarch64, 64-bit
-baddr:          0x0
 binsz:          24,411
 text size:      0x3e94 = 16,020 B (.text, r-x)
 plt size:       0x2d0  =    720 B (.plt, r-x)
 rodata size:    0x148  =    328 B (.rodata, r--)
 data size:      0xa5   =    165 B (.data, rw-)
 bss size:       0x6a8  =  1,704 B (.bss, rw-)
-functions:      47（其中 41 个 PLT 导入 + 1 entry0 + 18 用户函数）
-imports:        41（PLT）
+functions:      47（41 PLT 导入 + entry0 + 18 用户函数）
 ```
 
-### 1.1 完整 PLT imports（41 个，**没有 xHook 痕迹**）
+### 1.1 PLT imports（41）
 
 ```
-__cxa_finalize  __cxa_atexit   gettid           clock_gettime
-sleep           pthread_create pthread_mutex_lock pthread_mutex_unlock
-pthread_mutex_init  snprintf  close             open
-lseek           read           sscanf           timer_create
-prctl           timer_settime  strlen           strcpy
-fopen           fclose         fgets            strcmp
-strstr          sched_setscheduler  regcomp      malloc
-strdup          free           sigemptyset      sigaction
-pthread_cond_signal  pthread_join  regfree     siglongjmp
-pthread_self    pthread_setname_np  pthread_cond_wait  regexec
-sigsetjmp       mprotect       __errno
+__cxa_finalize __cxa_atexit gettid clock_gettime sleep
+pthread_create pthread_mutex_lock pthread_mutex_unlock pthread_mutex_init
+snprintf close open lseek read sscanf timer_create prctl timer_settime
+strlen strcpy fopen fclose fgets strcmp strstr sched_setscheduler
+regcomp malloc strdup free sigemptyset sigaction pthread_cond_signal
+pthread_join regfree siglongjmp pthread_self pthread_setname_np
+pthread_cond_wait regexec sigsetjmp mprotect __errno
 ```
 
-**关键**：`mprotect`（`0x68f0`）、`regcomp`+`regexec`+`regfree`（libc regex，非 xHook
-的内部 regex）、`sched_setscheduler`（线程优先级）、`timer_create`+`timer_settime`
-（定时器）、`pthread_*`（线程）、`prctl`（线程名）。**没有 dlopen/dlsym**
-—— 自己注入自己即可，不需要再拉别的库。
+关键：`mprotect`（inline 改写需要）、`regcomp/regexec/regfree`（**libc regex**，
+就是那条 `.*`）、`sched_setscheduler`（hook 线程设 FIFO）、`timer_create`、
+`pthread_cond_wait`（**它自己链接了 pthread_cond_wait** → 它能 hook 同名的自己）。
+**没有 dlopen/dlsym** —— 目标符号靠 `/proc/self/maps` + ELF 解析自定位。
 
-### 1.2 .rodata 字符串（vendor 件未 strip，全部可读）
+### 1.2 .rodata 字符串（全部可读）
 
 ```
-/system/lib64/libandroidfw.so       ← 目标 .so（主）
-/system/lib64/libandroid.so          ← 目标 .so（备用，符号兜底）
-/system/bin/surfaceflinger           ← 进程 anchor（出现在 .so 里用于自检）
-xh_refresh_loop                      ← hook 函数名
-/proc/%d/comm
-/proc/self/maps
-/proc/%d/stat
-"%lx-%*lx %4s %lx %*x:%*x %*d%n"    ← /proc/self/maps 行的 sscanf 模板
-"%*d (%*[^)]%*[)] %c"               ← /proc/<pid>/stat 行的 PID-CMD 解析
-"DelayedWork"                        ← dfps 调度器命名（跨项目共享）
-".*"                                  ← regex（regcomp 编译）
-"r"                                  ← fopen mode
+/system/lib64/libandroidfw.so     ← hook 目标库集合（主）
+/system/lib64/libandroid.so       ← hook 目标库集合（备）
+/system/bin/surfaceflinger        ← 进程 anchor
+xh_refresh_loop                   ← xHook 线程名（**不是符号名**）
+/proc/%d/comm, /proc/self/maps, /proc/%d/stat
+"%lx-%*lx %4s %lx %*x:%*x %*d%n"  ← /proc/self/maps 行 sscanf 模板
+"%*d (%*[^)]%*[)] %c"             ← /proc/<pid>/stat PID-CMD 解析
+"DelayedWork"                     ← 延迟任务名（与 dfps 同源）
+".*"                              ← regcomp 编译的 regex
+"r"                               ← fopen mode
 ```
 
-### 1.3 修正 `m1-static-reverse.md §1.5`
+### 1.3 四条加密记录（`.data` @ vaddr 0x8d60，共 165 B 段的一部分）
 
-`docs/m1-static-reverse.md §1.5` 写的：
-> "libsfanalysis 通过 patchelf --add-needed 注入 surfaceflinger"
+```
+0x8d60  3272 379e 9724 827d 2033 a8d2 b5        count=1
+0x8d70  3172 379e 597b 165a 2f26 821e f8ce 4ffb db11 0ffd b5   count=2
+0x8d88  3072 379e a900 40f2 44e9 6513 b80a 7e1e 97ae 81a6 5d04 ac3e b16a 3461 b5  count=3
+0x8da8  3072 379e a900 40f2 44e9 6513 32c1 869a 6dbd c154 b278 33ed d11e 511c b5  count=3
+```
 
-**正确**：patchelf **目标**确实是 `/system/bin/surfaceflinger` 主程序（vendor
-sfanalysis 模块的 `common/post-fs-data.sh` 显式做这件事），但**被 hook 的函数**
-`xh_refresh_loop` 在 `libandroidfw.so`（surfaceflinger 运行时 dlopen 的库）里。
-**两件事不冲突**——DT_NEEDED 注入 surfaceflinger 主程序，sfanalysis 自己 dlopen
-后在 `/proc/self/maps` 里找 `libandroidfw.so` 的 .text 段，再 mprotect + inline
-patch。这与 m1-static-reverse.md §1.5 写的"解析 /proc/self/maps 定位目标库，再按
-名挂钩"语义一致；§1.5 的措辞没有明确区分**注入对象**（surfaceflinger）和
-**hook 对象**（libandroidfw.so 内的函数），本节予以澄清。
+布局：`[u32 count ^ 0x9e377233][count×8 字节密文][0x00]`（写时把末尾 `b5` 覆盖成 0）。
+cipher 常量：delta `0x61c88647`（= `-0x9e3779b9 mod 2^32`），
+key `[0xe9, 0x91d, 0x5b25, 0x38f75]`，状态初值 `0x28b7bd67` / `0xc6ef3720`（= `delta×32`），
+32 轮。完整解析器：`scripts/sfanalysis-deobf.py`（独立跑通）。
+
+### 1.4 解密结果（**M8 最关键的一条**）
+
+```
+ioctl
+epoll_wait
+pthread_cond_timedwait
+pthread_cond_wait
+```
+
+语义：`ioctl` = surfaceflinger 往显示驱动推帧（**正在渲染**）；
+`epoll_wait` / `pthread_cond_wait` / `pthread_cond_timedwait` =
+surfaceflinger 阻塞等待（**空闲**）。hint 就是从这些调用的时序推出来的。
+
+### 1.5 相关函数映射（r2 静态）
+
+| 函数 | 作用 |
+|---|---|
+| `entry0` (0x287c) | 只做 fini 注册 |
+| `fcn.000028d4` (0x29c4) | ctor：`pthread_mutex_lock` → `sigaction(SIGSEGV)` → `pthread_create(worker)` |
+| `fcn.0000318c` | worker：`pthread_setname_np(self,"xh_refresh_loop")` 后循环 `cond_wait` → 调 `fcn.00003298` |
+| `fcn.00003298` | 读 `/proc/self/maps`、按 `%lx-%*lx %4s …` 解析、用 `regexec` 匹配目标库 |
+| `fcn.00003ec4` (1948 B) | **djb2 哈希表查找**（`h = h*33 + c`）+ `strcmp` 命中 → 符号表查询 |
+| `fcn.00004d58` | 分配 hook 槽（0x18 字节表、上限 32）+ `sched_setscheduler(FIFO)` + `timer_create` |
+| `fcn.00005090` | **密文解密器**（`sleep(60)` 后跑，见 §1.3） |
+| `fcn.00005c88` | 引用 `fcn.00003ec4` 的调用方 |
 
 ---
 
-## 2. 注入机制（vendor 是怎么做的，已静态确认）
+## 2. 注入机制（静态确认）
 
 ```
-post-fs-data.sh（vendor sfanalysis 模块）:
-  $MODDIR/system/bin/patchelf --add-needed libsfanalysis.so /system/bin/surfaceflinger
-                                     --output $MODDIR/$SF
-  __set_perm $MODDIR/$SF 0 0 0755 "<原 SF secontext>"
+vendor sfanalysis 模块 common/post-fs-data.sh:
+  patchelf --add-needed libsfanalysis.so /system/bin/surfaceflinger --output $MODDIR/$SF
 
-effect:
-  surfaceflinger 主程序 ELF 的 DT_NEEDED 多了一项 libsfanalysis.so
-  surfaceflinger 进程启动时由 ld.so 自动 dlopen libsfanalysis.so
-  libsfanalysis.so 的 .init_array 跑一个 ctor（entry0 路线）：
-    entry0 → bti c → adrp x0, 0x79e0 → __cxa_finalize@plt
-    (entry0 只做 fini 注册，真正的 init 在 fcn.000028d4)
-  fcn.000028d4（ctor）→ pthread_mutex_lock → sigaction(SIGSEGV) →
-    regcomp(".*") → timer_create(CLOCK_MONOTONIC) →
-    pthread_create(worker_thread)
-  worker_thread 负责：读 /proc/self/maps、定位 libandroidfw.so、mprotect、
-    inline patch xh_refresh_loop、回到主线程
-  主线程仅在被 hook 的 xh_refresh_loop 触发时通过 trampoline 进入
-    fcn.00003ec4（hook handler），handler 跑 SfHint FSM、open+write hint file
+surfaceflinger ELF 的 DT_NEEDED 多一项 → 启动时 ld.so 自动 dlopen libsfanalysis.so
+  .init_array → fcn.000028d4（ctor）
+    → sigaction(SIGSEGV)、起 worker 线程
+  worker（"xh_refresh_loop"）：周期 sleep → 读 /proc/self/maps → 找目标库 →
+    mprotect 目标库 .text 为 RWX → 在目标库里给 4 个 libc 符号名装 hook
+  hook 触发时进入 handler → 推 SfHint 状态 → 写 <USER_PATH>/sfanalysis.hint 单字节
+  （解密器 fcn.00005090 延迟 60s 跑，解密 §1.4 的 4 个名字）
 ```
 
-**重要**：vendor 的 hook 流程是 **多线程协作**（主线程被 hook 调用、worker 线程做
-注入），不是单线程 inline patch。本仓库重写时可保留这一模式，但 §5/§6 描述的
-单线程 inline patch 路径也能完成同样的语义。
+**注意（真机实测，2026-10-09，alioth/A16）**：
+`surfaceflinger` 的 `/proc/<pid>/maps`（431 个 .so）与 DT_NEEDED **都不含
+`libandroidfw.so`**；该库只出现在 zygote / system_server / 各 App 进程里。
+所以 §1.2 的 `libandroidfw.so` 目标库集合在 A16 的 SF 里匹配不到 ——
+**vendor 件在这台设备上也会静默失效**（不是本重写引入的回归）。
+这与 §1.4 的 libc 目标并不矛盾：libc 在每个进程都有，但 maps 扫描的库选择
+若只认 libandroidfw，那在 A16-SF 上就没有可 hook 的挂点。
 
 ---
 
-## 3. hook handler 入口（`fcn.00003ec4`，1948 字节，最大函数）
-
-[待 M8 验收]：未深度反汇编。**初步推断**（基于字符串引用 + 函数大小）：
-- SfHint 6 值 FSM（idle/switch/trigger/gesture/touch/junk）
-- open(O_WRONLY|O_CREAT|O_TRUNC) `<hint_file>` → write(byte) → close
-- 或者 open(O_WRONLY) → lseek(0) → write(byte) → close（更省 inode）
-- prctl(PR_SET_NAME, "SfHintHook") 或 pthread_setname_np 设置线程名
-- 状态持续时间记录（`hintDuration` schema）
-
-**SfHint 6 值枚举**（与 `m1-static-reverse.md §1.3` 完全一致，本仓库
-`rust/uperf-core/src/hint.rs::SfHint::from_byte` 已实现）：
+## 3. SfHint 6 值枚举（与消费端一致）
 
 ```rust
-0 = SfHint::Idle     (8 chars, "idle")
-1 = SfHint::Switch   (6 chars, "switch")
-2 = SfHint::Trigger  (7 chars, "trigger")
-3 = SfHint::Gesture  (7 chars, "gesture")
-4 = SfHint::Touch    (5 chars, "touch")
-5 = SfHint::Junk     (4 chars, "junk")
-6+ = SfHint::Unknown (14 chars, "unknown")
+0 = Idle("idle")   1 = Switch("switch")  2 = Trigger("trigger")
+3 = Gesture("gesture")  4 = Touch("touch")  5 = Junk("junk")  6+ = Unknown("unknown")
 ```
 
----
-
-## 4. SfHint FSM 6 值与 §7.4 兼容性
-
-`docs/spec/sfanalysis.md §2.3` 已锁定 byte 协议与消费端 `SfAnalysisListener` 接口
-（`rust/uperf-core/src/watch_task.rs`）字节兼容。**byte 序列一致性验证** 留给真机
-byte 对账（M8 验收），r2 静态不覆盖。
+本仓库 `rust/uperf-core/src/hint.rs::SfHint::from_byte` 已实现（M3 落地）。
 
 ---
 
-## 5. 重写实现约束（来自 vendor 静态事实）
+## 4. 对重写的约束（**已按本节结论更新**）
 
 | 约束 | 来源 |
 |---|---|
-| 必须 hook `xh_refresh_loop` | vendor `.rodata` 字符串 |
-| 必须在 `libandroidfw.so` 的 .text 段做 inline patch | vendor `fopen("/proc/self/maps")` + `sscanf` 解析 |
-| 必须 `mprotect` 改 RWX | vendor PLT imports |
-| 必须用 libc `regcomp/regexec`（非 xHook 内部 regex） | vendor PLT imports |
-| 必须写 `<USER_PATH>/sfanalysis.hint` 单字节 | vendor 行为（与 §7.4 一致） |
-| patchelf 注入 surfaceflinger 主程序 | vendor `post-fs-data.sh` |
+| hook 目标 = `ioctl` / `epoll_wait` / `pthread_cond_timedwait` / `pthread_cond_wait` | §1.4 解密结果 |
+| 从调用时序推 SfHint（ioctl=渲染，等待=空闲） | §1.4 语义 |
+| 需要 `mprotect` 改目标库 .text | vendor imports |
+| 目标库选择走 `/proc/self/maps` + regex（集合含 libandroidfw/libandroid） | §1.2 / §1.5 |
+| 写 `<USER_PATH>/sfanalysis.hint` 单字节 | §7.4 |
 
 ---
 
-## 6. 未做（明确标记）
+## 5. 未做 / 不确定（诚实标记）
 
-| 项 | 状态 | 谁负责 |
-|---|---|---|
-| 真机 byte 序列与 vendor 件对账 | [待 M8 验收] | 用户 |
-| Frida trace xh_refresh_loop 调用频率 | 不做（AGENT.md §12.1 明确不做 Frida） | — |
-| hook handler 函数级反汇编（fcn.00003ec4 1948 B 全展开） | 做了第 1 层（入口 + string ref），未做完整流程 | r2 静态已够 |
-| 内联汇编 trampoline 字节序列精确推导 | [M8 Rust 实现时按需做] | 本仓库 |
-| 6 值 FSM 触发条件逐条推理 | [M8 真机采集] | 用户 |
+| 项 | 状态 |
+|---|---|
+| 4 个 hook 的**装法**（inline patch vs GOT/PLT）细节 | [I]：走 mprotect + 改写，具体指令序列未逐条反推 |
+| hint 从 ioctl/等待时序到 0..5 的**确切判定式** | [U]：`fcn.00003ec4` 之后的 handler 未完整反推 |
+| `fcn.00003298` maps 匹配里 regex 的确切模式 | [I]：`.rodata` 只有 `.*`，可能在运行时另建 |
+| 真机 byte 对账 | [U] 留给 M8 验收 |
+| 内联汇编 trampoline 字节 | [U] 实现时按需 |
 
 ---
 
-## 7. 引用
+## 6. 引用
 
-- `docs/spec/sfanalysis.md`：M8 边界 spec（接口契约 / 实现约束 / 验收脚本）
-- `docs/m1-static-reverse.md §1.5`：M1 时的逆向笔记（已部分被本节修正）
-- `rust/uperf-core/src/hint.rs`：消费端 SfHint 6 值 FSM（已 M3 落地）
-- `rust/uperf-core/src/watch_task.rs`：SfAnalysisListener（已 M6b 落地）
-- `magisk/script/libuperf.sh`：hint 文件 `<USER_PATH>/sfanalysis.hint` 路径定义
+- `scripts/sfanalysis-deobf.py`：§1.3/§1.4 的解密器（可复现）
+- `docs/spec/sfanalysis.md`：M8 边界 spec
+- `docs/m1-static-reverse.md §1.5`：M1 逆向笔记（**本节推翻其 hook 目标结论**）
+- `rust/uperf-core/src/hint.rs`、`rust/uperf-core/src/watch_task.rs`：消费端（已落地）
