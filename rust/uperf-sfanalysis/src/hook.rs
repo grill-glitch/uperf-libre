@@ -252,6 +252,26 @@ mod arch {
     const MAP_PRIVATE: i32 = 0x02;
     const MAP_ANONYMOUS: i32 = 0x20;
 
+    /// Guards the one-shot mmap-shape probe so the log stays readable.
+    static PROBED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    /// Try one anonymous mapping shape; report whether it succeeded.
+    unsafe fn probe(len: usize, prot: i32) -> (bool, i32) {
+        let p = mmap(
+            core::ptr::null_mut(),
+            len,
+            prot,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if p as isize == -1 {
+            (false, errno())
+        } else {
+            (true, 0)
+        }
+    }
+
     /// Install one hook. The trampoline is built before the entry is patched,
     /// so a failure leaves the target untouched.
     pub fn install(name: &str) -> Result<Hook, HookError> {
@@ -271,6 +291,20 @@ mod arch {
         }
 
         let ps = page_size();
+        // One-shot diagnostic: which mmap shape does this domain refuse?
+        // (surfaceflinger returns EACCES for the RWX anonymous map even with the
+        // execmem rule in place and no AVC logged, so the cause is elsewhere.)
+        if !PROBED.swap(true, Ordering::SeqCst) {
+            unsafe {
+                let (r, e1) = probe(ps, PROT_READ | PROT_WRITE);
+                let (x, e2) = probe(ps, PROT_READ | PROT_EXEC);
+                let (rx, e3) = probe(ps, PROT_READ | PROT_WRITE | PROT_EXEC);
+                crate::dbg_log(&format!(
+                    "mmap probe: RW ok={} err={} | RX ok={} err={} | RWX ok={} err={}",
+                    r, e1, x, e2, rx, e3
+                ));
+            }
+        }
         let tramp = unsafe {
             mmap(
                 core::ptr::null_mut(),

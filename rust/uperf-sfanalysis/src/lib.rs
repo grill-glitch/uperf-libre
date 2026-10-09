@@ -55,6 +55,31 @@ fn env_secs(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// Debug sink. Appends to `<dir>/sfh.log` only when `UPERF_SFANALYSIS_DEBUG` is
+/// set or `<dir>/sfh.debug` exists — the vendor is completely silent, so this
+/// stays off by default and is a documented diagnostic deviation.
+///
+/// A file sink is required because surfaceflinger's stderr goes nowhere: init
+/// does not forward it to logcat, so `eprintln!` is invisible in SF.
+pub(crate) fn dbg_log(msg: &str) {
+    use std::io::Write;
+    let dir = std::env::var("UPERF_SFANALYSIS_LOG_DIR")
+        .unwrap_or_else(|_| String::from("/data/misc/surfaceflinger"));
+    let marker = format!("{}/sfh.debug", dir);
+    let enabled = std::env::var("UPERF_SFANALYSIS_DEBUG").is_ok()
+        || std::path::Path::new(&marker).exists();
+    if !enabled {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("{}/sfh.log", dir))
+    {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
 /// Install all four hooks. Idempotent-ish: a second call re-patches, which is
 /// what the vendor's refresh loop does.
 fn install_all() -> usize {
@@ -63,6 +88,10 @@ fn install_all() -> usize {
         match hook::install(name) {
             Ok(h) => {
                 ok += 1;
+                dbg_log(&format!(
+                    "hooked {} entry={:#x} tramp={:#x}",
+                    h.name, h.entry, h.tramp
+                ));
                 eprintln!(
                     "uperf-sfanalysis: hooked {} (entry {:#x}, tramp {:#x})",
                     h.name, h.entry, h.tramp
@@ -70,6 +99,7 @@ fn install_all() -> usize {
             }
             Err(e) => {
                 // A slot we cannot patch must never abort the host process.
+                dbg_log(&format!("NOT hooked {}: {}", name, e));
                 eprintln!("uperf-sfanalysis: {} not hooked: {}", name, e);
             }
         }
@@ -113,7 +143,12 @@ extern "C" fn sfh_ctor() {
         return;
     }
     set_realtime();
-    let delay = env_secs("UPERF_SFANALYSIS_DELAY_SECS", 60);
+    // Debug mode (env var or the marker file) installs immediately, so a device
+    // round does not have to sit through the vendor's 60 s delay.
+    let debug = std::env::var("UPERF_SFANALYSIS_DEBUG").is_ok()
+        || std::path::Path::new("/data/misc/surfaceflinger/sfh.debug").exists();
+    let default_delay = if debug { 0 } else { 60 };
+    let delay = env_secs("UPERF_SFANALYSIS_DELAY_SECS", default_delay);
     let interval = env_secs("UPERF_SFANALYSIS_INTERVAL_SECS", 60);
     let _ = std::thread::Builder::new()
         .name("xh_refresh_loop".into())

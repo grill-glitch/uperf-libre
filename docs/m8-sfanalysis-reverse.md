@@ -306,9 +306,40 @@ SF 里出现 fd 114 -> /system/bin/surfaceflinger
 `service.sh`/`system.prop`/`patchelf`/`libsfanalysis.so`），所以它自己也没解决
 `execmem`；这个特性在 enforcing 的新 Android 上本来就是死的。
 
-**可选 opt-in**（未实现，属主动增强而非复刻）：模块带一条
-`allow surfaceflinger self:process execmem`（Magisk/KernelSU 的 `sepolicy.rule`），
-本仓库的库就能真的把 hook 装上。
+**第二轮（同一天，继续深挖）**——结论是**库本身正确，唯一拦路者是 SELinux**：
+
+用探针把三种 mmap 形态分开测（`sfh.log`）:
+
+```
+surfaceflinger 进程内,enforcing:
+  mmap probe: RW ok=true err=0 | RX ok=false err=13 | RWX ok=false err=13
+  NOT hooked ioctl: mmap errno=13   ×4
+临时 setenforce 0:
+  mmap probe: RW ok=true err=0 | RX ok=true err=0 | RWX ok=true err=0
+  hooked ioctl / pthread_cond_timedwait / pthread_cond_wait / epoll_wait   ← 4/4 装上
+  SF pid 不变,存活;libc 的 r-xp 段被切开(rwxp 页出现)
+```
+
+即 **`PROT_EXEC` 的匿名映射**被拒（RW 正常），且 `avc_spoof` 关掉后也**没有
+avc 记录**（说明该拒绝是 `dontaudit` 或审计去重）。permissive 下 4 个 hook 全部
+装上、SF 不死 → **`libsfanalysis_rs.so` 在 SF 里是可用的**。
+
+**策略规则没能生效**：
+
+* 模块目录放了 `sepolicy.rule`（KernelSU-Next 的字符串里确实有
+  `Failed to load sepolicy.rule for`，且 `rezygisk`/`zygisk_vector` 两个模块都在用）
+  → 开机后仍 EACCES。
+* `ksud sepolicy patch "allow surfaceflinger surfaceflinger process execmem"` 与
+  `ksud sepolicy apply <file>` 都 rc=0（`check` 也认这条语法）→ 仍 EACCES。
+* 期间设备发生**两次内核 panic**（`console-ramoops-0`: `Kernel panic -
+  not syncing: Fatal exception` / `Going down for restart now`），与本轮的
+  `ksud sepolicy patch` 尝试时间相关（本机装有 KernelPatch/KPatch-Next，panic
+  handler 由 KP 接管，call trace 为空）。
+* **据此停止**在用户日常机上继续调策略，不再尝试 `ksud sepolicy patch`。
+
+**交付状态**：模块带上 `magisk/sepolicy.rule`（作为产品侧修复，语法经
+`ksud sepolicy check` 验证），但**其是否在 KernelSU-Next 上真正落地未验证**；
+需要在可牺牲的设备上单独确认，或从 KernelSU-Next 侧排查。
 
 ---
 

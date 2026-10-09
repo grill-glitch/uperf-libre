@@ -255,8 +255,15 @@ surfaceflinger，纯内存、无磁盘改动：
 不存在；本仓库卡在 `execmem` 策略）。vendor 模块没发布任何 `sepolicy.rule`，
 它自己也没解决这个问题 —— 该特性在 enforcing 的新 Android 上本来就是死的。
 
-**可选 opt-in**（未实现，属主动增强而非复刻）：模块加一条
-`allow surfaceflinger self:process execmem`，本仓库的库即可真正安装 hook。
+**第二轮（见 `docs/m8-sfanalysis-reverse.md §8` 末段）**：探针证明 **只有带
+`PROT_EXEC` 的匿名 mmap 被拒**（RW 正常）；临时 `setenforce 0` 时 **4 个 hook
+全部装上、SF 存活** → 库本身可用，唯一拦路者是 SELinux。模块 `sepolicy.rule`
+（正确语法 `allow surfaceflinger surfaceflinger process execmem`）与
+`ksud sepolicy patch/apply` 都 rc=0 却**没能放行**。期间设备两次**内核 panic**，
+与 `ksud sepolicy patch` 尝试时间相关 → **停止在用户机上调策略**。
+
+**交付**：`magisk/sepolicy.rule` 随模块发布（产品侧修复，语法经
+`ksud sepolicy check` 验证），落地效果**未验证**，需在可牺牲设备上单独确认。
 
 **回滚**：注入是纯内存的，SF 重启即恢复。注意 `setprop ctl.restart surfaceflinger`
 在本 ROM 上会经 `onrestart restart zygote` 级联成**整机重启**（实测 uptime 归零），

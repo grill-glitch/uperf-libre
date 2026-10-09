@@ -1,0 +1,22 @@
+# SELinux rules for the SfAnalysis injection module (M8).
+#
+# KernelSU-Next loads `<module>/sepolicy.rule` at boot (same mechanism the
+# rezygisk / zygisk_vector modules use).
+#
+# Why these two:
+#
+#   execmem  — libsfanalysis_rs.so builds its inline-hook trampolines on an
+#              anonymous mmap(PROT_READ|PROT_WRITE|PROT_EXEC) page. Without this
+#              rule the mmap fails EACCES and no hook is ever installed
+#              (device-verified: `NOT hooked ioctl: mmap errno=13` x4, and
+#              `avc denied { execmem } ... tclass=process` on an unpatched boot).
+#
+#   execmod  — installing a hook also mprotects the target's file-backed code
+#              page (libc.so, context system_lib_file) to RWX to write the
+#              16-byte jump. That is the `execmod` check.
+#
+# The vendor's own sfanalysis / ssanalysis modules ship no sepolicy.rule at all,
+# so upstream never solved this; the feature is simply dead on enforcing builds.
+
+allow surfaceflinger surfaceflinger process execmem
+allow surfaceflinger system_lib_file file execmod
