@@ -584,6 +584,16 @@ libandroidfw 的 **ELF 头段**（maps 首条 r--p）而非 `.text`——真机 
 **另一条真机事实**：A16 的 `surfaceflinger` 根本不加载 `libandroidfw.so`
 （431 个 .so + DT_NEEDED 双证），故 vendor 件在这台设备上同样静默失效。
 
+**M8 前提被推翻（2026-10-09，三证见 `docs/m8-sfanalysis-reverse.md` §6）**：
+`sfanalysis.hint` **没有生产者**。两份 vendor 库（`libsfanalysis.so` /
+`libssanalysis.so`）的未定义符号里**没有 `write` / `syscall` / `mmap` / `pipe`**，
+即没有写文件或建 IPC 的能力；`strace -f` 全量追踪（harness 1733 行 + 运行中 daemon
+29129 行）确认零文件写入，daemon 只是在轮询一个永不存在的文件
+（`openat(hint, O_RDONLY) = ENOENT`）。所以"重写 hint 生产者"**没有可对齐的对象**。
+处置路线（删 blob / 移植进程内行为 / 新增 opt-in 生产者）见
+`docs/spec/sfanalysis.md §8`，**待定**。当前 `rust/uperf-sfanalysis` 在选定方向前
+不接入发布流程。
+
 ### 12.2 其它未知
 | 项 | 状态 | 处理 |
 |---|---|---|
@@ -596,7 +606,7 @@ libandroidfw 的 **ELF 头段**（maps 首条 r--p）而非 `.text`——真机 
 | **无 CAP_SYS_NICE 时不能把调度类"升"回去**（NORMAL→IDLE 可以，IDLE→NORMAL EPERM） | **已解**（内核真实规则，非沙箱怪癖）；host 单测按此写成"接受两种结果" | `docs/m6-sched-evidence.md` §6 |
 | `/proc/<tid>/stat` 字段 18 是 `priority`(=20+nice)，**nice 是字段 19** | **已解**：曾读 index 15 得到 25（nice=5 时） | `docs/m6-sched-evidence.md` §6 |
 | **`atrace` 的 marker 载荷** | **已解**：payload 由 vendored `cpp/dfps/source/utils/atrace.c` 定义（`B\|<pid>\|<tag>`/`E\|<pid>`/`C\|<pid>\|<tag>\|<n>`），开关就是 `AtraceToggle()`；**marker 字面量本就不该出现在二进制里**（由埋点处的 `ATRACE_*` 宏构造，埋点在 `inotify.cpp:59`/`topapp_monitor.cpp:50`）。设备实测 34 条真实 marker | `docs/m6d-evidence.md` §1 |
-| **`sfanalysis.hint` 的生产端路径** | **M8 已解**：`docs/m1-static-reverse.md §1.5` 已确认 vendor libsfanalysis 不带路径串，路径通过 `(MODULE_PATH + "/config/")` + 常量 `sfanalysis.hint` 拼接得到（与 dfps DelayedWork 命名约定同）；M8 重写时按 §7.4 协议明示 | `docs/m8-sfanalysis-reverse.md` §2 |
+| **`sfanalysis.hint` 的生产端** | **已解（真机证伪"有生产者"）**：vendor `libsfanalysis.so` / `libssanalysis.so` 的未定义符号里**无 `write`/`syscall`/`mmap`/`pipe`**（不能写文件/建通道）；harness `strace -f`（1733 行）写标志 open = 0；运行中 daemon 的 `strace`（29129 行）只见到 `openat(hint, O_RDONLY) = ENOENT` 轮询。**该文件没有生产者**——上游此特性未完成/已废弃 | `docs/m8-sfanalysis-reverse.md` §6 |
 | **`modules.input.*` 未接入** | **已知 parity 缺口**：`swipeThd/gestureThdX/gestureThdY/gestureDelayTime/holdEnterTime` 仍是 vendored `input_listener.cpp` 的硬编码默认值（`0.01/0.03/0.03/2.0/1.0`），而二进制里这 5 个键**确实存在**（上游会读）。sdm888 的值恰好等于默认值，所以本机看不出来，其他配置会有差异 | 因阈值是 private 且无 setter，改它必须动 `cpp/dfps/**`（违反 M0 的"零改动"不变量）。M7 二选一：(a) 加 setter 并在 `DFPS_VENDOR.md` 记录该 diff；(b) 在 `cpp/uperf/` 侧重写 InputListener |
 | **`auto` 的语义** | [I]：`cur_powermode.txt` 的合法值之一但非预设名；二进制有 `Internal perapp switcher {}`/`Internal perapp switcher cannot be enabled`，故读作"交给 perapp 规则" | `docs/m6b-evidence.md` §1 |
 | **`UPERF_FAKE_ROOT` 只覆盖 sysfs 写入** | **已知**：`sched_setaffinity`/`sched_setscheduler` 是 syscall，无路径可重定向。真机调度测试必须同时设 `UPERF_SCHED_DRY_RUN=1` | `docs/m6b-evidence.md` §7 |

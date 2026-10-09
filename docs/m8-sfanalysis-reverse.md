@@ -171,7 +171,36 @@ surfaceflinger ELF 的 DT_NEEDED 多一项 → 启动时 ld.so 自动 dlopen lib
 
 ---
 
-## 6. 引用
+## 6. 生产端不存在（真机证据，2026-10-09）
+
+`AGENT.md §7.4` / §12.2 假设 `sfanalysis.hint` 由 vendor `libsfanalysis.so` 写入。
+**真机证据表明没有生产者。** 三证独立：
+
+1. **符号表**：`libsfanalysis.so` 的全部 43 个未定义符号里**没有**
+   `write` / `pwrite` / `syscall` / `mmap` / `pipe` / `eventfd` / `sendto`
+   —— 它没有任何写文件或建 IPC 通道的能力（只有 `open/lseek/read/fopen/fgets`，全读）。
+   `libssanalysis.so` 同理。
+2. **strace 全量追踪**：NDK harness 同时 `dlopen(libandroidfw.so)` +
+   `dlopen(libsfanalysis_vendor.so)`，等过它的 `sleep(60)` 解密延迟，再调用四个被 hook
+   的函数，`strace -f` 抓 **1733 行** syscall：写标志 open = **0**，`write` = 只有
+   harness 自己的 stdout/stderr。worker 线程（独立 pid）确实跑了：`nanosleep(60)` →
+   反复读 `/proc/self/maps` → 16 组 `mprotect(RW)`/`mprotect(R)` 补代码，
+   全程无任何文件写入。
+3. **strace 运行中的 daemon**：`pidof uperf` 两个进程全 trace 15 s（29129 行），
+   唯一命中 hint 的行为是 worker **反复**
+   `openat("/sdcard/Android/yc/uperf/sfanalysis.hint", O_RDONLY|O_CLOEXEC) = -1 ENOENT`
+   —— 消费端在轮询一个**永远不存在**的文件；窗口内写标志 open = 0。
+
+**结论**：`libsfanalysis.so` 是一个**纯进程内代码补丁库**（hook 4 个 libc 函数、
+补 16 个 hook 点），不产出 hint 文件；daemon 的 `SfAnalysisListener` 在读一个
+没有生产者的文件。**"重写 hint 生产者" 这个前提不成立**——上游这个特性是
+未完成/已废弃的（配置键与监听器都在，生产者缺失）。
+
+对 M8 的处置见 `docs/spec/sfanalysis.md §8` 与 `AGENT.md §12.1` 的更新。
+
+---
+
+## 7. 引用
 
 - `scripts/sfanalysis-deobf.py`：§1.3/§1.4 的解密器（可复现）
 - `docs/spec/sfanalysis.md`：M8 边界 spec
