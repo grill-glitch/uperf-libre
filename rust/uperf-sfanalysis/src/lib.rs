@@ -30,6 +30,7 @@
 
 #![allow(non_snake_case, non_camel_case_types)]
 
+pub mod got;
 pub mod hook;
 pub mod observe;
 
@@ -61,16 +62,23 @@ fn env_secs(name: &str, default: u64) -> u64 {
 ///
 /// A file sink is required because surfaceflinger's stderr goes nowhere: init
 /// does not forward it to logcat, so `eprintln!` is invisible in SF.
-pub(crate) fn dbg_log(msg: &str) {
-    use std::io::Write;
+/// Is the diagnostic sink on? (env var, or the marker file next to the log)
+pub(crate) fn debug_enabled() -> bool {
+    if std::env::var("UPERF_SFANALYSIS_DEBUG").is_ok() {
+        return true;
+    }
     let dir = std::env::var("UPERF_SFANALYSIS_LOG_DIR")
         .unwrap_or_else(|_| String::from("/data/misc/surfaceflinger"));
-    let marker = format!("{}/sfh.debug", dir);
-    let enabled = std::env::var("UPERF_SFANALYSIS_DEBUG").is_ok()
-        || std::path::Path::new(&marker).exists();
-    if !enabled {
+    std::path::Path::new(&format!("{}/sfh.debug", dir)).exists()
+}
+
+pub(crate) fn dbg_log(msg: &str) {
+    use std::io::Write;
+    if !debug_enabled() {
         return;
     }
+    let dir = std::env::var("UPERF_SFANALYSIS_LOG_DIR")
+        .unwrap_or_else(|_| String::from("/data/misc/surfaceflinger"));
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -89,12 +97,12 @@ fn install_all() -> usize {
             Ok(h) => {
                 ok += 1;
                 dbg_log(&format!(
-                    "hooked {} entry={:#x} tramp={:#x}",
-                    h.name, h.entry, h.tramp
+                    "hooked {} slots={} orig={:#x}",
+                    h.name, h.slots, h.orig
                 ));
                 eprintln!(
-                    "uperf-sfanalysis: hooked {} (entry {:#x}, tramp {:#x})",
-                    h.name, h.entry, h.tramp
+                    "uperf-sfanalysis: hooked {} ({} GOT slots, orig {:#x})",
+                    h.name, h.slots, h.orig
                 );
             }
             Err(e) => {
@@ -110,6 +118,23 @@ fn install_all() -> usize {
     ok
 }
 
+/// One-line snapshot of the observer counters, for the debug sink.
+fn stats_line() -> String {
+    use std::sync::atomic::Ordering as O;
+    format!(
+        "stats ioctl={} epoll={} cw={} ctw={} txns={} writes={} state={} idle_ms={} installed={}",
+        observe::SFH_CALLS[0].load(O::Relaxed),
+        observe::SFH_CALLS[1].load(O::Relaxed),
+        observe::SFH_CALLS[2].load(O::Relaxed),
+        observe::SFH_CALLS[3].load(O::Relaxed),
+        observe::SFH_BINDER_TXNS.load(O::Relaxed),
+        observe::SFH_BINDER_WRITES.load(O::Relaxed),
+        observe::SFH_STATE.load(O::Relaxed),
+        observe::SFH_IDLE_MS.load(O::Relaxed),
+        observe::SFH_INSTALLED.load(O::Relaxed),
+    )
+}
+
 /// Run the worker: delay, install, then re-apply on a period. Named
 /// `xh_refresh_loop` to match the vendor's thread name.
 fn worker(delay: u64, interval: u64) {
@@ -117,6 +142,17 @@ fn worker(delay: u64, interval: u64) {
     let n = install_all();
     if n == 0 {
         return;
+    }
+    dbg_log(&format!("install done: {}", stats_line()));
+    if debug_enabled() {
+        // Periodic evidence that the hooks are actually being *called* — the
+        // install log alone only proves the GOT slots were rewritten.
+        let _ = std::thread::Builder::new()
+            .name("sfh_stats_loop".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                dbg_log(&stats_line());
+            });
     }
     loop {
         std::thread::sleep(std::time::Duration::from_secs(interval));

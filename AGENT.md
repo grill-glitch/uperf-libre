@@ -21,10 +21,18 @@
 - 不追求与闭源二进制逐指令等价；追求**配置语义等价 + 运行时行为等价**（用 §10 的 parity 工具证明）。
 
 **0 闭源 blob 不变量（M8 起新增）**：
-uperf 模块发布的二进制树里**不得包含任何闭源 `.so`**。SfAnalysis 的 SF 注入库
-`libsfanalysis.so`（26 KB / 47 函数 / 静态链 xHook，目标函数 `xh_refresh_loop`）必须由
-本仓库自研重写；vendor 的 `magisk/bin/libsfanalysis.so` 自 M8 起从发布产物中**移除**。
-重写边界、注入机制、兼容性缺口见 §12.1 / `docs/spec/sfanalysis.md` / `docs/m8-sfanalysis-reverse.md`。
+**0 闭源 blob 不变量（M8 起新增）**：uperf 模块发布的二进制树里**不得包含任何闭源 `.so`**。SfAnalysis 的 SF 注入库
+`libsfanalysis.so`（26 KB / 47 函数 / 静态链 xHook）必须由本仓库自研重写；vendor 的
+`magisk/bin/libsfanalysis.so` 自 M8 起从发布产物中**移除**。
+
+重写件 `rust/uperf-sfanalysis/`（产物 `libsfanalysis_rs.so`）已在真机（alioth /
+crDroid A16 / KernelSU Next / **SELinux enforcing**）验证：4/4 hook 在
+`surfaceflinger` 内装上并持续观测真实活动（`ioctl=167 / epoll=50 / binder 事务 132`，
+SF pid 不变）。机制是 **GOT/PLT 改写**，与 vendor 静态链的 xHook 默认机制一致，**不需要
+任何 exec 权限**（既无 `execmem` 也无 `execmod`）。注意：`xh_refresh_loop` 是 xHook 的
+线程名，**不是**被 hook 的函数——真目标是 4 个 libc 函数（`ioctl` / `epoll_wait` /
+`pthread_cond_wait` / `pthread_cond_timedwait`）。重写边界、注入机制、兼容性缺口见
+§12.1 / `docs/spec/sfanalysis.md` / `docs/m8-sfanalysis-reverse.md`（§10 为真机结论）。
 
 **成功判据（全部要有真机证据）**：
 1. `magisk/bin/uperf` 被自研二进制替换后，模块在 alioth（crDroid A16 / KernelSU Next）与 polaris（LineageOS 22.2）上开机自启成功，`/sdcard/Android/yc/uperf/uperf_log.txt` 无 `[E]`，`killall uperf` 能正常停止。**M8 起新增**：发布产物中**不存在任何闭源 `.so`**——`magisk/bin/` 下 vendor 的 `libsfanalysis.so` 已被 `libsfanalysis_rs.so` 替换，`build.sh make check` 脚本化断言。
@@ -530,16 +538,24 @@ M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（conf
 
 **目标（M8 重写计划）**：在 uperf 模块发布的二进制树中**移除所有闭源 `.so`**。
 SfAnalysis 的 SF 注入库 `libsfanalysis.so`（26 KB / 47 函数、纯 C、静态链 xHook）
-由本仓库**自研 Rust 重写**，新库名 `libsfanalysis_rs.so`，**接口契约不变**：
-写入路径与字节协议（`<config dir>/sfanalysis.hint` 单字节 0..5）必须字节兼容。
+由本仓库**自研 Rust 重写**，新库名 `libsfanalysis_rs.so`。**注意**：vendor 件其实
+**不写** `sfanalysis.hint`（见下），所以"接口契约"实际上是"在 SF 进程内装上 4 个 hook
+并保持宿主存活"，重写件按同一语义实现。
 
-**现状（M0..M7 vendor 件过渡，m1-static-reverse.md §1.5 已静态逆向）**：
+**逆向现状（m1-static-reverse.md §1.5 的结论已被 `docs/m8-sfanalysis-reverse.md` 推翻）**：
 - `libsfanalysis.so` 通过 `patchelf --add-needed` 注入 surfaceflinger；
-  解析 `/proc/self/maps` 定位 `libandroidfw.so`，再按名挂钩。
-- 唯一被 hook 的函数是 `xh_refresh_loop`（在 `libandroidfw.so` 内，
-  SurfaceFlinger 渲染链路上）。
-- 注入机制：`mprotect` 把 `libandroidfw.so` 的 `.text` 改成 RWX，写跳转。
-  调用时 libsfanalysis 写入 `sfanalysis.hint` 单字节 state（0/1/2/3，静态已知）。
+  解析 `/proc/self/maps` 定位 `/system/lib64/libandroidfw.so`，再按名挂钩。
+- **被 hook 的是 4 个 libc 函数**：`ioctl` / `epoll_wait` / `pthread_cond_wait` /
+  `pthread_cond_timedwait`（函数名字符串 TEA 加密在 `.data` 里，解密器见
+  `scripts/sfanalysis-deobf.py`）。`xh_refresh_loop` 是 **xHook 自己的线程名**，
+  不是 hook 目标——m1 §1.5 把它当成目标函数是错的。
+- 机制是 **xHook 的 GOT/PLT 改写**（不是 inline patch）：改写调用方 GOT 槽，
+  只需对数据页 `mprotect(RW)`。
+- **它不写 `sfanalysis.hint`**：43 个未定义符号里没有 `write`/`pwrite`/`syscall`/
+  `mmap`，真机 strace 也未见文件写。也就是说 **hint 在生产端根本不存在**
+  （详见 `docs/m8-sfanalysis-reverse.md` §6）。重写件同样不写——这是复刻，不是缺功能。
+- 本机（crDroid A16）的 SF **不加载 libandroidfw.so**，所以 vendor 件在 enforcing 下
+  既不崩也不 hook——这是它自己的目标选择问题，与权限无关。
 - 静态产物（vendor 二进制里保留全部字符串）：
   `/system/lib64/libandroidfw.so`（目标 .so）、
   `/system/lib64/libandroid.so`（备用）、

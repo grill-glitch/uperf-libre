@@ -337,9 +337,83 @@ avc 记录**（说明该拒绝是 `dontaudit` 或审计去重）。permissive �
   handler 由 KP 接管，call trace 为空）。
 * **据此停止**在用户日常机上继续调策略，不再尝试 `ksud sepolicy patch`。
 
-**交付状态**：模块带上 `magisk/sepolicy.rule`（作为产品侧修复，语法经
-`ksud sepolicy check` 验证），但**其是否在 KernelSU-Next 上真正落地未验证**；
-需要在可牺牲的设备上单独确认，或从 KernelSU-Next 侧排查。
+**当时的交付状态（已被 §10 取代）**：模块带上 `magisk/sepolicy.rule`，但其是否在
+KernelSU-Next 上真正落地未验证。
+
+---
+
+## 10. 解决：GOT/PLT 改写（2026-10-09 后续，真机验证通过）
+
+§8 停在"SELinux 挡住 execmem"上。后续三条实验把结论彻底改了。
+
+### 10.1 三条权限探测（在 SF 内、enforcing 下）
+
+```
+mmap(PROT_READ|PROT_WRITE,  匿名)        -> ok
+mmap(PROT_READ|PROT_EXEC,   匿名)        -> EACCES (13)
+mmap(PROT_READ|PROT_WRITE|PROT_EXEC, 匿名)-> EACCES (13)
+mprotect(file-backed 代码页, RWX)        -> EACCES (13)      ← execmod
+mprotect(RELRO 数据页, RW)               -> ok              ← 关键
+```
+
+**代码页写不了，数据页能写。**
+
+### 10.2 KernelSU-Next 侧没有可用通道（实测）
+
+* `ksud sepolicy patch "..."` 语法被接受（rc=0，`check` 也认），**但策略不生效**。
+  用受控拒绝实验确认：`/data/local/tmp/denytest`（context
+  `u:object_r:keystore_data_file:s0`）对 `shell` 读被拒 → patch
+  `allow shell keystore_data_file file read` → 仍被拒。
+* 更关键的对照：把同一条规则写进 **`/data/adb/modules/zygisk_vector/sepolicy.rule`**
+  （一个确实在用的 Zygisk 模块）并**重启**，读仍然被拒；写进 `uperf` 模块自己的
+  `sepolicy.rule` 同样无效。
+  → **这台设备上 KernelSU-Next 不加载任何模块的 `sepolicy.rule`**，与是否 Zygisk
+  模块无关。既有模块带这个文件不等于它被消费。
+
+### 10.3 于是改用 GOT/PLT 改写 —— 也正是 vendor 的真实做法
+
+vendor 库**静态链的是 xHook**，而 xHook 的默认机制就是 GOT/PLT 改写，不是 inline
+patch。这同时解释了为什么 vendor 件在 SF 里"没崩也没 hook"：它受制于它自己写死的
+`/system/lib64/libandroidfw.so` 目标选择（A16 的 SF 不加载该库），而不是权限。
+
+实现（`rust/uperf-sfanalysis/src/got.rs`）：
+
+1. `dl_iterate_phdr` 遍历所有已加载对象；
+2. 从 PT_DYNAMIC 取 `DT_SYMTAB/DT_STRTAB/DT_JMPREL/DT_RELA`；
+3. 遍历 relocation，符号名精确匹配四个目标 → 槽地址 = `dlpi_addr + r_offset`，
+   槽里现有值就是 libc 的原始地址（存下来给 shim 调用）；
+4. `mprotect(槽所在页, RW)` → 写 → 还原原保护位。**只碰数据页。**
+
+三条实现坑（都已在代码里注释）：
+
+* **bionic 不改写 dynamic 段里的指针条目**：ET_DYN 的 `DT_STRTAB` 等仍是
+  vaddr 相对值（实测 `sym=0x320 str=0x584 jmprel=0x7f0`）。必须先折叠 `dlpi_addr`，
+  否则全部落入越界检查而静默跳过。
+* 有一个模块交出的 `DT_STRTAB` 根本不可用 → 每处解引用前都要用模块 PT_LOAD 的
+  `[lo,hi)` 做范围校验（未加校验时真机 SIGSEGV，崩在 `xh_refresh_loop`，fault addr
+  `0x7f8`）。
+* relocation 条目按 `DT_RELAENT` 步进，不要硬编码 24。
+
+### 10.4 真机结果（alioth / crDroid A16 / KernelSU Next / SELinux enforcing）
+
+```
+hooked ioctl                  slots=14 orig=0x77b8b1318c
+hooked pthread_cond_timedwait slots=7  orig=0x77b8b1796c
+hooked pthread_cond_wait      slots=9  orig=0x77b8b178ec
+hooked epoll_wait             slots=3  orig=0x77b8b25790
+```
+
+SF pid 1506 全程不变。25 秒后从 SF 内部读计数器：
+
+```
+stats ioctl=167 epoll=50 cw=28 ctw=0 txns=132 writes=126 state=1 idle_ms=282 installed=1
+```
+
+**4/4 hook 装上、活着、且在观测真实 SF 活动**（167 次 ioctl / 132 次 binder 事务 /
+126 次非空写缓冲）。host 侧 `cargo test -p uperf-sfanalysis` 19 项全过。
+
+→ 结论：**`magisk/sepolicy.rule` 不再需要，已删除**；本机 KernelSU-Next 也不加载
+它。feature 在 enforcing 上不再"死于权限"。
 
 ---
 
