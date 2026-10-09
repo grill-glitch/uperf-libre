@@ -183,4 +183,36 @@ done
 ## 7. 不做 Frida
 
 AGENT.md §10.5 没要求 SfAnalysis 走动态验证；r2 静态 + 真机 byte 抓取覆盖。
-**不引入 frida / strace / ltrace 依赖**。
+**不引入 frida 依赖**（真机验证用 ADB + strace，strace 是设备自带 `/system/bin/strace`）。
+
+---
+
+## 8. M8 前提被推翻（2026-10-09 真机证据）
+
+真机测试发现 **`sfanalysis.hint` 没有生产者**，证据见
+`docs/m8-sfanalysis-reverse.md §6`（符号表 + harness strace + daemon strace 三证）。
+因此：
+
+* **`libsfanalysis.so` 不是 hint 生产者**，是一个纯进程内代码补丁库
+  （hook `ioctl`/`epoll_wait`/`pthread_cond_wait`/`pthread_cond_timedwait`，
+  在目标里补 16 个 hook 点）。
+* daemon 的 `SfAnalysisListener` 在轮询一个**永远不存在**的文件
+  （`openat(hint, O_RDONLY) = ENOENT`，实测）。
+* 所以本文档 §2/§3 描述的"重写它、产出同样的 hint 字节"**没有可对齐的对象**：
+  没有 byte 序列可比，因为上游也没有。
+
+### 三条处置路线（**待决**）
+
+| 选项 | 内容 | 代价 / 风险 |
+|---|---|---|
+| **A. 直接删 blob** | 发布产物不再带 `libsfanalysis.so`，不写替代品；daemon 侧的消费端保留（无害轮询，将来有生产者即可用） | 达到"0 闭源 blob"；但该库在进程内补的 16 个 hook 点效果**未测定**，删除即等于去掉一个未知的微调 |
+| **B. 忠实移植进程内行为** | 用 Rust 重写 4 个 libc hook + 那 16 个补丁点的语义 | 需要继续深挖 handler（`fcn.00003ec4` 之后）才能知道补丁干什么；即便移植成功，**外部可观测契约仍为空**（无人能验证 parity） |
+| **C. 新增 opt-in 生产者** | 自己从 SF 活动推 hint 写文件，让 daemon 的现有消费端活起来 | 这是**新功能**不是重写；参照 AGENT.md §12.2 的 governor 先例（"无 parity 可保 → 新策略应 opt-in"） |
+
+**本文档的立场**：M8 的原始目标（"重写 hint 生产者"）**不成立**，不应按 §2/§3
+继续实现，否则是在给一个不存在的契约编造实现。建议先在 A 与 C 之间选
+（B 只在明确需要那个未测定的进程内微调时才有意义）。
+
+当前 `rust/uperf-sfanalysis` 的实现（hook 目标错 + 补丁落点错）在选定方向前
+**不接入发布流程**；`build.sh make check` 的 0-blob 断言仍然有效（它会阻止
+vendor `.so` 回到产物里）。
