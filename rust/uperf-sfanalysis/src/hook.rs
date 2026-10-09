@@ -35,16 +35,19 @@ pub const TARGETS: [&str; 4] = [
 #[derive(Debug)]
 pub struct Hook {
     pub name: &'static str,
-    pub entry: usize,
-    pub tramp: usize,
-    pub entry_page_len: usize,
+    /// number of GOT slots rewritten
+    pub slots: usize,
+    /// the original (libc) address the slots pointed at
+    pub orig: usize,
 }
 
 #[derive(Debug)]
 pub enum HookError {
     NoSymbol(String),
     NoExecMapping(String),
+    NoSlot(String),
     RelocationUnsafe { name: String, insn: u32 },
+    Slot { name: String, addr: usize, errno: i32, what: &'static str },
     Syscall(&'static str, i32),
     Unsupported(&'static str),
 }
@@ -54,13 +57,53 @@ impl core::fmt::Display for HookError {
         match self {
             HookError::NoSymbol(s) => write!(f, "symbol not resolvable: {}", s),
             HookError::NoExecMapping(s) => write!(f, "no r-x mapping for {}", s),
+            HookError::NoSlot(s) => write!(f, "no GOT slot references {}", s),
             HookError::RelocationUnsafe { name, insn } => {
                 write!(f, "{}: pc-relative insn {:#010x} in prologue", name, insn)
+            }
+            HookError::Slot { name, addr, errno, what } => {
+                write!(f, "{}: {} at {:#x} errno={}", name, what, addr, errno)
             }
             HookError::Syscall(w, e) => write!(f, "{} errno={}", w, e),
             HookError::Unsupported(a) => write!(f, "inline hooks unsupported on {}", a),
         }
     }
+}
+
+/// Install one hook by rewriting every GOT/relocation slot that refers to
+/// `name` (see `got.rs` for why rewriting beats inline patching here).
+pub fn install(name: &str) -> Result<Hook, HookError> {
+    let slots = crate::got::find_slots(name);
+    if slots.is_empty() {
+        return Err(HookError::NoSlot(name.into()));
+    }
+    let orig = slots[0].value;
+    slot_for(name).ok_or_else(|| HookError::NoSymbol(name.into()))?
+        .store(orig, Ordering::SeqCst);
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let shim = arch::arch_shim_for(name).ok_or_else(|| HookError::NoSymbol(name.into()))?;
+        for s in &slots {
+            crate::got::patch_slot(s.addr, shim).map_err(|(e, what)| HookError::Slot {
+                name: name.into(),
+                addr: s.addr,
+                errno: e,
+                what,
+            })?;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = &slots;
+        return Err(HookError::Unsupported("GOT rewriting is aarch64-only"));
+    }
+
+    Ok(Hook {
+        name: TARGETS.iter().find(|t| **t == name).copied().unwrap_or("?"),
+        slots: slots.len(),
+        orig,
+    })
 }
 
 // --- per-symbol original pointers, read by the asm shims -------------------
@@ -236,7 +279,7 @@ mod arch {
     /// value expression loads its *contents* (a `u8`), which is the low byte of
     /// the shim's first instruction — 0xff for `sub sp, sp, #64` — not the
     /// address we need.
-    pub fn shim_for(name: &str) -> Option<usize> {
+    pub fn arch_shim_for(name: &str) -> Option<usize> {
         Some(match name {
             "ioctl" => core::ptr::addr_of!(SFH_SHIM_IOCTL) as usize,
             "epoll_wait" => core::ptr::addr_of!(SFH_SHIM_EPOLL_WAIT) as usize,
@@ -255,6 +298,26 @@ mod arch {
     /// Guards the one-shot mmap-shape probe so the log stays readable.
     static PROBED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+    /// Start address of libc's last `r--p` mapping (its RELRO / GOT region),
+    /// page-aligned. Used by the GOT-patching feasibility probe.
+    fn libc_relro_page(_ps: usize) -> Option<usize> {
+        let txt = std::fs::read_to_string("/proc/self/maps").ok()?;
+        let mut last = None;
+        for line in txt.lines() {
+            let mut it = line.split_whitespace();
+            let (Some(range), Some(perms)) = (it.next(), it.next()) else { continue };
+            let path = it.last().unwrap_or("");
+            if !path.ends_with("libc.so") || !perms.starts_with("r--") {
+                continue;
+            }
+            let (s, _e) = range.split_once('-')?;
+            if let Ok(s) = usize::from_str_radix(s, 16) {
+                last = Some(s);
+            }
+        }
+        last
+    }
+
     /// Try one anonymous mapping shape; report whether it succeeded.
     unsafe fn probe(len: usize, prot: i32) -> (bool, i32) {
         let p = mmap(
@@ -272,11 +335,15 @@ mod arch {
         }
     }
 
-    /// Install one hook. The trampoline is built before the entry is patched,
-    /// so a failure leaves the target untouched.
-    pub fn install(name: &str) -> Result<Hook, HookError> {
+    /// Inline patching. NOT used any more: on this device both executable-memory
+    /// routes are refused by SELinux (`execmem` for an anonymous RWX map,
+    /// `execmod` for mprotecting a file-backed code page), so the live path is
+    /// GOT rewriting in `got.rs`. Kept because the code and its trampoline
+    /// layout are the reference for what an inline patch would have to do.
+    #[allow(dead_code)]
+    pub fn install_inline(name: &str) -> Result<Hook, HookError> {
         let entry = resolve_entry(name)?;
-        let shim = shim_for(name).ok_or_else(|| HookError::NoSymbol(name.into()))?;
+        let shim = arch_shim_for(name).ok_or_else(|| HookError::NoSymbol(name.into()))?;
         let slot = slot_for(name).ok_or_else(|| HookError::NoSymbol(name.into()))?;
 
         if !is_executable(entry) {
@@ -303,6 +370,22 @@ mod arch {
                     "mmap probe: RW ok={} err={} | RX ok={} err={} | RWX ok={} err={}",
                     r, e1, x, e2, rx, e3
                 ));
+                // GOT/PLT rewriting — which is what the xHook the vendor links
+                // actually does by default — needs only RW on a *data* page.
+                // Probe libc's RELRO (r--p) mapping, where its GOT lands under
+                // full RELRO.
+                if let Some(relro) = libc_relro_page(ps) {
+                    let m = mprotect(relro as *mut c_void, ps, PROT_READ | PROT_WRITE);
+                    let me = if m == 0 { 0 } else { errno() };
+                    if m == 0 {
+                        let _ = mprotect(relro as *mut c_void, ps, PROT_READ);
+                    }
+                    crate::dbg_log(&format!(
+                        "mprotect probe: libc RELRO page RW ok={} err={}",
+                        m == 0,
+                        me
+                    ));
+                }
             }
         }
         let tramp = unsafe {
@@ -399,9 +482,8 @@ mod arch {
 
         Ok(Hook {
             name: TARGETS.iter().find(|t| **t == name).copied().unwrap_or("?"),
-            entry,
-            tramp,
-            entry_page_len: page_len,
+            slots: 0,
+            orig: entry,
         })
     }
 
@@ -462,13 +544,8 @@ mod arch {
     );
 }
 
-#[cfg(target_arch = "aarch64")]
-pub use arch::install;
-
-#[cfg(not(target_arch = "aarch64"))]
-pub fn install(_name: &str) -> Result<Hook, HookError> {
-    Err(HookError::Unsupported("inline hooks are aarch64-only"))
-}
+// The live entry point is the file-scope `install` above (GOT rewriting).
+// `arch::install_inline` is retained only as reference.
 
 #[cfg(test)]
 mod tests {
