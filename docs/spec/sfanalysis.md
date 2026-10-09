@@ -201,18 +201,40 @@ AGENT.md §10.5 没要求 SfAnalysis 走动态验证；r2 静态 + 真机 byte �
 * 所以本文档 §2/§3 描述的"重写它、产出同样的 hint 字节"**没有可对齐的对象**：
   没有 byte 序列可比，因为上游也没有。
 
-### 三条处置路线（**待决**）
+### 决定：B — 复刻进程内行为（2026-10-09）
 
-| 选项 | 内容 | 代价 / 风险 |
-|---|---|---|
-| **A. 直接删 blob** | 发布产物不再带 `libsfanalysis.so`，不写替代品；daemon 侧的消费端保留（无害轮询，将来有生产者即可用） | 达到"0 闭源 blob"；但该库在进程内补的 16 个 hook 点效果**未测定**，删除即等于去掉一个未知的微调 |
-| **B. 忠实移植进程内行为** | 用 Rust 重写 4 个 libc hook + 那 16 个补丁点的语义 | 需要继续深挖 handler（`fcn.00003ec4` 之后）才能知道补丁干什么；即便移植成功，**外部可观测契约仍为空**（无人能验证 parity） |
-| **C. 新增 opt-in 生产者** | 自己从 SF 活动推 hint 写文件，让 daemon 的现有消费端活起来 | 这是**新功能**不是重写；参照 AGENT.md §12.2 的 governor 先例（"无 parity 可保 → 新策略应 opt-in"） |
+用户裁定：**彻底去除闭源 blob，但复刻 blob 行为**。因此
+`rust/uperf-sfanalysis` 重写为行为等价的进程内观察库：
 
-**本文档的立场**：M8 的原始目标（"重写 hint 生产者"）**不成立**，不应按 §2/§3
-继续实现，否则是在给一个不存在的契约编造实现。建议先在 A 与 C 之间选
-（B 只在明确需要那个未测定的进程内微调时才有意义）。
+* 注入方式不变（`patchelf --add-needed` 进 surfaceflinger）；
+* ctor 把调用线程设为 `SCHED_FIFO` prio 3（同 vendor）；
+* worker 线程名 `xh_refresh_loop`，延迟 60 s 后安装，然后周期重装（同 vendor）；
+* inline hook 4 个 libc 函数，替换函数**先调原函数、保存返回值、喂观察者、返回原值**；
+* `ioctl` 额外匹配 `BINDER_WRITE_READ`(0xc0306201) 并解 `binder_write_read`；
+* **不写任何文件、不开任何 IPC**（与 vendor 一致）。
 
-当前 `rust/uperf-sfanalysis` 的实现（hook 目标错 + 补丁落点错）在选定方向前
-**不接入发布流程**；`build.sh make check` 的 0-blob 断言仍然有效（它会阻止
-vendor `.so` 回到产物里）。
+**已记录的偏差**（都是 spec 允许/必要的，不是遗漏）：
+
+| 偏差 | 原因 |
+|---|---|
+| `dlsym` 代替手写 ELF dynsym 遍历 | 等价且短；见 §3 |
+| maps 扫描过滤 `x` 权限 | vendor 不过滤 → 补到 ELF 头段（§0/§5），必须修 |
+| 无 POSIX `timer_create`(SIGEV_THREAD_ID) | vendor 的 DelayedWork 定时器只驱动它自己的状态机，无外部可观测影响；不实现以免引入信号/线程复杂度 |
+| 不 open surfaceflinger/libandroidfw/libandroid | 那是 vendor 解析 ELF 找符号用的；我们用 dlsym |
+| 诊断经 `write`（`eprintln`） | vendor 完全静默；仅在错误/`UPERF_SFANALYSIS_DEBUG=1` 时输出，默认不影响行为 |
+
+**真机验证**（alioth / crDroid A16，隔离 harness，未接 SF）：
+
+```
+superf-sfanalysis: hooked ioctl (entry 0x…318c, tramp 0x…0000)
+uperf-sfanalysis: hooked pthread_cond_timedwait (entry 0x…796c, …)
+uperf-sfanalysis: hooked pthread_cond_wait (entry 0x…78ec, …)
+uperf-sfanalysis: hooked epoll_wait (entry 0x…4d40, …)   ← 跟到 __epoll_pwait
+calls: ioctl=-1 ioctl2=-1 epoll=-1
+  ioctl = 2   epoll_wait = 1   cond_wait = 0   cond_timedwait = 1
+  binder_txns = 1   binder_writes = 1   installed = 1
+exit=0
+```
+
+**未做**：把库真的注入 SF 并观察长期稳定性（harness 已验证机制，SF 侧留待下一次；
+SF 崩了要重启时会连带 zygote，风险高，需单独一轮）。

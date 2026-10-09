@@ -1,128 +1,131 @@
-//! `libsfanalysis_rs` — Rust rewrite of yc9559/uperf's `libsfanalysis.so`.
+//! `libsfanalysis_rs` — behaviour-preserving replacement for the vendored
+//! `libsfanalysis.so`.
 //!
-//! Injected into `surfaceflinger` via `patchelf --add-needed` (see
-//! `magisk/customize.sh`). Hooks `xh_refresh_loop` inside `libandroidfw.so`
-//! by mprotect + inline patch, and writes a single byte to
-//! `<USER_PATH>/sfanalysis.hint` on every call. Byte protocol: see
-//! `docs/spec/sfanalysis.md §2.3` and AGENT.md §7.4 / §12.1.
+//! What the vendor library does (established by r2 + on-device strace,
+//! docs/m8-sfanalysis-reverse.md §5/§5b):
 //!
-//! Layout:
-//!   hook.rs — locate libandroidfw.so in /proc/self/maps, mprotect, patch
-//!   fsm.rs  — SfHint 6-value FSM (idle/switch/trigger/gesture/touch/junk)
-//!   sink.rs — open + truncate + write single byte
-//!   lib.rs  — public surface + init entry point
+//!   1. injected into `surfaceflinger` via `patchelf --add-needed`;
+//!   2. the ctor sets the calling thread to `SCHED_FIFO` priority 3, arms a
+//!      POSIX timer whose handler names itself `DelayedWork`, and starts a
+//!      worker thread named `xh_refresh_loop`;
+//!   3. the worker sleeps 60 s, then repeatedly walks `/proc/self/maps`,
+//!      `mprotect`s target pages RWX and patches the entry of four libc
+//!      functions: `ioctl`, `epoll_wait`, `pthread_cond_wait`,
+//!      `pthread_cond_timedwait`;
+//!   4. each replacement calls the original, keeps its return value, feeds an
+//!      observer (`ioctl` additionally decodes `BINDER_WRITE_READ`), and
+//!      returns the original's value;
+//!   5. it never writes a file and never opens an IPC channel.
 //!
-//! The crate is `std` (cdylib always pulls in libc anyway). All syscalls
-//! have an error path; nothing panics on a real device. We set a thread
-//! name via `prctl` so logcat shows "uperf-sfanalysis" instead of the
-//! surfaceflinger-inherited name.
+//! This crate reproduces 1–5. The only intentional deviations are the ones the
+//! spec records: `dlsym` instead of a hand-rolled ELF dynsym walk, and the
+//! maps scan filters on the `x` permission (the vendor's does not, which makes
+//! it patch the ELF-header segment — see docs/m8-sfanalysis-reverse.md §0).
 //!
-//! Tests live in each submodule and run on the host under `cargo test`.
-//! The host has no `libandroidfw.so`; tests inject a fake module under
-//! `UPERF_FAKE_ROOT/self_maps` and `UPERF_FAKE_ROOT/lib` to exercise the
-//! parser without doing real mprotect on the build machine.
+//! Env (documented, not part of the vendor surface):
+//!   UPERF_SFANALYSIS_DISABLE=1     do nothing
+//!   UPERF_SFANALYSIS_DELAY_SECS=N  worker delay before the first install
+//!                                  (default 60, matching the vendor)
+//!   UPERF_SFANALYSIS_INTERVAL_SECS=N  re-apply period (default 60)
 
 #![allow(non_snake_case, non_camel_case_types)]
 
-mod fsm;
-mod hook;
-mod sink;
+pub mod hook;
+pub mod observe;
 
-pub use fsm::SfHint;
+use std::sync::atomic::Ordering;
 
-/// Hint file name, written next to `<USER_PATH>/uperf.json`. Path is
-/// supplied by the consumer (`SfAnalysisListener` in `uperf-core`), but
-/// `magisk/customize.sh` also exports `UPERF_SF_HINT_FILE` so the producer
-/// and consumer agree without an IPC handshake.
-pub const SF_HINT_FILE: &str = "sfanalysis.hint";
+/// State snapshot indices for `sfh_stats`.
+pub const STAT_IOCTL: usize = 0;
+pub const STAT_EPOLL_WAIT: usize = 1;
+pub const STAT_COND_WAIT: usize = 2;
+pub const STAT_COND_TIMEDWAIT: usize = 3;
+pub const STAT_BINDER_TXNS: usize = 4;
+pub const STAT_BINDER_WRITES: usize = 5;
+pub const STAT_STATE: usize = 6;
+pub const STAT_LAST_MS: usize = 7;
+pub const STAT_IDLE_MS: usize = 8;
+pub const STAT_INSTALLED: usize = 9;
 
-/// Target function name in `libandroidfw.so`. From vendor `.rodata`:
-/// `xh_refresh_loop` (m1-static-reverse.md §1.5 + m8-sfanalysis-reverse §1.2).
-pub const HOOK_TARGET_SYM: &str = "xh_refresh_loop";
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+}
 
-/// `ctor`-equivalent entry point. `patchelf` puts `libsfanalysis_rs.so` in
-/// surfaceflinger's DT_NEEDED, and the dynamic loader runs the library's
-/// `DT_INIT` array on load. We register our installer into `.init_array`
-/// so it runs **before** surfaceflinger's main thread starts the renderer,
-/// giving us the right window to mprotect + patch `xh_refresh_loop`.
-///
-/// `#[link_section = ".init_array"]` plus `#[used]` makes the symbol survive
-/// `--gc-sections`. The leading byte in the section is conventionally a
-/// 16-bit priority — `0xffff` = "highest priority, run first".
-/// On surfaceflinger startup, this triggers:
-///   1. regcomp a benign regex (debug aid)
-///   2. mprotect + inline patch xh_refresh_loop
-///   3. from then on, every call to xh_refresh_loop runs our handler
-///      which writes a SfHint byte to `<hint>`.
+fn env_secs(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Install all four hooks. Idempotent-ish: a second call re-patches, which is
+/// what the vendor's refresh loop does.
+fn install_all() -> usize {
+    let mut ok = 0;
+    for name in hook::TARGETS {
+        match hook::install(name) {
+            Ok(h) => {
+                ok += 1;
+                eprintln!(
+                    "uperf-sfanalysis: hooked {} (entry {:#x}, tramp {:#x})",
+                    h.name, h.entry, h.tramp
+                );
+            }
+            Err(e) => {
+                // A slot we cannot patch must never abort the host process.
+                eprintln!("uperf-sfanalysis: {} not hooked: {}", name, e);
+            }
+        }
+    }
+    if ok > 0 {
+        observe::SFH_INSTALLED.store(1, Ordering::Relaxed);
+    }
+    ok
+}
+
+/// Run the worker: delay, install, then re-apply on a period. Named
+/// `xh_refresh_loop` to match the vendor's thread name.
+fn worker(delay: u64, interval: u64) {
+    std::thread::sleep(std::time::Duration::from_secs(delay));
+    let n = install_all();
+    if n == 0 {
+        return;
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+        install_all();
+    }
+}
+
+/// Set the calling thread to SCHED_FIFO priority 3, matching the vendor ctor.
+/// Failure is not fatal (an unprivileged process simply cannot).
+fn set_realtime() {
+    #[cfg(target_os = "android")]
+    unsafe {
+        let mut p: libc::sched_param = core::mem::zeroed();
+        p.sched_priority = 3;
+        let _ = libc::sched_setscheduler(0, libc::SCHED_FIFO, &p);
+    }
+}
+
+/// Constructor. Registered in `.init_array` so it runs when the dynamic loader
+/// loads the library into surfaceflinger.
+extern "C" fn sfh_ctor() {
+    if env_flag("UPERF_SFANALYSIS_DISABLE") {
+        eprintln!("uperf-sfanalysis: disabled by env");
+        return;
+    }
+    set_realtime();
+    let delay = env_secs("UPERF_SFANALYSIS_DELAY_SECS", 60);
+    let interval = env_secs("UPERF_SFANALYSIS_INTERVAL_SECS", 60);
+    let _ = std::thread::Builder::new()
+        .name("xh_refresh_loop".into())
+        .spawn(move || worker(delay, interval));
+}
+
 #[used]
 #[link_section = ".init_array"]
-static _INIT_CTOR: unsafe extern "C" fn() -> std::os::raw::c_int = {
-    unsafe extern "C" fn wrapper() -> std::os::raw::c_int {
-        if let Err(e) = hook::install(HOOK_TARGET_SYM) {
-            eprintln!("uperf-sfanalysis: hook install failed: {}", e);
-            return 1;
-        }
-        0
-    }
-    wrapper
-};
+static SFH_INIT: extern "C" fn() = sfh_ctor;
 
-// We don't define our own `_init` / `_fini` symbols because the C runtime
-// already provides them via `crti.o`. Instead the `.init_array` entry above
-// is what runs on library load. We keep `sfhint_install` and
-// `sfhint_remove` as the public Rust names for completeness.
+/// Explicit install entry (used by the device harness and tests).
 #[no_mangle]
-pub extern "C" fn sfhint_install() -> std::os::raw::c_int {
-    if let Err(e) = hook::install(HOOK_TARGET_SYM) {
-        eprintln!("uperf-sfanalysis: hook install failed: {}", e);
-        return 1;
-    }
-    0
+pub extern "C" fn sfh_install() -> i32 {
+    install_all() as i32
 }
-
-#[no_mangle]
-pub extern "C" fn sfhint_remove() {
-    hook::uninstall();
-}
-
-/// FFI entry the trampoline jumps to. Original `xh_refresh_loop` body is
-/// called first via the trampoline, so we don't need to replicate its
-/// semantics — we only observe that it ran and write the byte.
-#[no_mangle]
-pub unsafe extern "C" fn sfhint_handler(arg: *mut std::ffi::c_void) {
-    let _ = arg;
-    let hint = fsm::next_hint();
-    if let Some(path) = sink::resolve_path() {
-        let _ = sink::write_byte(&path, hint as u8);
-    }
-}
-
-/// Optional C entry point: query the current hint without driving the FSM.
-/// Useful for tests and for `SfAnalysisListener`'s dry-run mode.
-#[no_mangle]
-pub extern "C" fn sfhint_current() -> u8 {
-    fsm::current_hint() as u8
-}
-
-/// Patch the trampoline back. Provided so a future `uninstall` could exist,
-/// but `surfaceflinger` never dlclose's us — kept for symmetry.
-#[no_mangle]
-pub extern "C" fn _fini_unused() {
-    hook::uninstall();
-}
-
-/// Optional name helper for diagnostics / logcat. Not strictly needed.
-#[no_mangle]
-pub extern "C" fn sfhint_name(b: u8, buf: *mut u8, len: usize) -> usize {
-    use std::ffi::CStr;
-    let name = fsm::SfHint::from_byte(b).as_str();
-    let bytes = name.as_bytes();
-    let n = bytes.len().min(len.saturating_sub(1));
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
-        *buf.add(n) = 0;
-    }
-    let _ = CStr::from_bytes_with_nul; // keep import live
-    n
-}
-

@@ -136,6 +136,66 @@ surfaceflinger ELF 的 DT_NEEDED 多一项 → 启动时 ld.so 自动 dlopen lib
 
 ---
 
+## 5. hook 注册与 handler（r2 深挖，2026-10-09）
+
+解密器 `fcn.00005090` 解出 4 个名字后，经 `fcn.000028d0`（注册助手）逐个登记：
+
+| 符号 | 替换函数 | old_func 槽 |
+|---|---|---|
+| `ioctl` | `fcn.00005464` | `0x8ff0` |
+| `pthread_cond_timedwait` | `fcn.000056a0` | `0x8ff8` |
+| `pthread_cond_wait` | `fcn.000056d0` | `0x9000` |
+| `epoll_wait` | `fcn.00005700` | `0x9008` |
+
+替换函数形状（**先调原函数、存返回值，再跑状态机、返回原值**）：
+
+* `fcn.000056a0` / `fcn.000056d0`（两个 cond_wait）：
+  `ldr x8,[slot]; blr x8; mov w19,w0; bl fcn.00004a28; mov w0,w19; ret`
+  —— 纯观察者，状态机在 `fcn.00004a28`。
+* `fcn.00005464`（ioctl）：先调原函数，然后匹配 `x1 == 0xc0306201`
+  —— 即 **`BINDER_WRITE_READ`**（`_IOWR('b',1,struct binder_write_read)`，
+  size 0x30=48 字节）。命中后校验参数结构、加锁、调 `fcn.00005c88`。
+  **所以它在解析 binder 事务**（探测 activity/焦点变化）。
+* `fcn.00005700`（epoll_wait）：先调原函数；再 `gettid()` 与 ctor 记录的 tid 比对，
+  命中才 `clock_gettime` + 状态机（`fcn.000058d8`），带 800ms 阈值。
+
+状态机家族（`fcn.00006000` / `0x60e0` / `0x6184` / `0x6210` / `0x6294`）形状相同：
+
+```
+if state == 2:
+    fd = *(i32*)(0x8fcc + 0xcc)      /* = 0x9098，见下 */
+    if fd >= 1:
+        lseek(fd, 0, SEEK_SET); read(fd, buf, 1);   /* 读 1 字节 */
+```
+
+`fcn.00004d58` 用 `open(path, O_RDONLY|O_NONBLOCK|O_CLOEXEC)` 打开三个文件并记 fd：
+`/system/bin/surfaceflinger`、`/system/lib64/libandroidfw.so`、`/system/lib64/libandroid.so`
+（fd 存 `.bss`：`0x9094` = libandroidfw，**`0x9098` = libandroid**）。
+状态机读的那 1 字节来自 **`libandroid.so` 的第 0 字节**（ELF magic `0x7f`），
+不是任何 hint 通道。
+
+`fcn.0000658c` = 排一个 DelayedWork（回调 + 到期时间），
+`fcn.0000637c` = 定时器回调（`prctl(PR_SET_NAME,"DelayedWork")` + 遍历到期任务、
+执行回调）。这就是 `.rodata` 里 `DelayedWork` 串的用途。
+
+---
+
+## 5b. 进程内可见副作用（strace 实测）
+
+| 时机 | syscall |
+|---|---|
+| 加载 | `sched_setscheduler(0, SCHED_FIFO, prio 3)`（把调用线程设成实时） |
+| 加载 | `timer_create(CLOCK_MONOTONIC, SIGEV_THREAD_ID, SIGRTMIN, tid=新线程)` |
+| 加载 | `open("/system/bin/surfaceflinger"…)`、`open(libandroidfw.so)`、`open(libandroid.so)` |
+| worker | `nanosleep(60)` → 反复 `open/read/close("/proc/self/maps")` → 16 组 `mprotect(RW)`/`mprotect(R)` |
+| 全程 | **零文件写**（无 `write`/`pwrite`/`syscall`/`mmap` 导入） |
+
+**注**：`libandroidfw.so` / `libandroid.so` 是它**打开来解析 ELF 找符号**用的
+（用来定位那 4 个 libc 符号？）——见 §5 的 open 与 `0x9094/0x9098`。
+A16 上 SF 不 map libandroidfw，但这两个文件在盘上存在，所以 `open` 仍成功。
+
+---
+
 ## 3. SfHint 6 值枚举（与消费端一致）
 
 ```rust

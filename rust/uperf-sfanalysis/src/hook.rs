@@ -1,522 +1,506 @@
-//! `xh_refresh_loop` hook installer.
+//! Inline-hook engine for the four libc functions the vendor library observes.
 //!
-//! What vendor does (m8-sfanalysis-reverse.md §2):
-//!   1. `fopen("/proc/self/maps", "r")` and read line-by-line.
-//!   2. For each line, `sscanf("%lx-%*lx %4s %lx %*x:%*x %*d%n",
-//!                              &start, perms_buf, &inode_off, &consumed)`.
-//!      Match `perms_buf[0] == 'r' && perms_buf[2] == 'x'` and
-//!      continue until `strstr(lib_name, "libandroidfw.so")`.
-//!   3. Collect (start, end, pathname) for that range.
-//!   4. `mprotect(start, page-rounded-size, PROT_READ|PROT_WRITE|PROT_EXEC)`.
-//!   5. Search that range for the bytes of the trampoline stub
-//!      (in vendor it's an unconditional `B`/`BR` jump slot they patch).
-//!   6. Overwrite the first matching instruction with a `LDR x16, =trampoline;
-//!      BR x16` pair.
-//!   7. Trampoline calls original, then jumps to our `sfhint_handler`, then
-//!      returns.
+//! Behaviour being replicated (docs/m8-sfanalysis-reverse.md §5): the vendor
+//! registers replacements for `ioctl`, `epoll_wait`, `pthread_cond_wait` and
+//! `pthread_cond_timedwait`; each replacement calls the original first, keeps
+//! its return value, runs an observer, then returns the original's value.
+//! `ioctl` additionally matches `BINDER_WRITE_READ` (0xc0306201).
 //!
-//! What this rewrite does, with the same byte effect on `xh_refresh_loop`:
-//!   - Same parser (we keep the `%lx-%*lx %4s %lx %*x:%*x %*d%n` format).
-//!   - Search the .text range for `xh_refresh_loop` by symbol: we cannot
-//!     rely on `dlsym` because the symbol may be hidden; we look up via the
-//!     ELF dynsym table parsed from the loaded library's address, or — as a
-//!     fallback — match the **first 4 bytes** of a `B <label>` (unconditional
-//!     branch) at the start of the page. That is vendor's actual strategy
-//!     after stripping.
-//!   - Replace those 4 bytes with our trampoline.
-//!   - The trampoline lives in a `static` `PAGE_ALIGNED` 4 KiB buffer with
-//!     `RWX` permissions set by `mprotect`. On aarch64 the trampoline is
-//!     16 bytes:
-//!         LDR x16, #8      ; load the address from the next 8 bytes
-//!         BR  x16          ; jump to it
-//!         .quad <handler>  ; address of `sfhint_handler`
-//!   - Original `xh_refresh_loop` body is preserved (we save the first 16
-//!     bytes before patching and have a `orig` shim that calls back into
-//!     the rest of the function).
+//! Mechanics:
+//!  1. resolve with `dlsym(RTLD_DEFAULT, name)` (the vendor walks ELF dynsym by
+//!     hand; dlsym is equivalent and shorter);
+//!  2. follow unconditional-branch stubs — bionic implements `epoll_wait` as
+//!     `mov x4,xzr; mov w5,#8; b __epoll_pwait`;
+//!  3. copy the first four instructions into an `mmap`'d RWX trampoline,
+//!     followed by `LDR x17,#8; BR x17; .quad entry+16`;
+//!  4. `mprotect` the entry page RWX and write the same jump at the entry,
+//!     targeting the asm shim.
 //!
-//! On **host** we do not mprotect anything; we read a fake `/proc/self/maps`
-//! from `UPERF_FAKE_ROOT/self_maps` and a fake `libandroidfw.so` bytes blob
-//! from `UPERF_FAKE_ROOT/lib/libandroidfw.so`. The "patch" simply asserts
-//! that the byte sequence we would write is present at the expected offset,
-//! without touching the host's actual memory.
+//! The copied prologue must be relocation-safe. Any PC-relative instruction is
+//! refused rather than corrupted. All four prologues on this device's bionic
+//! pass (asserted in tests).
 
-use std::env;
-use std::ffi::CString;
-use std::fs;
-use std::path::PathBuf;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::ffi::{c_char, c_void, CString};
 
-use libc::{fopen, fgets, mprotect, O_WRONLY, PROT_READ, PROT_WRITE, PROT_EXEC};
+/// The four symbols, in the order the vendor registers them.
+pub const TARGETS: [&str; 4] = [
+    "ioctl",
+    "pthread_cond_timedwait",
+    "pthread_cond_wait",
+    "epoll_wait",
+];
 
-/// Error type used by `install`. Display impl is the only consumer.
+/// One installed hook.
+#[derive(Debug)]
+pub struct Hook {
+    pub name: &'static str,
+    pub entry: usize,
+    pub tramp: usize,
+    pub entry_page_len: usize,
+}
+
 #[derive(Debug)]
 pub enum HookError {
-    MapsOpen(String),
-    Parse(String),
-    Range(String),
-    Mprotect(i32),
-    Patch(String),
-    Disabled(String),
+    NoSymbol(String),
+    NoExecMapping(String),
+    RelocationUnsafe { name: String, insn: u32 },
+    Syscall(&'static str, i32),
+    Unsupported(&'static str),
 }
 
 impl core::fmt::Display for HookError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            HookError::MapsOpen(s)  => write!(f, "open maps: {}", s),
-            HookError::Parse(s)     => write!(f, "parse line: {}", s),
-            HookError::Range(s)     => write!(f, "range not found: {}", s),
-            HookError::Mprotect(e)  => write!(f, "mprotect failed errno={}", e),
-            HookError::Patch(s)     => write!(f, "patch: {}", s),
-            HookError::Disabled(s)  => write!(f, "disabled: {}", s),
+            HookError::NoSymbol(s) => write!(f, "symbol not resolvable: {}", s),
+            HookError::NoExecMapping(s) => write!(f, "no r-x mapping for {}", s),
+            HookError::RelocationUnsafe { name, insn } => {
+                write!(f, "{}: pc-relative insn {:#010x} in prologue", name, insn)
+            }
+            HookError::Syscall(w, e) => write!(f, "{} errno={}", w, e),
+            HookError::Unsupported(a) => write!(f, "inline hooks unsupported on {}", a),
         }
     }
 }
 
-/// Public entry: install the hook for the given symbol name. On a device,
-/// this runs at surfaceflinger startup (called from `_init`).
-pub fn install(target_sym: &str) -> Result<(), HookError> {
-    if env::var("UPERF_SFANALYSIS_DISABLE").is_ok() {
-        return Err(HookError::Disabled("UPERF_SFANALYSIS_DISABLE is set".into()));
-    }
-    // On host (UPERF_FAKE_ROOT set), skip /proc/self/maps and mprotect;
-    // the unit tests verify the parser and the fake .so contents. This
-    // keeps `cargo test` from mprotecting the build machine's address space.
-    if env::var("UPERF_FAKE_ROOT").is_ok() {
-        return install_fake(target_sym);
-    }
-    let maps = read_maps()?;
-    let range = locate_target(&maps, target_sym)
-        .ok_or_else(|| HookError::Range(format!("{} not found in maps", target_sym)))?;
-    mprotect_range(range.0, range.1)?;
-    patch_target(range.0, range.1, target_sym)?;
-    Ok(())
+// --- per-symbol original pointers, read by the asm shims -------------------
+
+/// Per-symbol original-function pointers, read by the asm shims.
+///
+/// Deliberately NOT `#[no_mangle]`: a preemptible (exported) symbol cannot be
+/// addressed with `adrp`+`:lo12:` inside a shared object. The assembly refers
+/// to them through `sym`, which resolves local items.
+pub static SFH_ORIG_IOCTL: AtomicUsize = AtomicUsize::new(0);
+pub static SFH_ORIG_EPOLL_WAIT: AtomicUsize = AtomicUsize::new(0);
+pub static SFH_ORIG_COND_WAIT: AtomicUsize = AtomicUsize::new(0);
+pub static SFH_ORIG_COND_TIMEDWAIT: AtomicUsize = AtomicUsize::new(0);
+
+fn slot_for(name: &str) -> Option<&'static AtomicUsize> {
+    Some(match name {
+        "ioctl" => &SFH_ORIG_IOCTL,
+        "epoll_wait" => &SFH_ORIG_EPOLL_WAIT,
+        "pthread_cond_wait" => &SFH_ORIG_COND_WAIT,
+        "pthread_cond_timedwait" => &SFH_ORIG_COND_TIMEDWAIT,
+        _ => return None,
+    })
 }
 
-/// Host-only install path: validates the fake .so layout without touching
-/// the host's actual address space.
-fn install_fake(target_sym: &str) -> Result<(), HookError> {
-    let root = env::var("UPERF_FAKE_ROOT")
-        .map_err(|_| HookError::Disabled("UPERF_FAKE_ROOT cleared mid-run".into()))?;
-    let mut lib_path = PathBuf::from(&root);
-    lib_path.push("lib");
-    lib_path.push("libandroidfw.so");
-    let bytes = fs::read(&lib_path)
-        .map_err(|e| HookError::Patch(format!("fake .so read: {}", e)))?;
-    if !bytes.windows(target_sym.len()).any(|w| w == target_sym.as_bytes()) {
-        return Err(HookError::Patch("symbol not in fake lib".into()));
-    }
-    // Also exercise the maps parser under the same root.
-    let _maps = read_maps()?;
-    eprintln!(
-        "uperf-sfanalysis: [fake] install OK; lib has {} bytes, sym '{}' present",
-        bytes.len(),
-        target_sym
-    );
-    Ok(())
+// --- pure helpers (unit-tested on the host) --------------------------------
+
+/// True when the instruction cannot be relocated into a trampoline:
+/// B/BL, B.cond, CBZ/CBNZ, TBZ/TBNZ, ADR/ADRP, LDR/PRFM (literal).
+pub fn is_pc_relative(insn: u32) -> bool {
+    insn & 0x7C00_0000 == 0x1400_0000      // B / BL
+        || insn & 0xFF00_0010 == 0x5400_0000 // B.cond
+        || insn & 0x7E00_0000 == 0x3400_0000 // CBZ / CBNZ
+        || insn & 0x7E00_0000 == 0x3600_0000 // TBZ / TBNZ
+        || insn & 0x1F00_0000 == 0x1000_0000 // ADR / ADRP
+        || insn & 0x3B00_0000 == 0x1800_0000 // LDR (literal) / PRFM (literal)
 }
 
-/// No-op on host; on a device we don't have a clean uninstall path either
-/// (surfaceflinger never dlclose's), so this is currently a marker.
-pub fn uninstall() {}
+/// Absolute target of an unconditional `B` at `at`, else `None`.
+pub fn branch_target(insn: u32, at: usize) -> Option<usize> {
+    if insn & 0xFC00_0000 != 0x1400_0000 {
+        return None;
+    }
+    let imm26 = (insn & 0x03FF_FFFF) as i32;
+    let imm26 = (imm26 << 6) >> 6; // sign-extend 26 bits
+    Some(((at as isize) + (imm26 as isize) * 4) as usize)
+}
 
-/// A parsed `/proc/self/maps` line: (start, end, pathname).
-type MapEntry = (usize, usize, String);
+/// Read `n` 32-bit instructions from `addr` (unaligned-safe).
+///
+/// # Safety
+/// `addr` must point at readable code.
+pub unsafe fn read_insns(addr: usize, n: usize) -> Vec<u32> {
+    let mut v = Vec::with_capacity(n);
+    for i in 0..n {
+        v.push(core::ptr::read_unaligned((addr as *const u32).add(i)));
+    }
+    v
+}
 
-/// Read /proc/self/maps, or the fake root copy on host.
-fn read_maps() -> Result<Vec<MapEntry>, HookError> {
-    let path = match env::var("UPERF_FAKE_ROOT") {
-        Ok(root) => {
-            let mut p = PathBuf::from(root);
-            p.push("self_maps");
-            p
+/// Read `n` 32-bit words from `addr` (data, not necessarily code).
+///
+/// # Safety
+/// `addr` must point at readable memory.
+pub unsafe fn read_words(addr: usize, n: usize) -> Vec<u32> {
+    read_insns(addr, n)
+}
+
+extern "C" {
+    fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+    fn __errno() -> *mut i32;
+    fn sysconf(name: i32) -> i64;
+    #[cfg(target_arch = "aarch64")]
+    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+    #[cfg(target_arch = "aarch64")]
+    fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+}
+
+const RTLD_DEFAULT: *mut c_void = core::ptr::null_mut();
+const _SC_PAGESIZE: i32 = 39;
+
+pub fn page_size() -> usize {
+    let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if p <= 0 { 4096 } else { p as usize }
+}
+
+fn errno() -> i32 {
+    unsafe { *__errno() }
+}
+
+/// Resolve `name`, following bionic tail-call stubs.
+///
+/// bionic implements several calls as a few register moves followed by an
+/// unconditional `b` (e.g. `epoll_wait` = `mov x4,xzr; mov w5,#8;
+/// b __epoll_pwait`). We look at the first four instructions: if one of them is
+/// an unconditional `B` and everything before it is relocation-safe, that is a
+/// stub body — follow it and look again. Up to three hops.
+pub fn resolve_entry(name: &str) -> Result<usize, HookError> {
+    let cname = CString::new(name).map_err(|_| HookError::NoSymbol(name.into()))?;
+    let p = unsafe { dlsym(RTLD_DEFAULT, cname.as_ptr()) };
+    if p.is_null() {
+        return Err(HookError::NoSymbol(name.into()));
+    }
+    let mut addr = p as usize;
+    for _ in 0..3 {
+        let insns = unsafe { read_insns(addr, 4) };
+        let mut followed = false;
+        for (i, &insn) in insns.iter().enumerate() {
+            let at = addr + i * 4;
+            if let Some(t) = branch_target(insn, at) {
+                // Only follow when the preceding instructions are a plain stub
+                // body; a `b` deeper in a real prologue is left alone.
+                if insns[..i].iter().all(|x| !is_pc_relative(*x)) {
+                    addr = t;
+                    followed = true;
+                }
+                break;
+            }
+            if is_pc_relative(insn) {
+                break; // B.cond/CBZ/ADR/… : not a stub, stop looking
+            }
         }
-        Err(_) => PathBuf::from("/proc/self/maps"),
-    };
-    let cpath = CString::new(path.to_str().ok_or_else(|| HookError::MapsOpen("non-utf8 path".into()))?)
-        .map_err(|e| HookError::MapsOpen(format!("cstring: {}", e)))?;
-    let mode = CString::new("r").unwrap();
-    let fp = unsafe { fopen(cpath.as_ptr(), mode.as_ptr()) };
-    if fp.is_null() {
-        return Err(HookError::MapsOpen(format!("fopen({:?}) returned NULL", path)));
-    }
-    let mut out = Vec::new();
-    let mut buf = [0u8; 512];
-    loop {
-        let p = unsafe { fgets(buf.as_mut_ptr() as *mut _, buf.len() as i32, fp) };
-        if p.is_null() {
+        if !followed {
             break;
         }
-        // Find length (fgets writes a NUL).
-        let mut len = 0;
-        while len < buf.len() && buf[len] != 0 {
-            len += 1;
-        }
-        if let Some(entry) = parse_maps_line(&buf[..len]) {
-            out.push(entry);
-        }
     }
-    unsafe { libc::fclose(fp); }
-    Ok(out)
+    Ok(addr)
 }
 
-/// Parse one `/proc/self/maps` line.
-/// Vendor uses: `%lx-%*lx %4s %lx %*x:%*x %*d%n`.
-/// We parse into (start, end, pathname) — pathname is whatever comes after
-/// the inode (or "(deleted)" or empty for [heap]/[vdso]/...).
-fn parse_maps_line(line: &[u8]) -> Option<MapEntry> {
-    // `/proc/self/maps` format:
-    //   start-end perms offset dev inode pathname
-    // where `offset`, `dev`, `inode` may have no spaces (they're separated
-    // by single spaces). `pathname` may contain spaces and may be missing.
-    // We tokenize from the right: take the last token as pathname, the
-    // previous three as inode/dev/offset, then the perms, then the two
-    // addresses.
-
-    // Trim trailing newline.
-    let mut line = line;
-    if line.last() == Some(&b'\n') {
-        line = &line[..line.len() - 1];
-    }
-    // Take the last token as pathname (if there are at least 6 tokens).
-    // 6 = two addresses, perms, offset, dev, inode. pathname is optional.
-    // Split on ' '.
-    let mut toks: Vec<&[u8]> = Vec::new();
-    let mut start = 0;
-    for (i, &c) in line.iter().enumerate() {
-        if c == b' ' {
-            if i > start {
-                toks.push(&line[start..i]);
-            }
-            start = i + 1;
-        }
-    }
-    if start < line.len() {
-        toks.push(&line[start..]);
-    }
-    if toks.len() < 5 {
-        return None;
-    }
-
-    // Token layout: [start-end, perms, offset, dev, inode, pathname?]
-    // Anonymous regions (no pathname) have only 5 tokens; named ones have 6+.
-    let range = toks[0];
-    let perms = toks[1];
-    // Optional pathname — anything after inode.
-    let pathname = if toks.len() > 5 {
-        // Re-join the trailing tokens (pathnames may contain spaces).
-        let joined = line.splitn(6, |c| *c == b' ').nth(5).unwrap_or(&[]);
-        String::from_utf8_lossy(joined).trim_end().to_owned()
-    } else {
-        String::new()
-    };
-
-    // Address range: split on '-'.
-    let dash = range.iter().position(|c| *c == b'-')?;
-    let start = parse_hex(&range[..dash])?;
-    let end = parse_hex(&range[dash + 1..])?;
-
-    // Sanity: perms must be 4 chars.
-    if perms.len() < 4 {
-        return None;
-    }
-    let _ = perms; // not used for selection; the caller filters by pathname.
-    Some((start, end, pathname))
-}
-
-fn parse_hex(s: &[u8]) -> Option<usize> {
-    let mut v: usize = 0;
-    for &c in s {
-        let d = match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'f' => c - b'a' + 10,
-            b'A'..=b'F' => c - b'A' + 10,
-            _ => return None,
-        };
-        v = v.checked_mul(16)?.checked_add(d as usize)?;
-    }
-    Some(v)
-}
-
-/// Find the r-x range whose pathname is `libandroidfw.so`. If the binary
-/// is unstripped, also verify the symname (best-effort). Returns
-/// (start_address, end_address).
-fn locate_target(maps: &[MapEntry], sym: &str) -> Option<(usize, usize)> {
-    let mut candidate: Option<(usize, usize, String)> = None;
-    for (start, end, path) in maps {
-        // We want r-x range whose pathname ends with libandroidfw.so.
-        if !path.ends_with("libandroidfw.so") {
-            continue;
-        }
-        candidate = Some((*start, *end, path.clone()));
-        break;
-    }
-    let (start, end, _path) = candidate?;
-
-    // Best-effort: if we have the ELF bytes (from UPERF_FAKE_ROOT/lib), try
-    // to confirm `sym` exists in the dynsym. On a device this is the lib
-    // mapped in memory; here it's a fake copy. We don't fail if absent —
-    // the caller just falls back to the trampoline-by-page scheme.
-    if let Ok(fake_root) = env::var("UPERF_FAKE_ROOT") {
-        let mut lib_path = PathBuf::from(fake_root);
-        lib_path.push("lib");
-        lib_path.push("libandroidfw.so");
-        if let Ok(bytes) = fs::read(&lib_path) {
-            let _ = sym;
-            let _ = bytes;
-        }
-    }
-    Some((start, end))
-}
-
-/// mprotect the range to RWX. On host (UPERF_FAKE_ROOT set) this is a no-op
-/// that just records the call.
-fn mprotect_range(start: usize, end: usize) -> Result<(), HookError> {
-    let len = end - start;
-    if env::var("UPERF_FAKE_ROOT").is_ok() {
-        // Host test: don't actually mprotect anything. Log to stderr so a
-        // debug trace shows the call was reached.
-        eprintln!("uperf-sfanalysis: [fake] mprotect({:#x}, {}) = RWX", start, len);
-        return Ok(());
-    }
-    let page_size = page_size();
-    let aligned_start = start & !(page_size - 1);
-    let aligned_len = (len + (start - aligned_start) + page_size - 1) & !(page_size - 1);
-    let r = unsafe {
-        mprotect(
-            aligned_start as *mut _,
-            aligned_len,
-            PROT_READ | PROT_WRITE | PROT_EXEC,
-        )
-    };
-    if r != 0 {
-        return Err(HookError::Mprotect(errno()));
-    }
-    Ok(())
-}
-
-/// Patch the first instruction of `xh_refresh_loop` with our trampoline.
+/// Is `addr` inside a mapping with the `x` permission?
 ///
-/// On host (UPERF_FAKE_ROOT set) we read the fake .so bytes, locate a
-/// candidate spot, and verify our 16-byte trampoline **would** fit; we do
-/// not modify the host's actual memory.
-fn patch_target(start: usize, end: usize, _sym: &str) -> Result<(), HookError> {
-    let len = end - start;
-    if env::var("UPERF_FAKE_ROOT").is_ok() {
-        // Verify we have a fake library whose first 16 bytes can host the
-        // trampoline, and that `xh_refresh_loop` appears as a string.
-        let mut lib_path = match env::var("UPERF_FAKE_ROOT") {
-            Ok(s) => PathBuf::from(s),
-            Err(_) => return Err(HookError::Patch("no fake root".into())),
+/// The vendor's scan does NOT filter on perms and therefore patches the
+/// *first* matching mapping — for `libandroidfw.so` that is the r--p ELF
+/// header, not the r-xp text (docs/m8-sfanalysis-reverse.md §0). Filtering is
+/// a deliberate correction, recorded in the spec.
+pub fn is_executable(addr: usize) -> bool {
+    let Ok(txt) = std::fs::read_to_string("/proc/self/maps") else {
+        return false;
+    };
+    for line in txt.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(range), Some(perms)) = (it.next(), it.next()) else { continue };
+        let Some((s, e)) = range.split_once('-') else { continue };
+        let (Ok(s), Ok(e)) = (usize::from_str_radix(s, 16), usize::from_str_radix(e, 16)) else {
+            continue;
         };
-        lib_path.push("lib");
-        lib_path.push("libandroidfw.so");
-        let bytes = fs::read(&lib_path)
-            .map_err(|e| HookError::Patch(format!("fake .so read: {}", e)))?;
-        // Sanity: file must contain `xh_refresh_loop` somewhere.
-        if !bytes.windows(15).any(|w| w == b"xh_refresh_loop") {
-            return Err(HookError::Patch("symbol not in fake lib".into()));
+        if addr >= s && addr < e {
+            return perms.as_bytes().get(2).copied() == Some(b'x');
         }
-        eprintln!(
-            "uperf-sfanalysis: [fake] would patch {:#x}..{:#x} ({} bytes), \
-             .text contains xh_refresh_loop",
-            start, end, len
-        );
-        return Ok(());
     }
-    // Real device path: write a 16-byte trampoline at `start`. The original
-    // bytes are first saved into a static buffer (not implemented here —
-    // vendor saved the same bytes for the trampoline's return path). The
-    // trampoline:
-    //   58000050   ldr x16, #8     ; pc-relative load of next 8 bytes
-    //   D61F0200   br  x16
-    //   <8 bytes> = absolute address of sfhint_handler
-    let trampoline: [u8; 16] = [
-        0x50, 0x00, 0x00, 0x58,
-        0x00, 0x02, 0x1F, 0xD6,
-        0, 0, 0, 0, 0, 0, 0, 0,
-    ];
-    // SAFETY: the range was just mprotected RWX. We write exactly 16 bytes.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            trampoline.as_ptr(),
-            start as *mut u8,
-            trampoline.len(),
-        );
-    }
-    Ok(())
+    false
 }
 
-#[inline]
-fn page_size() -> usize {
-    // sysconf(_SC_PAGESIZE) on Android is 4096.
-    4096
+// ===========================================================================
+// aarch64 implementation
+// ===========================================================================
+
+#[cfg(target_arch = "aarch64")]
+mod arch {
+    use super::*;
+
+    extern "C" {
+        #[link_name = "sfh_shim_ioctl"]
+        static SFH_SHIM_IOCTL: u8;
+        #[link_name = "sfh_shim_epoll_wait"]
+        static SFH_SHIM_EPOLL_WAIT: u8;
+        #[link_name = "sfh_shim_cond_wait"]
+        static SFH_SHIM_COND_WAIT: u8;
+        #[link_name = "sfh_shim_cond_timedwait"]
+        static SFH_SHIM_COND_TIMEDWAIT: u8;
+    }
+
+    /// Address of each asm shim. `addr_of!` is required: naming the static in a
+    /// value expression loads its *contents* (a `u8`), which is the low byte of
+    /// the shim's first instruction — 0xff for `sub sp, sp, #64` — not the
+    /// address we need.
+    pub fn shim_for(name: &str) -> Option<usize> {
+        Some(match name {
+            "ioctl" => core::ptr::addr_of!(SFH_SHIM_IOCTL) as usize,
+            "epoll_wait" => core::ptr::addr_of!(SFH_SHIM_EPOLL_WAIT) as usize,
+            "pthread_cond_wait" => core::ptr::addr_of!(SFH_SHIM_COND_WAIT) as usize,
+            "pthread_cond_timedwait" => core::ptr::addr_of!(SFH_SHIM_COND_TIMEDWAIT) as usize,
+            _ => return None,
+        })
+    }
+
+    const PROT_READ: i32 = 1;
+    const PROT_WRITE: i32 = 2;
+    const PROT_EXEC: i32 = 4;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MAP_ANONYMOUS: i32 = 0x20;
+
+    /// Install one hook. The trampoline is built before the entry is patched,
+    /// so a failure leaves the target untouched.
+    pub fn install(name: &str) -> Result<Hook, HookError> {
+        let entry = resolve_entry(name)?;
+        let shim = shim_for(name).ok_or_else(|| HookError::NoSymbol(name.into()))?;
+        let slot = slot_for(name).ok_or_else(|| HookError::NoSymbol(name.into()))?;
+
+        if !is_executable(entry) {
+            return Err(HookError::NoExecMapping(name.into()));
+        }
+
+        let saved = unsafe { read_insns(entry, 4) };
+        for &insn in &saved {
+            if is_pc_relative(insn) {
+                return Err(HookError::RelocationUnsafe { name: name.into(), insn });
+            }
+        }
+
+        let ps = page_size();
+        let tramp = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                ps,
+                PROT_READ | PROT_WRITE | PROT_EXEC,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if tramp as isize == -1 {
+            return Err(HookError::Syscall("mmap", errno()));
+        }
+        let tramp = tramp as usize;
+
+        unsafe {
+            let p = tramp as *mut u32;
+            for (i, insn) in saved.iter().enumerate() {
+                core::ptr::write_unaligned(p.add(i), *insn);
+            }
+            core::ptr::write_unaligned(p.add(4), 0x5800_0051); // ldr x17, #8
+            core::ptr::write_unaligned(p.add(5), 0xD61F_0220); // br  x17
+            core::ptr::write_unaligned((tramp + 24) as *mut u64, (entry + 16) as u64);
+        }
+        slot.store(tramp, Ordering::SeqCst);
+
+        // Both the trampoline and the patched entry are newly written code.
+        // The D-cache must be cleaned and the I-cache invalidated per line, or
+        // the CPU may execute the stale (zero) contents and take SIGBUS/SEGV.
+        unsafe fn flush_code(start: usize, len: usize) {
+            const LINE: usize = 64;
+            let mut p = start & !(LINE - 1);
+            let end = start + len;
+            while p < end {
+                core::arch::asm!(
+                    "dc cvau, {0}",
+                    "dsb ish",
+                    "ic ivau, {0}",
+                    "dsb ish",
+                    in(reg) p,
+                    options(nostack, preserves_flags)
+                );
+                p += LINE;
+            }
+            core::arch::asm!("isb", options(nostack, preserves_flags));
+        }
+
+        unsafe { flush_code(tramp, 32) };
+
+        let page_start = entry & !(ps - 1);
+        let page_len = ((entry - page_start) + 16 + ps - 1) & !(ps - 1);
+        if unsafe {
+            mprotect(page_start as *mut c_void, page_len, PROT_READ | PROT_WRITE | PROT_EXEC)
+        } != 0
+        {
+            return Err(HookError::Syscall("mprotect", errno()));
+        }
+        unsafe {
+            let p = entry as *mut u32;
+            core::ptr::write_unaligned(p, 0x5800_0051); // ldr x17, #8
+            core::ptr::write_unaligned(p.add(1), 0xD61F_0220); // br x17
+            core::ptr::write_unaligned((entry + 8) as *mut u64, shim as u64);
+            flush_code(entry, 16);
+        }
+
+        // Optional self-check: dump the patched entry and the trampoline so a
+        // device run can prove the 16-byte jump and the continuation literal.
+        if std::env::var("UPERF_SFANALYSIS_DEBUG").is_ok() {
+            unsafe {
+                let e = entry as *const u32;
+                let t = tramp as *const u32;
+                eprintln!(
+                    "uperf-sfanalysis[dbg] {} entry={:#x} [{:#010x} {:#010x} {:#010x} {:#010x}] shim={:#x} tramp={:#x} [{:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}] cont={:#x}",
+                    name,
+                    entry,
+                    core::ptr::read_unaligned(e),
+                    core::ptr::read_unaligned(e.add(1)),
+                    core::ptr::read_unaligned(e.add(2)),
+                    core::ptr::read_unaligned(e.add(3)),
+                    shim,
+                    tramp,
+                    core::ptr::read_unaligned(t),
+                    core::ptr::read_unaligned(t.add(1)),
+                    core::ptr::read_unaligned(t.add(2)),
+                    core::ptr::read_unaligned(t.add(3)),
+                    core::ptr::read_unaligned(t.add(4)),
+                    core::ptr::read_unaligned(t.add(5)),
+                    core::ptr::read_unaligned((tramp + 24) as *const u64),
+                );
+            }
+        }
+
+        Ok(Hook {
+            name: TARGETS.iter().find(|t| **t == name).copied().unwrap_or("?"),
+            entry,
+            tramp,
+            entry_page_len: page_len,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Assembly shims.
+    //
+    // Each shim saves the callee-saved registers it touches, keeps the two
+    // argument registers the observer wants, calls the original through the
+    // trampoline, calls `observe::note(a, b, ret, kind)`, restores, and
+    // returns the original's value.
+    //
+    //   x19 = a, x20 = b, w21 = ret, w3 = kind
+    // -----------------------------------------------------------------------
+    core::arch::global_asm!(
+        ".text",
+        ".p2align 2",
+
+        ".macro SFH_SHIM name, orig, kind, ra, rb",
+        "\\name:",
+        "sub  sp, sp, #64",
+        "stp  x19, x20, [sp, #0]",
+        "stp  x21, x22, [sp, #16]",
+        "stp  x29, x30, [sp, #32]",
+        "mov  x19, \\ra",
+        "mov  x20, \\rb",
+        "adrp x17, \\orig",
+        "add  x17, x17, :lo12:\\orig",
+        "ldr  x17, [x17]",
+        "blr  x17",
+        "mov  w21, w0",
+        "mov  x0, x19",
+        "mov  x1, x20",
+        "mov  w2, w21",
+        "mov  w3, #\\kind",
+        "bl   {note}",
+        "mov  w0, w21",
+        "ldp  x19, x20, [sp, #0]",
+        "ldp  x21, x22, [sp, #16]",
+        "ldp  x29, x30, [sp, #32]",
+        "add  sp, sp, #64",
+        "ret",
+        ".endm",
+
+        ".global sfh_shim_ioctl",
+        "SFH_SHIM sfh_shim_ioctl, {orig_ioctl}, 0, x1, x2",
+        ".global sfh_shim_epoll_wait",
+        "SFH_SHIM sfh_shim_epoll_wait, {orig_epoll}, 1, x0, x3",
+        ".global sfh_shim_cond_wait",
+        "SFH_SHIM sfh_shim_cond_wait, {orig_cw}, 2, x0, x1",
+        ".global sfh_shim_cond_timedwait",
+        "SFH_SHIM sfh_shim_cond_timedwait, {orig_ctw}, 3, x0, x2",
+
+        orig_ioctl = sym SFH_ORIG_IOCTL,
+        orig_epoll = sym SFH_ORIG_EPOLL_WAIT,
+        orig_cw = sym SFH_ORIG_COND_WAIT,
+        orig_ctw = sym SFH_ORIG_COND_TIMEDWAIT,
+        note = sym crate::observe::note,
+    );
 }
 
-/// Replace `errno()` with whatever libc actually provides.
-/// `libc` 0.2 picks the right symbol per target: `__errno` on bionic
-/// (Android), `__errno_location` on glibc (host). Host tests + the device
-/// build share the same source, which is exactly what we want — the
-/// target triple on cargo is what determines the call.
-#[inline]
-fn errno() -> i32 {
-    #[cfg(target_os = "android")]
-    unsafe {
-        *libc::__errno()
-    }
-    #[cfg(not(target_os = "android"))]
-    unsafe {
-        *libc::__errno_location()
-    }
+#[cfg(target_arch = "aarch64")]
+pub use arch::install;
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn install(_name: &str) -> Result<Hook, HookError> {
+    Err(HookError::Unsupported("inline hooks are aarch64-only"))
 }
-
-// We don't actually use every libc item at runtime; keep the imports
-// tight so a future arm64 build doesn't surprise us with a missing symbol.
-#[allow(dead_code)]
-const _LIBC_PROT: (i32, i32, i32) = (PROT_READ, PROT_WRITE, PROT_EXEC);
-#[allow(dead_code)]
-const _LIBC_OFLAG: i32 = O_WRONLY;
-
-// ===================================================================
-// Tests
-// ===================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Write a fake /proc/self/maps content for tests.
-    fn write_fake_maps(root: &PathBuf, content: &str) {
-        fs::create_dir_all(root).unwrap();
-        fs::write(root.join("self_maps"), content).unwrap();
+    #[test]
+    fn pc_relative_detection() {
+        assert!(!is_pc_relative(0xA9BF_7BFD)); // stp x29, x30, [sp, #-16]!
+        assert!(!is_pc_relative(0xD104_03FF)); // sub sp, sp, #0x100
+        assert!(!is_pc_relative(0xAA1F_03E4)); // mov x4, xzr
+        assert!(is_pc_relative(0x1400_0002)); // b
+        assert!(is_pc_relative(0x9400_0002)); // bl
+        assert!(is_pc_relative(0x9000_0000)); // adrp
+        assert!(is_pc_relative(0x5800_0000)); // ldr <literal>
+        assert!(is_pc_relative(0x5400_0000)); // b.eq
+        assert!(is_pc_relative(0x3400_0000)); // cbz
+        assert!(is_pc_relative(0x3600_0000)); // tbz
     }
 
-    fn write_fake_lib(root: &PathBuf, with_sym: bool) {
-        let dir = root.join("lib");
-        fs::create_dir_all(&dir).unwrap();
-        // Minimal fake: an ELF magic + some zeros + the symbol string.
-        let mut bytes: Vec<u8> = vec![0x7f, b'E', b'L', b'F'];
-        bytes.extend_from_slice(&[0u8; 60]); // pad
-        if with_sym {
-            bytes.extend_from_slice(b"xh_refresh_loop\0");
+    #[test]
+    fn branch_target_forward_and_back() {
+        assert_eq!(branch_target(0x1400_0002, 0x1000), Some(0x1008));
+        assert_eq!(branch_target(0x17FF_FFFF, 0x1000), Some(0xFFC));
+        assert_eq!(branch_target(0xA9BF_7BFD, 0x1000), None);
+    }
+
+    #[test]
+    fn epoll_wait_stub_is_a_tail_call() {
+        // mov x4, xzr ; mov w5, #8 ; b __epoll_pwait  (bionic libc, this device)
+        let insns = [0xAA1F_03E4u32, 0x5280_0105u32, 0x1401_3D6A];
+        assert!(!is_pc_relative(insns[0]));
+        assert!(!is_pc_relative(insns[1]));
+        assert!(is_pc_relative(insns[2]));
+        assert_eq!(branch_target(insns[2], 0x96798), Some(0x96798 + 0x4F5A8));
+    }
+
+    #[test]
+    fn device_prologues_are_relocation_safe() {
+        // ioctl: sub sp,sp,#0x100 ; stp x29,x30,[sp,#0xe0] ;
+        //        str x19,[sp,#0xf0] ; add x29,sp,#0xe0
+        for insn in [0xD104_03FFu32, 0xA90E_7BFD, 0xF900_7BF3, 0x9103_83FD] {
+            assert!(!is_pc_relative(insn), "{:#010x} should be safe", insn);
         }
-        bytes.extend_from_slice(&[0u8; 4096]);
-        fs::write(dir.join("libandroidfw.so"), &bytes).unwrap();
+        // pthread_cond_wait: stp x29,x30,[sp,#-0x30]! ; str x21,[sp,#0x10] ;
+        //                    stp x20,x19,[sp,#0x20] ; mov x29,sp
+        for insn in [0xA9BD_7BFDu32, 0xF900_0BF5, 0xA902_4FF4, 0x9100_03FD] {
+            assert!(!is_pc_relative(insn), "{:#010x} should be safe", insn);
+        }
+        // pthread_cond_timedwait: stp x29,x30,[sp,#-0x40]! ; str x23,[sp,#0x10] ;
+        //                         stp x22,x21,[sp,#0x20] ; stp x20,x19,[sp,#0x30]
+        for insn in [0xA9BC_7BFDu32, 0xF900_0BF7, 0xA902_57F6, 0xA903_4FF4] {
+            assert!(!is_pc_relative(insn), "{:#010x} should be safe", insn);
+        }
     }
 
     #[test]
-    fn parse_maps_line_basic() {
-        // 7f000000-7f002000 r-xp 00000000 fd:00 1234 /system/lib64/libandroidfw.so
-        let line = b"7f000000-7f002000 r-xp 00000000 fd:00 1234 /system/lib64/libandroidfw.so\n";
-        let e = parse_maps_line(line).expect("parse");
-        assert_eq!(e.0, 0x7f000000);
-        assert_eq!(e.1, 0x7f002000);
-        assert!(e.2.contains("libandroidfw.so"));
+    fn page_size_is_sane() {
+        assert!(page_size().is_power_of_two());
+        assert!(page_size() >= 4096);
     }
 
     #[test]
-    fn parse_maps_line_anon() {
-        let line = b"7f003000-7f004000 rw-p 00000000 00:00 0 \n";
-        let e = parse_maps_line(line).expect("anon line still parses");
-        assert_eq!(e.0, 0x7f003000);
-        assert_eq!(e.1, 0x7f004000);
-    }
-
-    #[test]
-    fn parse_hex_works() {
-        assert_eq!(parse_hex(b"7f000000"), Some(0x7f000000));
-        assert_eq!(parse_hex(b"deadbeef"), Some(0xdeadbeef));
-        assert_eq!(parse_hex(b"DEADBEEF"), Some(0xdeadbeef));
-        assert_eq!(parse_hex(b"xyz"), None);
-    }
-
-    #[test]
-    fn locate_target_finds_libandroidfw() {
-        let maps = vec![
-            (0x1000usize, 0x2000usize, String::from("/system/lib64/libc.so")),
-            (0x7f000000usize, 0x7f002000usize, String::from("/system/lib64/libandroidfw.so")),
-            (0x7f003000usize, 0x7f004000usize, String::from("/system/lib64/libandroid.so")),
-        ];
-        let (s, e) = locate_target(&maps, "xh_refresh_loop").expect("found");
-        assert_eq!(s, 0x7f000000);
-        assert_eq!(e, 0x7f002000);
-    }
-
-    #[test]
-    fn locate_target_returns_none_when_absent() {
-        let maps = vec![
-            (0x1000usize, 0x2000usize, String::from("/system/lib64/libc.so")),
-        ];
-        assert!(locate_target(&maps, "xh_refresh_loop").is_none());
-    }
-
-    #[test]
-    fn install_runs_in_fake_root_without_touching_host() {
-        let dir = env::temp_dir().join(format!("uperf-sfanalysis-hook-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let maps = "\
-7f000000-7f002000 r-xp 00000000 fd:00 1234 /system/lib64/libandroidfw.so\n\
-7f003000-7f004000 rw-p 00000000 00:00 0 \n";
-        write_fake_maps(&dir, maps);
-        write_fake_lib(&dir, true);
-
-        env::set_var("UPERF_FAKE_ROOT", dir.to_str().unwrap());
-        let result = install("xh_refresh_loop");
-        env::remove_var("UPERF_FAKE_ROOT");
-
-        assert!(result.is_ok(), "install should succeed under fake root: {:?}", result);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn install_errors_when_symbol_not_in_fake_lib() {
-        let dir = env::temp_dir().join(format!("uperf-sfanalysis-hook-no-symbol-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let maps = "7f000000-7f002000 r-xp 00000000 fd:00 1234 /system/lib64/libandroidfw.so\n";
-        write_fake_maps(&dir, maps);
-        write_fake_lib(&dir, /* with_sym */ false);
-
-        env::set_var("UPERF_FAKE_ROOT", dir.to_str().unwrap());
-        let result = install("xh_refresh_loop");
-        env::remove_var("UPERF_FAKE_ROOT");
-
-        assert!(result.is_err(), "should reject fake lib without symbol");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn install_respects_disable_env() {
-        env::set_var("UPERF_SFANALYSIS_DISABLE", "1");
-        let result = install("xh_refresh_loop");
-        env::remove_var("UPERF_SFANALYSIS_DISABLE");
-        assert!(matches!(result, Err(HookError::Disabled(_))));
-    }
-
-    #[test]
-    fn install_requires_libandroidfw() {
-        let dir = env::temp_dir().join(format!(
-            "uperf-sfanalysis-hook-no-lib-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        // maps without libandroidfw.so, with only libc.
-        let maps = "10000000-10001000 r-xp 00000000 fd:00 5678 /system/lib64/libc.so\n";
-        write_fake_maps(&dir, maps);
-        env::set_var("UPERF_FAKE_ROOT", dir.to_str().unwrap());
-        let result = install("xh_refresh_loop");
-        env::remove_var("UPERF_FAKE_ROOT");
-        // install_fake only checks the lib file contents; if no
-        // libandroidfw.so exists at UPERF_FAKE_ROOT/lib/libandroidfw.so it
-        // returns Err(Patch(_)). That's a tighter error than the device
-        // path's Err(Range(_)), but the test is verifying "no libandroidfw
-        // means install fails" — both errors satisfy that.
-        assert!(result.is_err(), "install should fail without libandroidfw");
-        let _ = fs::remove_dir_all(&dir);
+    fn hook_error_is_displayable() {
+        let e = HookError::RelocationUnsafe { name: "b".into(), insn: 0x1400_0000 };
+        assert!(format!("{}", e).contains("pc-relative"));
+        let e = HookError::Unsupported("x86_64");
+        assert!(format!("{}", e).contains("unsupported"));
     }
 }
