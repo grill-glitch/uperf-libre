@@ -1,23 +1,24 @@
-# M9 device verification — raw run, alioth
+# M9 device verification — raw run, alioth (this build installed)
 #
 # Device: alioth (SM8250, crDroid Android 16, kernel 4.19.325-cip131-st15-perf,
 #         KernelSU-Next, SELinux Enforcing)
-# Build:  magisk/bin/uperf 2256520 bytes (md5 49f3962992f9d9fee4adc30478c03fda),
-#         magisk/script/uperf_watchdog.sh (md5 200a0019b7802befb87c890852359fd6)
+# Build:  bin/uperf 580d6ff0ee1ac499b28027e8617fb465,
+#         script/uperf_watchdog.sh 8986602ebeca4fc8f1d3098bbebf595f
 # Command: adb shell su -c 'sh /data/local/tmp/m9/m9-device-verify.sh'
-# Note: this is the unedited stdout; the harness also writes /data/local/tmp/m9/.completed
-#       so a truncated log (dropped adb link, killed reader) cannot pass for a finished run.
+# Note: the harness writes /data/local/tmp/m9/.completed so a truncated log
+#       (dropped adb link, killed reader) cannot pass for a finished run.
 
 == M9 device verification: alioth, kernel 4.19.325-cip131-st15-perf-g1899485b41b7, Android 16, Enforcing
    real governors before: policy0=schedutil policy4=schedutil policy7=schedutil 
-   test binary: /data/local/tmp/m9/fake_uperf (2256520 bytes)
+   test binary md5 verified against the driver's build (580d6ff0ee1ac499b28027e8617fb465)
+   test binary: /data/local/tmp/m9/fake_uperf (2260984 bytes)
 
 == part 1: does the scan judge the real daemon correctly? (dry run, read-only)
-   pid=6275 ppid=1 cmdline=[uperf                                                                                                           ] exe=/data/adb/modules/uperf/bin/uperf
-    ok   pid 6275: exe survives the cmdline rewrite
-   pid=6276 ppid=6275 cmdline=[uperf                                                                                                           ] exe=/data/adb/modules/uperf/bin/uperf
-    ok   pid 6276: exe survives the cmdline rewrite
-    ok   the installed daemon is a supervisor (6275) + worker (6276) pair
+   pid=11540 ppid=1 cmdline=[uperf                                                                                                           ] exe=/data/adb/modules/uperf/bin/uperf
+    ok   pid 11540: exe survives the cmdline rewrite
+   pid=11541 ppid=11540 cmdline=[uperf                                                                                                           ] exe=/data/adb/modules/uperf/bin/uperf
+    ok   pid 11541: exe survives the cmdline rewrite
+    ok   the installed daemon is a supervisor (11540) + worker (11541) pair
     ok   the watchdog calls the real pair healthy, with the real pids
     ok   it reads the real cpufreq tree: nothing armed
     ok   no false unhealthy sample in 7 s of sampling
@@ -42,21 +43,23 @@
     ok   no zombie left behind
 
 == part 3b: supervisor SIGKILLed -> the orphaned worker disarms on SIGTERM
-   supervisor=[14568] worker=[14569]
+   supervisor=[12020] worker=[12022]
     ok   no worker left: the survivor is classified as a lone supervisor
-    ok   the survivor is the old worker (pid 14569)
+    ok   the survivor is the old worker (pid 12022)
     ok   the orphan was seen as unhealthy
-    ok   the watchdog retired the orphan with SIGTERM (pid 14569)
+    ok   the watchdog retired the orphan with SIGTERM (pid 12022)
     ok   the orphan handed the policies back itself
     ok   every fake policy is back to schedutil
     ok   no zombie left behind
 
 == part 4: watchdog cost, and the control that the real CPU was never touched
     ok   read the watchdog's own cpu time
-   watchdog cpu: 67 ticks = 670 ms over 60 s at the shipped 15 s cadence -> 1.116 % of one core (CLK_TCK=100)
+    ok   the daemon rotated its log (daemon_log.1.txt exists)
+    ok   the base log stayed under the cap (6302 bytes <= 128 KiB)
+   watchdog cpu: 51 ticks = 510 ms over 60 s at the shipped 15 s cadence -> 0.850 % of one core (CLK_TCK=100)
     ok   under 1.2 s of cpu in 60 s (2% of one core) at the shipped cadence
     ok   the test daemon is fully cleaned up
     ok   the real cpufreq governors are byte-identical to before
 
-== M9 device verification: 31 passed, 0 failed
+== M9 device verification: 33 passed, 0 failed
    harness dir: /data/local/tmp/m9

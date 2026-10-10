@@ -1,0 +1,55 @@
+# M9 boot verification — raw run, alioth (installed via ksud module install + restart)
+#
+# Device: alioth (SM8250, crDroid Android 16, kernel 4.19.325-cip131-st15-perf,
+#         KernelSU-Next, SELinux Enforcing)
+# Build:  the same 580d6ff0 build, staged by ksud and hot-synced into the live module
+#         directory (md5s compared staged == live == repo before restarting).
+# Command: adb shell su -c 'sh /data/local/tmp/m9-device-boot-verify.sh'
+# Covers what the pre-install harness cannot: KernelSU's service.sh path starting the
+# watchdog and it surviving boot, the WebUI restart lock handover, and the log bounds.
+
+== M9 boot verification: alioth, kernel 4.19.325-cip131-st15-perf-g1899485b41b7, uptime 947 s
+   boot_id=6087d780-31c2-423f-ad4a-43f9251331bf
+
+== part 1: the installed module carries the M9 files
+    ok   the watchdog script is installed
+    ok   the daemon binary is installed
+   binary: 580d6ff0ee1ac499b28027e8617fb465  /data/adb/modules/uperf/bin/uperf
+   watchdog: 8986602ebeca4fc8f1d3098bbebf595f  /data/adb/modules/uperf/script/uperf_watchdog.sh
+
+== part 2: the daemon and the watchdog both came up from service.sh
+   daemon: supervisor=[13547] worker=[13549]
+    ok   the daemon is running (supervisor + worker)
+    ok   uperf.state is from this boot
+    ok   uperf.state says running
+   takeover=off armed=0
+   watchdog: pid=13579 start_ticks=93624 owner=13579:6087d780-31c2-423f-ad4a-43f9251331bf:93624
+    ok   a watchdog owns the lock and is alive (pid 13579)
+    ok   that pid really runs the watchdog ([sh /data/adb/modules/uperf/script/uperf_watchdog.sh ])
+    ok   the lock's start_ticks match the live process
+    ok   uperf_watchdog.state is from this boot
+    ok   the watchdog calls the daemon healthy
+    ok   it is still sampling (last write 937400 ms, now 948270 ms, 10 s ago)
+    ok   the watchdog logged its start this boot
+    ok   no unhealthy sample since it started
+
+== part 3: a WebUI-style restart hands the lock over
+    ok   webui.sh restart exits 0
+   daemon now: supervisor=[13760] worker=[13762]
+    ok   the daemon is back up after the restart
+    ok   uperf.state is owned by the live worker
+    ok   and still says running (no stale stop landed)
+   watchdog: old=13579 new=13792
+    ok   a watchdog owns the lock again (pid 13792)
+    ok   it is a *new* watchdog, not the old one
+    ok   the old watchdog is gone (no double supervision)
+    ok   the new watchdog reports the daemon healthy
+   restart output: restart.before=2 chown: /proc/sys/fs/inotify/max_queued_events: Operation not permitted chmod: /proc/sys/fs/inotify/max_queued_events: Operation not permitted chmod: /proc/sys/fs/inotify/max_queued_ev
+
+== part 4: the log is bounded
+   uperf_log.txt: 159895 bytes
+   uperf_log.txt.bak: 160962 bytes
+    ok   the current log is under 8 MiB (159895 bytes)
+    ok   the backup is under the script's cap (160962 bytes)
+
+== M9 boot verification: 23 passed, 0 failed

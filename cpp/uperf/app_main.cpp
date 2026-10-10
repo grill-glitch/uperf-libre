@@ -30,6 +30,7 @@
 // (cpp/include/uperf_rs.h).
 
 #include <getopt.h>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -38,7 +39,7 @@
 #include <unistd.h>
 #include <vector>
 
-#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/spdlog.h>
 
 #include "m0_event_tap.h"
@@ -74,10 +75,38 @@ static pid_t old_pid;
 
 // ---------------------------------------------------------------- logger
 
+// The log is bounded in-process. Measured on alioth: the daemon appended forever and
+// reached 34 MB in a day, with a 138 MB `uperf_log.txt.bak` beside it — `uperf_start`
+// moves the file aside on every start and nothing ever trimmed either one. The writer
+// is the only place that can bound it without re-reading a hundred megabytes: a script
+// cannot rotate a file the daemon holds open, and trimming a 138 MB file on /sdcard at
+// boot costs more than the space it frees.
+//
+// `UPERF_LOG_MAX_BYTES` overrides the per-file budget (used by the device harness to
+// force a rotation without writing 4 MB).
+static constexpr uint64_t LOG_MAX_BYTES_DEFAULT = 4 * 1024 * 1024;
+static constexpr size_t LOG_MAX_FILES = 2; // uperf_log.txt + .1 + .2
+
+static uint64_t LogMaxBytes(void) {
+    const char *env = ::getenv("UPERF_LOG_MAX_BYTES");
+    if (env != nullptr && *env != '\0') {
+        char *end = nullptr;
+        unsigned long long v = ::strtoull(env, &end, 10);
+        // Ignore nonsense (and anything under 4 KiB, which would rotate per line).
+        // The device harness sets 8 KiB: the daemon writes 30-60 KiB/min regardless of
+        // level (the volume is activity-bound, not level-bound — measured at info and
+        // at trace), so a small cap is what makes a rotation observable in a minute.
+        if (end != env && v >= 4 * 1024) {
+            return v;
+        }
+    }
+    return LOG_MAX_BYTES_DEFAULT;
+}
+
 static void InitLogger(void) {
     auto logger = spdlog::default_logger();
     if (logFile.empty() == false) {
-        auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFile, false);
+        auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(logFile, LogMaxBytes(), LOG_MAX_FILES);
         logger->sinks().emplace_back(sink);
     }
     logger->set_pattern("%H:%M:%S %L %v");

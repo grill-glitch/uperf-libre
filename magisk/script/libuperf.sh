@@ -155,6 +155,27 @@ uperf_stop() {
     uperf_restore_governors
 }
 
+# Keep the previous run's log, but bounded. `uperf_start` moves the log aside on
+# every start, and nothing ever trimmed the backup: measured on alioth, 138 MB of
+# `/sdcard` held by `uperf_log.txt.bak`. Trimming a file that size on /sdcard at boot
+# would cost more than the space it frees, so an oversized backup is dropped instead
+# of read. The current log is bounded by the daemon itself (spdlog's rotating sink,
+# `UPERF_LOG_MAX_BYTES`); this only covers the copy the script makes.
+UPERF_LOG_BACKUP_MAX_BYTES="${UPERF_LOG_BACKUP_MAX_BYTES:-16777216}"
+
+uperf_trim_log_backup() {
+    local bak="$USER_PATH/uperf_log.txt.bak" size
+    [ -f "$bak" ] || return 0
+    size="$(wc -c <"$bak" 2>/dev/null)"
+    case "$size" in
+    '' | *[!0-9]*) return 0 ;;
+    esac
+    [ "$size" -le "$UPERF_LOG_BACKUP_MAX_BYTES" ] && return 0
+    rm -f "$bak" 2>/dev/null
+    echo "uperf: dropped an oversized log backup ($size > $UPERF_LOG_BACKUP_MAX_BYTES bytes)"
+    return 0
+}
+
 # The user directory is seeded exactly once, at install time (`script/setup.sh`),
 # and the installed module deliberately keeps no copy of `config/` (setup.sh removes
 # it). Nothing else recreates it — so if the directory is ever lost, the daemon starts
@@ -191,6 +212,7 @@ uperf_start() {
     lock_val "1024" /proc/sys/fs/inotify/max_user_instances
 
     mv $USER_PATH/uperf_log.txt $USER_PATH/uperf_log.txt.bak
+    uperf_trim_log_backup
     if [ -f $BIN_PATH/libc++_shared.so ]; then
         ASAN_LIB="$(ls $BIN_PATH/libclang_rt.asan-*-android.so)"
         export LD_PRELOAD="$ASAN_LIB $BIN_PATH/libc++_shared.so"

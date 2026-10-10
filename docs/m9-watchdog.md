@@ -11,13 +11,15 @@ recoverable from outside it. Deliverables:
 | `magisk/uninstall.sh` | stops the watchdog by pid before the module files disappear |
 | `magisk/script/webui.sh` | `status` also reports `daemon.state`/`daemon.armed`/`watchdog.*` |
 | `scripts/test_watchdog_host.sh` | host harness, 9 cases / 55 assertions |
-| `scripts/m9-device-verify.sh` | device harness (on the phone, via `su -c`), 31 assertions |
+| `scripts/m9-device-verify.sh` | device harness (on the phone, via `su -c`), 33 assertions |
+| `scripts/m9-device-boot-verify.sh` | post-install/post-boot harness, 23 assertions |
 
-Status: **[V] host-verified** (cargo + the host harness) and **[V]
-device-verified** (alioth, KernelSU-Next, Enforcing — §5). Still unverified: that
-KernelSU/Magisk keep the watchdog alive across the `service.sh` exit, and the
-WebUI-restart lock handover; both need a module install plus a restart, a separate
-step.
+Status: **[V] host-verified** (cargo + the host harness: 10 cases / 60 assertions),
+**[V] device-verified** (alioth, KernelSU-Next, Enforcing: `m9-device-verify.sh`,
+33 assertions) and **[V] install+boot verified** on the same device
+(`ksud module install` + a restart: `m9-device-boot-verify.sh`, 23 assertions —
+the watchdog is started by KernelSU's `service.sh` path, survives, a WebUI restart
+hands the lock over, and the status file survives that restart).
 
 ## 1. The problem
 
@@ -120,7 +122,10 @@ A **stale `state=running` with no live process is the documented signature of a
 kill** — the state the watchdog reacts to. That is also why `uperf_rs_stop`
 writes `state=stopped`: after a clean stop the file says so.
 
-`<USER_PATH>/uperf_watchdog.state` — written by the watchdog: `state`
+`<USER_PATH>/uperf_watchdog.state` — written by the watchdog **every sample**, even
+when nothing changes (`updated_uptime_ms` is the evidence that a supervisor with
+nothing to report is still alive; a log line every 15 s would drown the log). Fields:
+`state`
 (`starting`/`running`/`recovering`/`restarted`/`restart-failed`/`restored`/
 `gave-up`/`stopped`), `restarts`, `interval_s`, `max_restarts`, the last
 sup/worker/armed snapshot, `exe`, `pid`/`boot_id`/`start_ticks` and
@@ -236,22 +241,49 @@ treated as unhealthy and collapsed. That accident is now a case of its own (and
 each case kills leftovers first, so one case cannot silently change another's
 premise).
 
+**[V] Device, install + boot** (`scripts/m9-device-boot-verify.sh`, **23
+assertions, 0 failures**, raw log in
+[`docs/m9-boot-run-alioth.txt`](./m9-boot-run-alioth.txt)). The module was installed
+with `ksud module install` (staged binary md5 == the local build) and the device
+restarted:
+
+* **The watchdog is started by KernelSU's own path and survives it.** 60 s after
+  boot: `watchdog started pid=6812 boot=<this boot>` at 11:33:17, then
+  `healthy: sup=[6466] workers=[6467] armed=[]`; the lock owner
+  `6812:<boot_id>:3583` matches the live process' `start_ticks`, its cmdline is
+  `sh /data/adb/modules/uperf/script/uperf_watchdog.sh` (so the `setsid` launch
+  works), the state file carries *this* boot's `boot_id`, and it was still
+  sampling 14 s before the check (i.e. it is ticking at the 15 s cadence, not a
+  stale file).
+* `uperf.state` from the installed build reports `state=running`,
+  `takeover=off`, `armed=0` — the new `status.rs` shipped and works.
+* **The WebUI restart hands the lock over:** `webui.sh restart` → daemon back,
+  lock owned by a *new* watchdog, the old one gone, and the new instance reporting
+  the daemon healthy. No double supervision.
+* **The status file survives a fast restart.** The boot run caught the opposite:
+  `uperf.state` said `stopped` beside a running daemon. `uperf_stop` (SIGTERM,
+  `sleep 1`) and `uperf_start` overlap — the *previous* worker's `uperf_rs_stop()`
+  joins its threads for up to 2 s, so its `state=stopped` write can land after the
+  new worker claimed the file, and since the takeover is off by default the new
+  daemon never writes again: the file lies for the rest of the session. The stop
+  paths now go through `status::write_if_owner()`, which refuses to touch a file
+  whose `pid=` is not this process. Verified two ways: five consecutive
+  `webui.sh restart`s each ended `state=running` with `pid` equal to the live
+  worker (the failing condition, measured in a loop), and the boot harness asserts
+  that ownership on every run.
+
 **[U] Device items, still open:**
 
-* that KernelSU/Magisk keep the watchdog alive across the `service.sh` exit
-  (`setsid` is used when present) and re-reap it properly — needs a module install
-  plus a restart;
-* the WebUI restart path (`webui.sh restart` → `uperf_stop` + `uperf_start`):
-  the lock is released by `uperf_watchdog_stop`, and a new instance starts; the
-  poll-then-drop-lock fallback was not exercised against a slow watchdog;
-* that the WebUI status contract holds on device (host-verified through the
-  `UPERF_WEBUI_USER_PATH` / `UPERF_WEBUI_FLAG_PATH` seams; the WebUI app itself
-  does not display the new keys yet — they are for `webui.sh status`, adb, and
-  future UI work);
 * the `comm` filter's failure mode: a daemon whose process name is neither the
   default nor `UPERF_WATCHDOG_COMM` looks absent. It is only a *filter*, so the
   consequence is a wrong verdict rather than an action on a stranger's process —
   but it is an assumption about a name dfps sets in `cpp/uperf/app_main.cpp`.
+* the WebUI *app* does not display the new status keys yet (the keys themselves are
+  host- and device-verified through `webui.sh status`; surfacing them is UI work);
+* the poll-then-drop-lock fallback in `uperf_watchdog_stop` was not exercised
+  against a watchdog that refuses to die within 5 s;
+* a full day of uptime (the log cap's long-run behaviour is inferred from the
+  rotation being size-driven — see `docs/m10-log-cap.md`).
 
 ## 6. Knobs
 
