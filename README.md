@@ -290,10 +290,16 @@ see [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md) and the
   reproducible to <0.0015 against the upstream printout), the
   PL1/PL2 pool arithmetic, the scene → sysfs writer pipeline, and the
   inotify-based hot reload of `cur_powermode.txt` / `perapp_powermode.txt`.
-- **Supervision (M9)**: host-verified — `cargo test --release` (211 tests) and
-  `sh scripts/test_watchdog_host.sh` (48 assertions, 8 cases against the real
-  script). Device verification of the watchdog is still pending: the `/proc`
-  identity argument, the `/sdcard` rename, and the teardown of a real daemon. See
+- **Supervision (M9)**: host-verified (`cargo test --release`, 211 tests; and
+  `sh scripts/test_watchdog_host.sh`, 9 cases / 55 assertions against the real
+  script) and **device-verified** on alioth (`scripts/m9-device-verify.sh`, 31
+  assertions): `/proc/<pid>/exe` survives dfps' cmdline rewrite, the dead-man path
+  restores a real armed daemon after SIGKILL, an orphaned worker disarms itself
+  after the watchdog's SIGTERM, and the watchdog costs 0.93 % of one core at the
+  shipped 15 s cadence. Three device-only defects were found and fixed on the way
+  (the scan's cost, the process-name filter, a no-trailing-newline read). Not yet
+  verified: the watchdog surviving `service.sh` under KernelSU/Magisk, and the
+  WebUI-restart lock handover. See
   [`docs/m9-watchdog.md`](./docs/m9-watchdog.md) §5.
 - **Best-effort**: latency smoothing (one OPP per sample unless the
   predict branch fires — upstream describes a continuous shared latency

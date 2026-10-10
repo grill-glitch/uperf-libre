@@ -48,7 +48,11 @@
 # reacts to "the daemon is gone while the takeover is still armed", and to "the
 # daemon is gone at all" while the module is meant to be running.
 #
-# Test seams (all default to the device layout): UPERF_WATCHDOG_{PROC_ROOT,
+# `UPERF_WATCHDOG_DRY_RUN=1` samples and reports but never acts: no teardown, no
+# restore, no restart. Same idea as `UPERF_SCHED_DRY_RUN` on the Rust side — the
+# only way to watch the judgement on a device whose daemon must not be touched.
+#
+# Test seams (all default to the device layout): UPERF_WATCHDOG_{PROC_ROOT,COMM,
 # CPUFREQ_ROOT,EXE,USER_PATH,FLAG_PATH,LOG,STATE,INTERVAL,RETRY_INTERVAL,GRACE,
 # MAX_RESTARTS,TEARDOWN_TICKS,VERIFY_WAIT,STUB}. `scripts/test_watchdog_host.sh`
 # drives the whole policy on a host machine with a fake /proc + fake cpufreq tree.
@@ -63,6 +67,17 @@ USER_PATH="${UPERF_WATCHDOG_USER_PATH:-$USER_PATH}"
 PROC_ROOT="${UPERF_WATCHDOG_PROC_ROOT:-/proc}"
 CPUFREQ_ROOT="${UPERF_WATCHDOG_CPUFREQ_ROOT:-${UPERF_CPUFREQ_ROOT:-/sys/devices/system/cpu/cpufreq}}"
 DAEMON_EXE="${UPERF_WATCHDOG_EXE:-$BIN_PATH/uperf}"
+# The process name the kernel reports for our processes. It is NOT the image's file
+# name: dfps sets it to a fixed string (`PROC_NAME` in cpp/uperf/app_main.cpp) for
+# both the supervisor and the worker, so a copied/renamed binary still calls itself
+# `uperf` (measured on alioth: image /data/local/tmp/m9/fake_uperf, comm `uperf`).
+#
+# The name is what makes the scan affordable: reading `comm` is a shell builtin,
+# while a `readlink` per pid costs ~13 ms on this device (measured: a full 1289-pid
+# exe scan took 19.9 s, so the watchdog never finished a single sample). `exe` stays
+# the authority on identity — comm is only a filter, so a process that merely *names*
+# itself `uperf` is still rejected.
+DAEMON_COMM="${UPERF_WATCHDOG_COMM:-uperf}"
 WD_LOG="${UPERF_WATCHDOG_LOG:-$USER_PATH/uperf_watchdog.log}"
 WD_STATE="${UPERF_WATCHDOG_STATE:-$USER_PATH/uperf_watchdog.state}"
 WD_LOCK_DIR="$FLAG_PATH/uperf_watchdog.lock"
@@ -113,23 +128,36 @@ wd_now_ms() {
     awk '{printf "%d", $1 * 1000}' /proc/uptime 2>/dev/null
 }
 
-# Field $2 of `/proc/<pid>/stat`, counted *after* the `(comm)` field — which may
-# itself contain spaces and parentheses — so a plain `awk '{print $N}'` is wrong.
-# After `(comm) `: 1 state, 2 ppid, ..., 20 starttime (field 22 overall).
-wd_stat_field() {
-    sed -n 's/^.*) //p' "$PROC_ROOT/$1/stat" 2>/dev/null | awk -v i="$2" '{print $i}'
+# `/proc/<pid>/stat` -> WD_PPID and WD_START_TICKS, in one read and no forks.
+#
+# The fields are counted *after* the `(comm)` field, which may itself contain spaces
+# and parentheses, so they are located from the last `)`. After `(comm) `: 1 state,
+# 2 ppid, ..., 20 starttime (field 22 overall). `read` + parameter expansion +
+# positional parameters are all shell builtins; the `sed|awk` version this replaces
+# cost two forks per call, and a fork is ~10 ms here.
+wd_stat_fields() {
+    local line
+    WD_PPID=""
+    WD_START_TICKS=""
+    IFS= read -r line <"$PROC_ROOT/$1/stat" 2>/dev/null || return 1
+    # shellcheck disable=SC2086 # word splitting is the point
+    set -- ${line##*) }
+    WD_PPID="$2"
+    WD_START_TICKS="${20}"
+    return 0
 }
-
-wd_ppid() { wd_stat_field "$1" 2; }
-
-wd_start_ticks() { wd_stat_field "$1" 20; }
 
 # The module binary's image. `exe` survives the cmdline rewrite both of our
 # processes go through, which is why identity is taken from here and not from the
 # process name. A module update replaces the file under a running process, so the
 # ` (deleted)` suffix readlink then reports is stripped.
 wd_exe() {
-    readlink "$PROC_ROOT/$1/exe" 2>/dev/null | sed 's/ (deleted)$//'
+    local exe
+    exe="$(readlink "$PROC_ROOT/$1/exe" 2>/dev/null)"
+    case "$exe" in
+    *" (deleted)") exe="${exe% (deleted)}" ;;
+    esac
+    echo "$exe"
 }
 
 # Classify every process running $DAEMON_EXE.
@@ -137,10 +165,15 @@ wd_exe() {
 #   WD_WORK its workers (the forked app that owns the governor)
 #   WD_ALL  both, for teardown
 wd_scan() {
-    local p pid exe ppid
+    local p pid comm exe
     WD_ALL=""
     for p in "$PROC_ROOT"/[0-9]*; do
-        [ -d "$p" ] || continue
+        # `read` from /proc/<pid>/comm first: a builtin, so ~1289 pids cost ~0.2 s
+        # instead of ~20 s of `readlink|sed`. Only a name match pays for the
+        # `readlink`, and the exe comparison below is what actually decides.
+        comm=""
+        IFS= read -r comm <"$p/comm" 2>/dev/null
+        [ "$comm" = "$DAEMON_COMM" ] || continue
         pid="${p##*/}"
         exe="$(wd_exe "$pid")"
         [ "$exe" = "$DAEMON_EXE" ] || continue
@@ -150,9 +183,9 @@ wd_scan() {
     WD_SUP=""
     WD_WORK=""
     for pid in $WD_ALL; do
-        ppid="$(wd_ppid "$pid")"
+        wd_stat_fields "$pid" || continue
         case " $WD_ALL " in
-        *" $ppid "*) WD_WORK="$WD_WORK $pid" ;;
+        *" $WD_PPID "*) WD_WORK="$WD_WORK $pid" ;;
         *) WD_SUP="$WD_SUP $pid" ;;
         esac
     done
@@ -162,16 +195,23 @@ wd_scan() {
 # Policies currently reading `userspace` — the live sysfs value. This, not the
 # status file and not a recorded value, is the authority on whether a takeover is
 # in effect.
-wd_armed() {
-    local d
+# Names of the policies currently reading `userspace`, space separated. `read`
+# instead of `cat` (one fork per policy per sample, on a hot loop).
+wd_armed_list() {
+    local d g out=""
     for d in "$CPUFREQ_ROOT"/policy*; do
         [ -f "$d/scaling_governor" ] || continue
-        [ "$(cat "$d/scaling_governor" 2>/dev/null)" = "userspace" ] || continue
-        echo "${d##*/}"
+        # No `|| continue` on the read: `read` returns non-zero when the file ends
+        # without a newline, and the daemon writes this value with no newline at all
+        # (`fs::write(.., "userspace")`). Treating that as a failure reported
+        # `armed=[]` on a device where every policy was armed.
+        g=""
+        IFS= read -r g <"$d/scaling_governor" 2>/dev/null
+        [ "$g" = "userspace" ] || continue
+        out="$out${d##*/} "
     done
+    echo "$out"
 }
-
-wd_armed_list() { wd_armed | tr '\n' ' '; }
 
 # ---------------------------------------------------------------- owner lock
 
@@ -188,9 +228,9 @@ wd_lock_owner_alive() {
     [ "$boot" = "$WD_BOOT_ID" ] || return 1
     [ -n "$start" ] || return 1
     [ "$start" != "0" ] || return 1
-    cur="$(wd_start_ticks "$pid")"
-    [ -n "$cur" ] || return 1
-    [ "$cur" = "$start" ] || return 1
+    wd_stat_fields "$pid" || return 1
+    [ -n "$WD_START_TICKS" ] || return 1
+    [ "$WD_START_TICKS" = "$start" ] || return 1
     return 0
 }
 
@@ -263,6 +303,7 @@ wd_teardown() {
     for pid in $WD_SUP $WD_WORK; do
         kill -TERM "$pid" 2>/dev/null
     done
+    [ -n "$WD_SUP$WD_WORK" ] && wd_log "SIGTERM -> [$(echo $WD_SUP $WD_WORK)]"
     i=0
     while [ "$i" -lt "$WD_TEARDOWN_TICKS" ]; do
         wd_scan
@@ -313,6 +354,11 @@ wd_recover() {
         wd_restore_governors
         wd_state_write "gave-up" "restart budget spent; platform governor in charge"
         WD_OBSERVE_ONLY=1
+        # Sticky: from here on the state file keeps saying `gave-up` however many
+        # unhealthy samples follow. A later `unhealthy` write would erase the one
+        # fact a reader needs (why the platform governor is in charge), and the
+        # stop path would lose it too.
+        WD_GAVE_UP=1
         return 1
     fi
 
@@ -361,13 +407,18 @@ main() {
     fi
 
     WD_BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
-    WD_SELF_START="$(wd_start_ticks $$)"
+    wd_stat_fields "$$"
+    WD_SELF_START="$WD_START_TICKS"
     WD_OWNED=0
     WD_RESTARTS=0
     WD_OBSERVE_ONLY=0
     WD_MISS=0
     WD_STATE_CUR=""
     WD_LAST_WRITTEN=""
+    WD_DRY_RUN=0
+    WD_GAVE_UP=0
+    [ "${UPERF_WATCHDOG_DRY_RUN:-0}" = "1" ] && WD_DRY_RUN=1
+    [ "$WD_DRY_RUN" = "1" ] && WD_OBSERVE_ONLY=1
     WD_SUP=""
     WD_WORK=""
     WD_ALL=""
@@ -383,7 +434,7 @@ main() {
     fi
     trap 'wd_shutdown "signalled"' TERM INT
 
-    wd_log "watchdog started pid=$$ boot=$(echo "$WD_BOOT_ID" | cut -c1-8) interval=${WD_INTERVAL}s retry=${WD_RETRY_INTERVAL}s grace=${WD_GRACE} max_restarts=${WD_MAX_RESTARTS} exe=$DAEMON_EXE"
+    wd_log "watchdog started pid=$$ boot=$(echo "$WD_BOOT_ID" | cut -c1-8) interval=${WD_INTERVAL}s retry=${WD_RETRY_INTERVAL}s grace=${WD_GRACE} max_restarts=${WD_MAX_RESTARTS} dry_run=$WD_DRY_RUN exe=$DAEMON_EXE"
     wd_state_write "starting" "watchdog up, waiting for the daemon"
 
     # `uperf_start` returns once the daemon has forked and waited 2 s; give it a
@@ -417,7 +468,15 @@ main() {
             WD_MISS=$((WD_MISS + 1))
             wd_log "unhealthy sample $WD_MISS/$WD_GRACE: sup_n=$sup_n work_n=$work_n armed=[$WD_LAST_ARMED]"
             WD_STATE_CUR="unhealthy"
-            if [ "$WD_MISS" -ge "$WD_GRACE" ] && [ "$WD_OBSERVE_ONLY" = "0" ]; then
+            if [ "$WD_OBSERVE_ONLY" = "1" ]; then
+                # Dry run (or a spent budget): report the verdict, change nothing.
+                if [ "$WD_GAVE_UP" = "1" ]; then
+                    wd_state_write "gave-up" "still unhealthy at sample $WD_MISS; platform governor in charge (budget spent)"
+                else
+                    wd_state_write "unhealthy" "sample $WD_MISS/$WD_GRACE (observe-only)"
+                fi
+                wd_sleep "$WD_RETRY_INTERVAL"
+            elif [ "$WD_MISS" -ge "$WD_GRACE" ]; then
                 WD_MISS=0
                 wd_recover
                 wd_sleep "$WD_RETRY_INTERVAL"
