@@ -18,6 +18,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod cpu_task;
+pub mod ctl_socket;
 pub mod dfps_rs;
 pub mod ffi;
 pub mod foreground;
@@ -360,6 +361,24 @@ pub(crate) extern "C" fn uperf_rs_start(
     }
 
 
+    // ⑦ control-plane socket (opt-in `UPERF_CTL_SOCKET`, e.g. `@uperf-ctl`). The daemon
+    // connects out and performs the token/version/pid handshake; with no socket
+    // configured this is a no-op.
+    if crate::ctl_socket::CtlTask::socket_addr().is_some() {
+        let cfg_dir = {
+            let cfg_str = cfg.to_string_lossy().to_string();
+            std::path::Path::new(&cfg_str).parent().map(|p| p.to_path_buf())
+        };
+        let mut guard = ctl_slot().lock();
+        if let Some(mut prev) = guard.take() {
+            prev.stop();
+        }
+        match crate::ctl_socket::CtlTask::spawn(cfg_dir, |m: &str| log_msg(m)) {
+            Some(t) => *guard = Some(t),
+            None => log_msg("Rust: ctl-socket task could not start"),
+        }
+    }
+
     // Start the file watcher: cur_powermode.txt / perapp_powermode.txt preset
     // switching and the single-byte sfanalysis.hint feed.
     if let Some(c) = cfg_for_governor.as_ref() {
@@ -432,6 +451,12 @@ pub(crate) extern "C" fn uperf_rs_stop() {
             t.stop();
         }
     }
+    {
+        let mut guard = ctl_slot().lock();
+        if let Some(mut t) = guard.take() {
+            t.stop();
+        }
+    }
     // Stop the dfps timer thread. The scheduler itself stays in its OnceLock;
     // `uperf_rs_start` on a reload replaces the dispatcher's clone.
     if let Some(s) = DFPS_SCHED.get() {
@@ -464,6 +489,8 @@ static SCHED_TASK: OnceLock<PMutex<Option<sched_task::SchedTask>>> = OnceLock::n
 static WATCH_TASK: OnceLock<PMutex<Option<watch_task::WatchTask>>> = OnceLock::new();
 /// ⑤ direct-binder frame source (opt-in). Held so `uperf_rs_stop` stops its thread.
 static SF_BINDER_TASK: OnceLock<PMutex<Option<sf_binder::FrameTask>>> = OnceLock::new();
+/// ⑦ control-plane socket (opt-in `UPERF_CTL_SOCKET`).
+static CTL_TASK: OnceLock<PMutex<Option<ctl_socket::CtlTask>>> = OnceLock::new();
 /// dfps-rs scheduler, mounted from grill-glitch/dfps-rewrite as a subtree at
 /// `rust/uperf-core/src/dfps_rs/`. Held so `uperf_rs_stop` can stop its timer
 /// thread; the dispatcher holds its own clone.
@@ -475,6 +502,10 @@ fn watch_task_slot() -> &'static PMutex<Option<watch_task::WatchTask>> {
 
 fn sf_binder_slot() -> &'static PMutex<Option<sf_binder::FrameTask>> {
     SF_BINDER_TASK.get_or_init(|| PMutex::new(None))
+}
+
+fn ctl_slot() -> &'static PMutex<Option<ctl_socket::CtlTask>> {
+    CTL_TASK.get_or_init(|| PMutex::new(None))
 }
 
 fn sched_task_slot() -> &'static PMutex<Option<sched_task::SchedTask>> {

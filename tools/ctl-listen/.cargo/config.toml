@@ -1,0 +1,7 @@
+[target.aarch64-linux-android]
+linker = "/home/bigbang/Android/Sdk/ndk/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+ar = "/home/bigbang/Android/Sdk/ndk/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+rustflags = [
+    "-C", "link-arg=--target=aarch64-linux-android24",
+    "-C", "link-arg=--sysroot=/home/bigbang/Android/Sdk/ndk/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/sysroot",
+]
