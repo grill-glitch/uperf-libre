@@ -167,12 +167,28 @@ commands issued:      sh …/webui.sh all | cat '…/uperf.json' | sh …/dfps.s
                       sh …/webui.sh log '100'
 ```
 
-The command strings the page issues are byte-identical to the adb-verified ones. Two
-defects were found by these runs and fixed: `#supervision-card` had no id (the new
-error-state hide loop threw on it), and the fixed 31% label column was wrapping a
-19-character unbreakable config identity onto a second line. A cross-check that every
-`getElementById` target in `webui/*.js` and `webui/pages/*.js` exists in `index.html` is
-now part of the loop; it reports none missing.
+The command strings the page issues are byte-identical to the adb-verified ones. Three
+defects were found by these runs and fixed:
+
+* `#supervision-card` had no id, so the new error-state hide loop threw on it.
+* The fixed 31% label column wrapped a 19-character unbreakable config identity onto a
+  second line.
+* **All four bottom-bar icons were invisible.** `.bottom-bar-item .bottom-icon` sets
+  `width: 24px; padding: 2px 12px`, and under the page-wide `box-sizing: border-box` the
+  horizontal padding consumed the whole 24px, so `svg { width: 100% }` resolved to 0 —
+  leaving the active pill with nothing in it. This one is inherited from the reference
+  implementation's stylesheet (it is visible in the "before" screenshot too), and it was
+  only caught by measuring the rendered boxes rather than by looking at the page. The fix
+  is `box-sizing: content-box` on that element, which also restores the pill to its
+  intended 48x28 (Material 3's active-indicator shape) instead of a 24px circle.
+
+Two audits now run as part of the loop and are worth repeating after any UI change:
+
+* every `getElementById` target in `webui/*.js` and `webui/pages/*.js` exists in
+  `index.html` — currently none missing;
+* every `md-icon` **on the visible page** has an `<svg>` with a non-empty `path` and a
+  rendered box of at least 6x6 — currently none bad on all four tabs (a hidden page
+  measures 0x0 by definition, so each tab has to be made active before auditing it).
 
 The icon set is generated, and `tools/gen-icons.mjs` fails the build in both directions:
 a listed icon the package does not have, and a name a call site uses that is not listed.

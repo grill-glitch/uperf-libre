@@ -522,7 +522,12 @@ pre.log.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
     -webkit-tap-highlight-color: transparent;
 }
 .bottom-bar-item[selected] { color: var(--md-sys-color-on-surface); }
+/* `content-box` matters here: the icon box is 24px and the padding forms the pill
+   behind it. Under the page-wide `border-box` the horizontal padding ate the whole
+   24px, so `svg { width: 100% }` resolved to 0 and all four icons were invisible —
+   only the active pill showed. */
 .bottom-bar-item .bottom-icon {
+    box-sizing: content-box;
     width: 24px;
     height: 24px;
     padding: 2px 12px;
