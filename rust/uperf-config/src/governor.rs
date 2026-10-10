@@ -150,9 +150,25 @@ pub struct Governor {
     pub last_sample: Instant,
     /// Number of loop iterations, for diagnostics.
     pub ticks: u64,
+    /// PL1 multiplier from the thermal policy (1.0 = no thermal easing). Only PL1 is
+    /// scaled — PL2 and the OPP targets are never chosen by temperature
+    /// ("先削 PL1 不先削频点").
+    pub thermal_scale: f64,
 }
 
 impl Governor {
+    /// Set the PL1 multiplier from the thermal policy. Clamped so a bad input can
+    /// never stop the governor from publishing a target.
+    pub fn set_thermal_scale(&mut self, scale: f64) {
+        self.thermal_scale = scale.clamp(0.05, 1.0);
+    }
+
+    /// The PL1 actually in force this cycle (the configured value, eased by the
+    /// thermal policy).
+    fn pl1(&self) -> f64 {
+        self.tunables.slow_limit_power * self.thermal_scale
+    }
+
     pub fn new(tunables: GovernorTunables, clusters: Vec<ClusterState>) -> Self {
         let pool = tunables.fast_limit_capacity;
         Self {
@@ -162,6 +178,7 @@ impl Governor {
             idle: true,
             last_sample: Instant::now(),
             ticks: 0,
+            thermal_scale: 1.0,
         }
     }
 
@@ -243,7 +260,7 @@ impl Governor {
             // `burst` bypasses both limits (README step 4).
             self.pool = self.tunables.fast_limit_capacity;
         } else {
-            let pl1 = self.tunables.slow_limit_power;
+            let pl1 = self.pl1();
             if est_power > pl1 {
                 self.pool = (self.pool - (est_power - pl1) * elapsed).max(0.0);
             } else {
@@ -300,7 +317,7 @@ impl Governor {
         // down by a shared cost ceiling — which pinned an idle cluster2 to
         // 960 kHz on device while it drew no current at all.
         if self.tunables.burst <= 0.0 {
-            let pl1 = self.tunables.slow_limit_power;
+            let pl1 = self.pl1();
             let limit = if self.pool > 0.0 {
                 self.tunables.fast_limit_power
             } else {
@@ -627,6 +644,52 @@ mod tests {
         );
         // And the tight cap should still be the binding one.
         assert!(loose[0] > tight[0], "PL1 should bind: tight={tight:?} loose={loose:?}");
+    }
+
+    /// ⑥: the thermal policy eases PL1, never the frequency points. A hot scale must
+    /// never *raise* a target, must actually bind on the loaded cluster, and every
+    /// target must still be an OPP of that cluster's own table (nothing invented).
+    #[test]
+    fn a_thermal_scale_eases_pl1_without_inventing_a_frequency_point() {
+        let mk = |scale: f64| {
+            let mut t = GovernorTunables::default();
+            t.slow_limit_power = 2.0;
+            t.fast_limit_power = 4.0;
+            t.fast_limit_capacity = 0.1; // drain almost immediately
+            t.margin = 0.22;
+            t.guide_cap = false;
+            t.limit_efficiency = false;
+            let mut g = Governor::new(t, sdm888_clusters());
+            g.set_thermal_scale(scale);
+            g
+        };
+        let run = |mut g: Governor| {
+            let mut st = StatStepper::new(8);
+            let t0 = Instant::now();
+            let mut out = Vec::new();
+            for i in 0..120 {
+                let (p, c) = st.step(&[0, 1, 2, 3], 100);
+                out = g.tick(&p, &c, t0 + Duration::from_millis(40 * i as u64));
+            }
+            out
+        };
+
+        let cool = run(mk(1.0));
+        let hot = run(mk(0.5));
+        for (i, (h, c)) in hot.iter().zip(cool.iter()).enumerate() {
+            assert!(h <= c, "cluster{i}: hot {h} kHz must not exceed cool {c} kHz");
+        }
+        assert!(
+            hot[0] < cool[0],
+            "a halved PL1 must bind on the loaded cluster: hot={hot:?} cool={cool:?}"
+        );
+        let clusters = sdm888_clusters();
+        for (i, &f) in hot.iter().enumerate() {
+            assert!(
+                clusters[i].opps_khz.contains(&f),
+                "cluster{i}: {f} kHz is not an OPP of its table"
+            );
+        }
     }
 
     /// The power budget must be attributed to *loaded* cores. With an

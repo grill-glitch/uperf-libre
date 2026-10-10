@@ -14,6 +14,7 @@ pub mod proc_stat;
 pub mod sched;
 pub mod switcher;
 pub mod sysfs;
+pub mod thermal;
 
 pub use config::{Config, CfgError, Meta, Modules, Preset, HINT_SCENES};
 pub use cpu::PowerModel;

@@ -292,11 +292,46 @@ impl CpuTask {
                 std::thread::sleep(gov.sample_period());
                 let mut prev = read_stat();
                 let mut tick = 0u64;
+                // ⑥ thermal feedback (fas-rs's `core_temp_thresh`): when the SoC runs
+                // hot, ease the sustained power budget (PL1) — the OPP *points* are
+                // never chosen by temperature. Sampled at 1 Hz; the governor ticks far
+                // faster than any thermal zone moves.
+                let tpolicy = uperf_config::thermal::ThermalPolicy::from_env();
+                let troot = std::env::var("UPERF_THERMAL_ROOT")
+                    .unwrap_or_else(|_| "/sys/class/thermal".into());
+                let tzones = uperf_config::thermal::discover_cpu_zones(std::path::Path::new(&troot));
+                match uperf_config::thermal::read_max_temp_c(&tzones) {
+                    Some(t) => log_line(&format!(
+                        "Rust: thermal {} zone(s) under {troot}, now {t:.1} C (thresh {:.0} C, floor x{:.2})",
+                        tzones.len(),
+                        tpolicy.thresh_c,
+                        tpolicy.floor
+                    )),
+                    None => log_line(&format!(
+                        "Rust: thermal no readable cpu zone under {troot}; PL1 left alone"
+                    )),
+                }
+                let mut next_thermal = Instant::now();
+                let mut last_scale = 1.0f64;
                 while !stop_child.load(Ordering::Relaxed) {
                     let period = gov.sample_period();
                     std::thread::sleep(period);
                     if stop_child.load(Ordering::Relaxed) {
                         break;
+                    }
+                    if Instant::now() >= next_thermal {
+                        next_thermal = Instant::now() + std::time::Duration::from_secs(1);
+                        if let Some(t) = uperf_config::thermal::read_max_temp_c(&tzones) {
+                            let s = uperf_config::thermal::pl1_scale(t, tpolicy);
+                            gov.set_thermal_scale(s);
+                            if (s - last_scale).abs() > 0.02 {
+                                last_scale = s;
+                                log_line(&format!(
+                                    "Rust: thermal {t:.1} C -> PL1 x{s:.2} (of {:.2} W)",
+                                    gov.tunables.slow_limit_power
+                                ));
+                            }
+                        }
                     }
                     let cur = read_stat();
                     let freqs = gov.tick(&prev, &cur, Instant::now());
