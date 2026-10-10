@@ -55,9 +55,32 @@ AppOpt 的 FPS 采集优先级（README）：eBPF（Rust/aya uprobe 到目标 PI
   （是否需要 `android.permission.DUMP`）、目标 layer 名从哪来、`--latency` 文本表的
   精确格式与采样窗口。
 
-## 4. 未做
+## 4. 第一轮：从零 binder 客户端，真机跑通（2026-10-10）
 
-**实现尚未开始**。它是一个里程碑级的工作：自研 binder 客户端（open/mmap
-`/dev/binder` + `BC_TRANSACTION`/`BR_TRANSACTION`，向 servicemanager 求 handle，对
-SF 发 `dump` 并带 pipe fd 取回文本）+ `--latency` 解析 + FPS 计算 + 与既有帧源
-（M8 注入的 `sfanalysis.hint`）的优先级/降级接线。须真机验证，不臆造。
+`tools/binder-probe/`（独立 crate，非 `rust/` 成员）已把最小可达事务打通并**真机
+验证**：root → open `/dev/binder` → `mmap(PROT_READ)` → `BINDER_VERSION`=8 →
+向 servicemanager(handle 0) 发 `getService("SurfaceFlingerAIDL")` → 收到 32 字节回复，
+解出 `flat_binder_object`：`kind=0x73682a85`（BINDER_TYPE_HANDLE）`binder=1`。
+⇒ **"daemon 内直连 binder"这条路在真机上成立**。
+
+踩出来的四个真事实（写进 `tools/binder-probe/README.md`，别再摸一遍）：
+
+1. **读缓冲必须是可写的堆缓冲，不是 mmap。** 内核把 `BR_*` 命令流写进
+   `read_buffer`；binder 的 mmap 是 `PROT_READ`（`PROT_WRITE` 实测 `EPERM`），用
+   mmap 当读缓冲必 `EFAULT`。payload 仍落在 mmap，由 `data.ptr.buffer` 只读读。
+2. **事务 data 必须带 AOSP `writeInterfaceToken` 的 vendor 头**：
+   `[i32 strictPolicy][i32 workSource][i32 kHeader][string16 descriptor][args]`，
+   `kHeader` = `0x53595354`（/dev/binder 的 "SYST"；vndbinder 是 `0x564e4452`）。
+   漏了它服务端打 `Expecting header 0x53595354...` 并丢弃事务。
+3. **同步调用是两次 ioctl**：写回 `BR_TRANSACTION_COMPLETE` 即立刻返回，须再发一次
+   只读 `BINDER_WRITE_READ` 阻塞等 `BR_REPLY`（libbinder 的 `waitForResponse`）。
+4. `BINDER_WRITE_READ` = `0xc0306201`（`binder_write_read` 是 48 字节）。常量表见
+   README。
+
+## 5. 未做（⑤ 的剩余）
+
+把该客户端扩成 SF 的 `dump` 事务：目标 handle 用本探针取到的 `SurfaceFlingerAIDL`
+handle，`code` = `dump`，data 里带一个 pipe fd 与 `--latency <layer>` 参数，读回文本
+后解析帧时间戳算 FPS；再与既有帧源（M8 注入的 `sfanalysis.hint`）接优先级与降级。
+SF 的 `dump()` 对 root 是否查 `android.permission.DUMP` **尚未实测**——本探针只证明了
+"能建连、能往返"。仍不臆造。
