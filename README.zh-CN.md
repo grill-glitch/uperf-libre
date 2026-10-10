@@ -572,6 +572,8 @@ tail <USER_PATH>/uperf_watchdog.log    # 看门狗的每一次判定
 
 `uperf.state` 里残留 `state=running` 但没有存活进程，就是被杀的标志；正常停止会写 `state=stopped`。`UPERF_WATCHDOG=0` 可关闭看门狗（排查崩溃循环时有用）。
 
+`UPERF_SF_INJECT=1` 时看门狗还看管**注入进 surfaceflinger 的库**（M8）：身份按 `pid:start_ticks` 判，SF 重启就重挂；注入前**自己把库 staging 到目标域读得到的路径**（模块自己的目录 SF 读不到——实测 `dlopen` 返回 0，搬到 `/data/misc/surfaceflinger/` + `system_file` 标签后 `r-xp` 映射成功），注入后**回读 maps 验证**（返回 0 但映射不在算失败），预算按**失败**计数（成功不消耗，SF 反复重启也不会因此失去帧源），放弃时写清原因；默认关闭，未开启时每采样只花一次字符串比较。
+
 看门狗的死手路径现在恢复**两样**东西：governor 接管（`uperf_restore_governors`）和守护进程改过的 sysfs knob（写入账本 `<USER_PATH>/sysfs_orig.txt` → `uperf_restore_sysfs`）。契约与 governor 一致：**读不到原值的条目只报告、绝不臆造**，且只在两清（无 unknown、无失败）时才清账本。注意 `modules.sysfs` 的 knob 表在出厂配置里是 `enable: false`（代码里的真写也只在 `UPERF_FAKE_ROOT` 下发生），所以这条路径今天在真机上不产生写入——账本是为它被启用时准备的。
 
 如果设备在手边没有看门狗的情况下卡在 `userspace`（手工删了模块、或关掉了看门狗），恢复：

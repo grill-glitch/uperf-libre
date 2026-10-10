@@ -111,6 +111,14 @@ SF_ENABLE="${UPERF_SF_INJECT:-0}"
 SF_TARGET="${UPERF_SF_TARGET:-/system/bin/surfaceflinger}"
 SF_LIB="${UPERF_SF_LIB:-$BIN_PATH/libsfanalysis_rs.so}"
 SF_INJECTOR="${UPERF_SF_INJECTOR:-/data/local/tmp/injector}"
+# The library is staged before injecting, and this is not optional: surfaceflinger runs as
+# `system`, and the module's own directory is not a path that domain can read. Measured on
+# the device — injecting straight from `<module>/bin/` makes the remote `dlopen` return 0
+# ("Injection failed..."), while the same file copied to `/data/misc/surfaceflinger/`
+# (mode 755, owner system:system, label `system_file`) maps `r-xp` and runs. The
+# requirement is a *readable* path with the right label, and the supervisor makes it so.
+SF_STAGE="${UPERF_SF_STAGE:-/data/misc/surfaceflinger/$(basename "$SF_LIB")}"
+SF_INJECT_LIB="$SF_LIB"
 SF_MAX_INJECTS="${UPERF_SF_MAX_INJECTS:-3}"
 SF_RETRY_SAMPLES="${UPERF_SF_RETRY_SAMPLES:-4}"
 SF_ID=""
@@ -366,8 +374,37 @@ wd_sf_is_injected() {
     grep -q "$(basename "$SF_LIB")" "$PROC_ROOT/$1/maps" 2>/dev/null
 }
 
+# Copy the library somewhere the target domain can read it, with the label that lets it
+# map. Best effort per step: a missing `chcon` (or a filesystem that does not care) must not
+# stop an injection that would otherwise work, but the *copy* must succeed.
+wd_sf_stage() {
+    local dir
+    if [ "$SF_LIB" = "$SF_STAGE" ]; then
+        SF_INJECT_LIB="$SF_LIB"
+        return 0
+    fi
+    dir="${SF_STAGE%/*}"
+    [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null
+    if cp -f "$SF_LIB" "$SF_STAGE" 2>/dev/null; then
+        chmod 755 "$SF_STAGE" 2>/dev/null
+        chown system:system "$SF_STAGE" 2>/dev/null
+        chcon u:object_r:system_file:s0 "$SF_STAGE" 2>/dev/null
+        SF_INJECT_LIB="$SF_STAGE"
+        return 0
+    fi
+    wd_log "sf: cannot stage $SF_LIB to $SF_STAGE — skipping the injection"
+    return 1
+}
+
 wd_sf_do_inject() {
-    "$SF_INJECTOR" "$SF_TARGET" "$SF_LIB" >/dev/null 2>&1
+    local out
+    wd_sf_stage || return 1
+    # The injector's own output is kept on failure: "the injector returned non-zero" is not a
+    # diagnosis, and the first version swallowed it to /dev/null — which is exactly how the
+    # unreadable-path failure stayed invisible for a round.
+    out="$("$SF_INJECTOR" "$SF_TARGET" "$SF_INJECT_LIB" 2>&1)" && return 0
+    wd_log "sf: injector said: $(echo "$out" | tail -3 | tr '\n' ' ')"
+    return 1
 }
 
 wd_sf_state() {
