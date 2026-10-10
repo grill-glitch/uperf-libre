@@ -18,6 +18,7 @@
 //! Everything above the transport is pure and host-tested: the `--latency` table
 //! parse, the FPS window, and the layer-name pick.
 
+use crate::hint::SfHint;
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -448,16 +449,38 @@ pub fn parse_latency(text: &str) -> (Option<u64>, Vec<Frame>) {
 
 /// FPS over the last `window_ns`, counted from `actual_present` timestamps. The
 /// clock is CLOCK_MONOTONIC, the same one SF's vsync timestamps use.
+pub fn frames_in_window(frames: &[Frame], now_ns: u64, window_ns: u64) -> usize {
+    if window_ns == 0 {
+        return 0;
+    }
+    let start = now_ns.saturating_sub(window_ns);
+    frames
+        .iter()
+        .filter(|f| f.actual_present > start && f.actual_present <= now_ns)
+        .count()
+}
+
 pub fn fps_in_window(frames: &[Frame], now_ns: u64, window_ns: u64) -> f64 {
     if window_ns == 0 {
         return 0.0;
     }
-    let start = now_ns.saturating_sub(window_ns);
-    let n = frames
-        .iter()
-        .filter(|f| f.actual_present > start && f.actual_present <= now_ns)
-        .count();
-    n as f64 * 1_000_000_000.0 / window_ns as f64
+    frames_in_window(frames, now_ns, window_ns) as f64 * 1_000_000_000.0 / window_ns as f64
+}
+
+/// What a frame sample can **honestly** assert about UI activity.
+///
+/// Frames prove one thing the input path cannot: that the UI is *not drawing*. So a
+/// window with no frames derives `Idle`, and nothing else is derived — touch, gesture
+/// and switch are facts about input, and this degraded leg must not dress a frame
+/// measurement up as the injected `sfanalysis.hint`. (Upstream parity this leans on:
+/// `HintState::expired()` is never polled in this daemon, so without an input event
+/// nothing would ever move the scene back to idle — the frame leg is what does.)
+pub fn frame_hint(frames_in_window: usize) -> Option<SfHint> {
+    if frames_in_window == 0 {
+        Some(SfHint::Idle)
+    } else {
+        None
+    }
 }
 
 /// `CLOCK_MONOTONIC` in nanoseconds — the clock SF's timestamps are on.
@@ -588,9 +611,15 @@ impl FrameTask {
         matches!(std::env::var("UPERF_SF_BINDER").ok().as_deref(), Some("1") | Some("true"))
     }
 
-    pub fn spawn<F, L>(cfg_dir: Option<std::path::PathBuf>, top_app: F, log: L) -> Option<FrameTask>
+    pub fn spawn<F, L, H>(
+        cfg_dir: Option<std::path::PathBuf>,
+        top_app: F,
+        on_hint: H,
+        log: L,
+    ) -> Option<FrameTask>
     where
         F: Fn() -> Option<String> + Send + 'static,
+        H: Fn(SfHint) + Send + 'static,
         L: Fn(&str) + Send + 'static,
     {
         let tick_ms = env_ms("UPERF_SF_BINDER_TICK_MS", 1000);
@@ -646,6 +675,7 @@ impl FrameTask {
                 let mut layer: Option<String> = pinned.clone();
                 let mut layer_for: Option<String> = None;
                 let mut last_src: Option<FrameSource> = None;
+                let mut last_derived: Option<SfHint> = None;
                 let mut fails = 0u32;
 
                 while !stop_thread.load(Ordering::SeqCst) {
@@ -663,6 +693,7 @@ impl FrameTask {
                     match src {
                         FrameSource::Hint => {
                             // The injected leg is live; do not touch binder at all.
+                            last_derived = None;
                             publish(FrameSource::Hint, age, None, 0, None, None);
                         }
                         FrameSource::Fps => {
@@ -686,12 +717,24 @@ impl FrameTask {
                                     Ok(text) => {
                                         let (refresh, frames) = parse_latency(&text);
                                         let fps = fps_in_window(&frames, monotonic_ns(), window_ms * 1_000_000);
+                                        let in_win = frames_in_window(&frames, monotonic_ns(), window_ms * 1_000_000);
                                         log(&format!(
-                                            "Rust: sf-binder layer={l} refresh_ns={} frames={} fps={fps:.1}",
+                                            "Rust: sf-binder layer={l} refresh_ns={} frames={} in_window={in_win} fps={fps:.1}",
                                             refresh.unwrap_or(0),
                                             frames.len()
                                         ));
                                         publish(FrameSource::Fps, age, Some(fps), frames.len(), Some(&l), refresh);
+                                        if let Some(h) = frame_hint(in_win) {
+                                            if last_derived != Some(h) {
+                                                last_derived = Some(h);
+                                                log(&format!(
+                                                    "Rust: sf-binder frame hint -> {} (nothing drawn in {} ms)",
+                                                    h.as_str(),
+                                                    window_ms
+                                                ));
+                                                on_hint(h);
+                                            }
+                                        }
                                         fails = 0;
                                     }
                                     Err(e) => {
@@ -831,5 +874,24 @@ mod tests {
     #[test]
     fn a_missing_hint_file_has_no_age() {
         assert_eq!(hint_age_ms(Path::new("/nonexistent/sfanalysis.hint")), None);
+    }
+
+    /// Frames may only ever assert idle. Anything else would be a frame measurement
+    /// dressed up as an input fact.
+    #[test]
+    fn only_the_idle_claim_is_derived_from_frames() {
+        assert_eq!(frame_hint(0), Some(SfHint::Idle));
+        assert_eq!(frame_hint(1), None);
+        assert_eq!(frame_hint(120), None);
+    }
+
+    #[test]
+    fn frames_in_window_matches_the_rate() {
+        let (_, frames) = parse_latency(TABLE);
+        assert_eq!(frames_in_window(&frames, 1_500_000_000, 1_000_000_000), 3);
+        assert_eq!(frames_in_window(&frames, 1_500_000_000, 0), 0);
+        // the rate and the count agree
+        let fps = fps_in_window(&frames, 1_500_000_000, 1_000_000_000);
+        assert!((fps - 3.0).abs() < 1e-9);
     }
 }

@@ -140,9 +140,32 @@ C stale    source=fps  hint_age_ms=6199 refresh_ns=8333333 layer=…Settings#474
 日志：frame source -> fps (hint_age_ms=None) -> hint (Some(103)) -> fps (Some(2061))
 ```
 
-## 8. 未做（⑤ 的剩余，[U]）
+## 8. 第五轮：降级腿真接管（2026-10-10）
 
-**FPS 仍只作观测 + 降级源，没有参与 dfps 的刷帧决策**：`sfanalysis.hint` 依旧是唯一
-进 SfHint FSM 的源。要让降级腿真正"接管"，需要定义 FPS/refresh → 场景/刷帧的映射
-（这是新的策略，不是复刻上游），并且 `hint_age_ms` 走的是 mtime（墙钟），需要更硬的
-存活判据。仍不臆造。
+**缺口**：`HintState::expired()`（上游按 `hintDuration` 过期）在本 daemon 里**从未被
+轮询**——`grep` 只在单测里出现。所以一旦场景被 touch 事件推上去，**没有输入事件它永远
+不会自己回到 idle**。
+
+**接管**：降级时帧腿把「窗口内 0 帧 ⇒ `Idle`」经 `Orchestrator::on_sf_hint`
+（与注入 hint 同一条入口）送进 FSM，写完后 drain 掉排队的场景写入。
+
+**只推断 idle**：`frame_hint(0)=Some(Idle)`，`frame_hint(>0)=None`。touch / gesture /
+switch 是**输入事实**，帧测量证明不了；降级腿不允许把帧测数据冒充成注入 hint。
+
+真机 e2e（`tools/binder-probe/e2e-takeover.sh`）：
+
+```
+A 无 hint        source=fps（layer=…launcher…#482，63 帧，refresh_ns=8333333）
+B 写一次 touch   SfAnalysis hint 'touch' (byte 4) transitioned=true → sched scene=touch
+C hint 过期      sf-binder frame source -> fps (hint_age_ms=Some(2142))
+                 sf-binder frame hint -> idle (nothing drawn in 1000 ms)
+                 sched scene=idle          ← 没有别的东西会做这个动作
+```
+
+## 9. 未做 / [U]
+
+* `hint_age_ms` 基于 mtime（墙钟比较），需要更硬的存活判据；
+* 帧腿只接管 **idle 方向**（有意为之，见上）；
+* `HintState::expired()` 未被轮询这件事本身**没有修**——它是上游 parity 的一部分
+  （按 `hintDuration` 过期），要修得先确认上游在等价情况下确实会过期，否则会改变
+  场景保持时长。记在这里，不臆造。
