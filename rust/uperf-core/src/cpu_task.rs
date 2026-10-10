@@ -65,6 +65,22 @@ impl UserspaceWriter {
         self.status = target;
     }
 
+    /// Report the takeover state only if the file is still ours (stop path).
+    fn write_status_if_owner(&self, state: &str) {
+        let Some(target) = self.status.as_ref() else {
+            return;
+        };
+        crate::status::write_if_owner(
+            &target.path,
+            &crate::status::Snapshot {
+                state,
+                takeover: true,
+                armed: &[],
+                config: &target.config,
+            },
+        );
+    }
+
     /// Report the takeover state. Best effort — see [`crate::status::write`].
     fn write_status(&self, state: &str) {
         let Some(target) = self.status.as_ref() else {
@@ -162,7 +178,10 @@ impl UserspaceWriter {
         // still be running (a clean stop writes `state=stopped` as well), but the
         // takeover is over. A reader that sees `state=running armed=0` is looking
         // at a run started without `UPERF_CPU_GOVERNOR=1`.
-        self.write_status("stopped");
+        //
+        // Ownership-checked: a disarm that lands after a restart belongs to the
+        // previous worker and must not overwrite the new one's status.
+        self.write_status_if_owner("stopped");
     }
 
     pub fn is_armed(&self) -> bool {

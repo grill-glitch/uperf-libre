@@ -291,16 +291,22 @@ see [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md) and the
   PL1/PL2 pool arithmetic, the scene → sysfs writer pipeline, and the
   inotify-based hot reload of `cur_powermode.txt` / `perapp_powermode.txt`.
 - **Supervision (M9)**: host-verified (`cargo test --release`, 211 tests; and
-  `sh scripts/test_watchdog_host.sh`, 9 cases / 55 assertions against the real
-  script) and **device-verified** on alioth (`scripts/m9-device-verify.sh`, 31
-  assertions): `/proc/<pid>/exe` survives dfps' cmdline rewrite, the dead-man path
+  `sh scripts/test_watchdog_host.sh`, 10 cases / 60 assertions against the real
+  script), **device-verified** on alioth (`scripts/m9-device-verify.sh`, 33
+  assertions: `/proc/<pid>/exe` survives dfps' cmdline rewrite, the dead-man path
   restores a real armed daemon after SIGKILL, an orphaned worker disarms itself
-  after the watchdog's SIGTERM, and the watchdog costs 0.93 % of one core at the
-  shipped 15 s cadence. Three device-only defects were found and fixed on the way
-  (the scan's cost, the process-name filter, a no-trailing-newline read). Not yet
-  verified: the watchdog surviving `service.sh` under KernelSU/Magisk, and the
-  WebUI-restart lock handover. See
-  [`docs/m9-watchdog.md`](./docs/m9-watchdog.md) §5.
+  after the watchdog's SIGTERM, 0.93-1.12 % of one core at the shipped 15 s
+  cadence) and **install+boot verified** (`scripts/m9-device-boot-verify.sh`, 23
+  assertions after `ksud module install` + a restart: KernelSU's `service.sh` path
+  starts the watchdog and it survives, and a `webui.sh restart` hands the owner
+  lock over to a new instance). Five device-only defects were found and fixed on
+  the way (the scan's cost, the process-name filter, a no-trailing-newline read, a
+  sticky `gave-up`, and a status file that a restart could leave saying `stopped`
+  beside a running daemon). See [`docs/m9-watchdog.md`](./docs/m9-watchdog.md) §5.
+- **Bounded logs (M10)**: the daemon rotates its own log (4 MiB per file, 2 rotated
+  files) and the start path drops an oversized backup (16 MiB) instead of reading
+  it — measured before this change: a 34 MB log plus a 138 MB `.bak` on
+  `/sdcard`. See [`docs/m10-log-cap.md`](./docs/m10-log-cap.md).
 - **Best-effort**: latency smoothing (one OPP per sample unless the
   predict branch fires — upstream describes a continuous shared latency
   budget whose discrete approximation we do not claim to match tick-for-tick),

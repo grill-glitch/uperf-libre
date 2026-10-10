@@ -246,6 +246,13 @@ alive "$WORKER" && c=0 || c=1
 check "the fake worker was not killed" "$c"
 [ ! -s "$WORK/healthy/stub.log" ] && c=0 || c=1
 check "no restart was attempted" "$c"
+# Liveness must be readable from the file, not only from the lock: the timestamp is
+# rewritten every sample even when nothing changes.
+m1="$(state_field healthy updated_uptime_ms)"
+sleep 3
+m2="$(state_field healthy updated_uptime_ms)"
+[ -n "$m1" ] && [ -n "$m2" ] && [ "$m2" -gt "$m1" ] && c=0 || c=1
+check "the state file's timestamp advances while healthy ($m1 -> $m2)" "$c"
 stop_watchdog "$WD_PID"
 eq "$(state_field healthy state)" "stopped" "a clean stop records state=stopped"
 kill -KILL "$SUP" "$WORKER" 2>/dev/null
@@ -420,6 +427,37 @@ eq "$(governor_of dryrun policy0)" "userspace" "the armed policy was NOT restore
 [ ! -s "$WORK/dryrun/stub.log" ] && c=0 || c=1
 check "no restart was attempted" "$c"
 kill -KILL "$WORKER" 2>/dev/null
+
+# ------------------------------------- case 10: the log backup cap (script side)
+
+echo "== case 10: an oversized log backup is dropped, a small one is kept"
+new_case logcap
+# The real `libuperf.sh`, sourced off-device: `USER_PATH` is redirected right after
+# sourcing because the function reads it at call time (the same late-binding rule the
+# watchdog needed). `UPERF_LOG_BACKUP_MAX_BYTES` is exported so the sourced default
+# does not win.
+run_trim() { # run_trim <user-dir> <max-bytes> <out-file>
+    (
+        cd "$BASE/magisk/script" || exit 1
+        UPERF_LOG_BACKUP_MAX_BYTES="$2" sh -c '
+            . ./libuperf.sh
+            USER_PATH="$1"
+            uperf_trim_log_backup
+            echo "present=$([ -f "$USER_PATH/uperf_log.txt.bak" ] && echo 1 || echo 0)"
+            echo "size=$([ -f "$USER_PATH/uperf_log.txt.bak" ] && wc -c <"$USER_PATH/uperf_log.txt.bak" | tr -d " " || echo 0)"
+        ' _ "$1"
+    ) >"$3" 2>&1
+}
+
+head -c 200000 /dev/zero | tr '\0' 'x' >"$WORK/logcap/user/uperf_log.txt.bak"
+run_trim "$WORK/logcap/user" 100000 "$WORK/logcap/big.out"
+check_contains "$WORK/logcap/big.out" "present=0" "a backup over the cap is dropped"
+check_contains "$WORK/logcap/big.out" "dropped an oversized log backup" "and it says so"
+
+head -c 50 /dev/zero | tr '\0' 'x' >"$WORK/logcap/user/uperf_log.txt.bak"
+run_trim "$WORK/logcap/user" 100000 "$WORK/logcap/small.out"
+check_contains "$WORK/logcap/small.out" "present=1" "a backup under the cap is kept"
+check_contains "$WORK/logcap/small.out" "size=50" "and is left byte-exact"
 
 # ------------------------------------------------------- case 6: syntax + wiring
 

@@ -622,7 +622,8 @@ CPU 调频器通过将每个 `cpufreq` policy 的 `scaling_governor` 切到 `use
 ## 状态
 
 - **稳定**：上游基础参考（25 个 OPP 上与 printout 拟合误差 <0.0015）、能耗模型、PL1/PL2 池算术、scene → sysfs 写入流水线，以及基于 inotify 的 `cur_powermode.txt` / `perapp_powermode.txt` 热重载。
-- **守护（M9）**：主机侧已验证（`cargo test --release` 211 个测试；`sh scripts/test_watchdog_host.sh` 9 用例 / 55 条断言，跑的是真实脚本），并已在 alioth **真机验证**（`scripts/m9-device-verify.sh`，31 条断言）：`/proc/<pid>/exe` 能穿过 dfps 的 cmdline 改写；真机 SIGKILL 后死手路径把已接管的三个 policy 恢复；孤儿 worker 在被看门狗 SIGTERM 后自行 disarm；出厂 15 s 节奏下看门狗占单核 0.93%。过程中发现并修掉三个**只有真机才暴露**的缺陷（扫描开销、进程名过滤器、无换行文件读取）。尚未验证：KernelSU/Magisk 下看门狗能否活过 `service.sh`、以及 WebUI 重启时锁的交接。见 [`docs/m9-watchdog.md`](./docs/m9-watchdog.md) §5。
+- **守护（M9）**：主机侧已验证（`cargo test --release` 211 个测试；`sh scripts/test_watchdog_host.sh` 10 用例 / 60 条断言），alioth **真机验证**（`scripts/m9-device-verify.sh`，33 条断言：`/proc/<pid>/exe` 穿过 dfps 的 cmdline 改写、SIGKILL 后死手路径恢复真实已接管 daemon、孤儿 worker 被 SIGTERM 后自行 disarm、出厂 15 s 节奏下占单核 0.93–1.12%），并完成 **装机 + 重启验收**（`scripts/m9-device-boot-verify.sh`，`ksud module install` + 重启后 23 条断言：KernelSU 的 `service.sh` 路径确实拉起看门狗且活过重启；`webui.sh restart` 把 owner 锁干净交接给新实例）。过程中发现并修掉五个**只有真机才暴露**的缺陷（扫描开销、进程名过滤器、无换行文件读取、`gave-up` 被后续采样擦除、以及重启后状态文件可能残留 `stopped` 而 daemon 仍在跑）。见 [`docs/m9-watchdog.md`](./docs/m9-watchdog.md) §5。
+- **日志上限（M10）**：daemon 自己轮转日志（每文件 4 MiB、保留 2 个），启动路径对超限备份直接丢弃（16 MiB）而不是去读它——改前实测：34 MB 的日志加 138 MB 的 `.bak` 堆在 `/sdcard`。见 [`docs/m10-log-cap.md`](./docs/m10-log-cap.md)。
 - **尽力而为**：延迟平滑（每采样最多一步，除非 predict 触发 —— 上游描述的是连续共享延迟预算，离散近似无法做到逐节拍匹配），以及 guideCap / limitEfficiency 的容量裁剪表（不可直接从闭源二进制观测）。
 - **真机验证**：alioth（crDroid Android 16 / KernelSU Next 3.3.0）与 polaris（LineageOS 22.2 working；Android 16 / 4.19 内核 —— axion 配置 + `KERNEL_CLANG_TRIPLE`）。
 

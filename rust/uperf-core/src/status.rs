@@ -118,6 +118,28 @@ pub fn write(path: &Path, snap: &Snapshot<'_>) {
     write_atomic(path, out.as_bytes());
 }
 
+/// Write only if the file already belongs to this process (or cannot say whose it is).
+///
+/// The stop path uses this. `uperf_stop` (SIGTERM, `sleep 1`) followed by
+/// `uperf_start` can overlap: the *previous* worker's `uperf_rs_stop()` joins its
+/// threads for up to 2 s, so it can reach its own `state=stopped` write after the new
+/// worker has already claimed the file — and since the takeover is off by default the
+/// new daemon never writes again, leaving `state=stopped` beside a running daemon for
+/// the rest of the session. Observed on device right after a `webui.sh restart`.
+pub fn write_if_owner(path: &Path, snap: &Snapshot<'_>) {
+    let mine = std::process::id().to_string();
+    let owned = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|l| l.strip_prefix("pid=").map(|v| v.trim().to_string()))
+        })
+        .map_or(true, |pid| pid == mine);
+    if owned {
+        write(path, snap);
+    }
+}
+
 /// `(ppid, start_ticks)` from a `/proc/<pid>/stat` line.
 ///
 /// Field 4 is the parent pid, field 22 the process start time in clock ticks.
@@ -257,6 +279,53 @@ mod tests {
         assert!(
             !second.contains("state=running"),
             "the old snapshot must be gone, not appended: {second}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_if_owner_steps_aside_for_a_newer_daemon() {
+        let dir = tmp_dir("owner");
+        let path = dir.join("uperf.state");
+        let snap = |state: &'static str| Snapshot {
+            state,
+            takeover: false,
+            armed: &[],
+            config: "/tmp/uperf.json",
+        };
+
+        // No file yet: the write happens (this is how a first run claims it).
+        write_if_owner(&path, &snap("running"));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("state=running"));
+
+        // A file owned by this pid: the stop write happens.
+        write_if_owner(&path, &snap("stopped"));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("state=stopped"));
+
+        // A file claimed by another pid (a newer worker after a restart): the stale
+        // stop write must not land.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let foreign = text
+            .lines()
+            .map(|l| {
+                if let Some(v) = l.strip_prefix("pid=") {
+                    format!("pid={}", v.parse::<u32>().unwrap_or(0) + 1)
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, foreign).unwrap();
+        write_if_owner(&path, &snap("running"));
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("state=stopped"),
+            "a non-owner must not overwrite: {after}"
+        );
+        assert!(
+            !after.contains(&format!("pid={}\n", std::process::id())),
+            "and must not claim it either: {after}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

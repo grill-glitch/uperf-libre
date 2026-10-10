@@ -139,7 +139,9 @@ wd_stat_fields() {
     local line
     WD_PPID=""
     WD_START_TICKS=""
-    IFS= read -r line <"$PROC_ROOT/$1/stat" 2>/dev/null || return 1
+    # The *group's* stderr is redirected, not the command's: when a pid vanishes
+    # mid-scan the shell prints the failed redirection itself.
+    { IFS= read -r line <"$PROC_ROOT/$1/stat"; } 2>/dev/null || return 1
     # shellcheck disable=SC2086 # word splitting is the point
     set -- ${line##*) }
     WD_PPID="$2"
@@ -172,7 +174,7 @@ wd_scan() {
         # instead of ~20 s of `readlink|sed`. Only a name match pays for the
         # `readlink`, and the exe comparison below is what actually decides.
         comm=""
-        IFS= read -r comm <"$p/comm" 2>/dev/null
+        { IFS= read -r comm <"$p/comm"; } 2>/dev/null
         [ "$comm" = "$DAEMON_COMM" ] || continue
         pid="${p##*/}"
         exe="$(wd_exe "$pid")"
@@ -457,11 +459,16 @@ main() {
         work_n=$#
 
         if [ "$sup_n" -eq 1 ] && [ "$work_n" -ge 1 ]; then
+            # The log stays change-only (a line every 15 s would drown it), but the
+            # *state file* is rewritten every sample: `updated_uptime_ms` is the only
+            # evidence that a supervisor which has nothing to report is still alive
+            # and still sampling (the device check for exactly that is what caught
+            # this — a state file frozen at boot looks identical to a dead watchdog).
             if [ "$WD_STATE_CUR" != "running" ]; then
                 wd_log "healthy: sup=[${WD_SUP# }] workers=[${WD_WORK# }] armed=[$WD_LAST_ARMED]"
-                wd_state_write "running" "supervisor + worker up"
                 WD_STATE_CUR="running"
             fi
+            wd_state_write "running" "supervisor + worker up"
             WD_MISS=0
             wd_sleep "$WD_INTERVAL"
         else

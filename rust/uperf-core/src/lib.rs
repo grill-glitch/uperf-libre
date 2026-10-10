@@ -379,7 +379,9 @@ pub(crate) extern "C" fn uperf_rs_stop() {
     // status file still saying `state=running` means the daemon was killed rather
     // than stopped — which is exactly what the module's watchdog keys off.
     if let Some(target) = crate::status::target() {
-        crate::status::write(
+        // Ownership-checked: after a fast restart this write may belong to the
+        // previous worker and must not overwrite the new one's `running`.
+        crate::status::write_if_owner(
             &target.path,
             &crate::status::Snapshot {
                 state: "stopped",

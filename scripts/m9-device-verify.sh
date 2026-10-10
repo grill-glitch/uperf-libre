@@ -77,7 +77,9 @@ exe_procs() {
         # dfps sets (`PROC_NAME` = uperf), and a `readlink` per pid costs ~13 ms here
         # — an unfiltered pass over 1289 pids took 40 s and dominated this harness.
         comm=""
-        IFS= read -r comm <"$p/comm" 2>/dev/null
+        # The group's stderr is redirected, not the command's: the shell prints a
+        # failed redirection itself when a pid vanishes mid-loop.
+        { IFS= read -r comm <"$p/comm"; } 2>/dev/null
         [ "$comm" = "uperf" ] || continue
         pid="${p##*/}"
         exe="$(readlink "$p/exe" 2>/dev/null)"
@@ -90,7 +92,7 @@ exe_procs() {
 }
 ppid_of() { # pure shell, like the watchdog: a fork is ~10 ms here
     local line
-    IFS= read -r line <"/proc/$1/stat" 2>/dev/null || return 1
+    { IFS= read -r line <"/proc/$1/stat"; } 2>/dev/null || return 1
     # shellcheck disable=SC2086
     set -- ${line##*) }
     echo "$2"
@@ -143,9 +145,22 @@ rm -rf "$T/sys" "$T/daemon_log.txt" "$T/orig_governor.txt" "$T/uperf.state"
 # wiring. Pushed by the driver from `build/.../runnable/uperf`.
 [ -s "$FAKE_EXE" ] || { echo " !! push the freshly built binary to $FAKE_EXE first"; exit 1; }
 chmod 755 "$FAKE_EXE"
-if cmp -s "$FAKE_EXE" "$REAL_EXE"; then
-    echo " !! $FAKE_EXE is the *installed* binary — push the current build instead"
+# The test binary must be a *distinct image* (identity is by `exe`, so sharing the
+# installed one's would make the scan see two supervisors) and, when the driver says
+# which build to expect, exactly that build. Comparing the two files for equality was
+# wrong once the installed module became the current build.
+if [ -n "$(exe_procs "$REAL_EXE")" ] && [ "$FAKE_EXE" = "$REAL_EXE" ]; then
+    echo " !! $FAKE_EXE is the installed image; the test copy must be at another path"
     exit 1
+fi
+if [ -f "$T/expected_bin_md5" ]; then
+    want="$(cat "$T/expected_bin_md5" 2>/dev/null)"
+    got="$(md5sum "$FAKE_EXE" 2>/dev/null | cut -d' ' -f1)"
+    if [ -n "$want" ] && [ "$got" != "$want" ]; then
+        echo " !! $FAKE_EXE is $got but the driver expects $want"
+        exit 1
+    fi
+    echo "   test binary md5 verified against the driver's build ($got)"
 fi
 cp -f /sdcard/Android/yc/uperf/uperf.json "$T/t3.json" 2>/dev/null || { echo " !! no config at /sdcard/Android/yc/uperf/uperf.json"; exit 1; }
 cleanup_fakes
@@ -235,14 +250,16 @@ fake_govs() {
 # Start the copied binary with the takeover on, but every write redirected into the
 # fake tree. Arms when policy0 reads `userspace` there.
 start_test_daemon() {
+    local cfg="${DAEMON_CFG:-$T/t3.json}"
     fake_tree
     UPERF_FAKE_ROOT="$FAKE_ROOT" \
         UPERF_CPU_GOVERNOR=1 \
         UPERF_SCHED_DRY_RUN=1 \
+        UPERF_LOG_MAX_BYTES="${UPERF_TEST_LOG_MAX:-4194304}" \
         UPERF_STATE_FILE="$T/orig_governor.txt" \
         UPERF_STATUS_FILE="$T/uperf.state" \
-        UPERF_STATUS_CONFIG="$T/t3.json" \
-        "$FAKE_EXE" "$T/t3.json" -o "$T/daemon_log.txt" </dev/null >/dev/null 2>&1 &
+        UPERF_STATUS_CONFIG="$cfg" \
+        "$FAKE_EXE" "$cfg" -o "$T/daemon_log.txt" </dev/null >/dev/null 2>&1 &
     i=0
     while [ "$i" -lt 60 ]; do
         [ "$(cat "$FAKE_FREQ/policy0/scaling_governor" 2>/dev/null)" = "userspace" ] && return 0
@@ -341,6 +358,14 @@ fi
 
 echo
 echo "== part 4: watchdog cost, and the control that the real CPU was never touched"
+# The log volume is config-driven (`modules.log.level`). `trace` guarantees far more
+# than the 64 KiB cap inside the 60 s window: at `info` the volume sat right at the cap
+# (measured 39 KB in one run, 263 KB in another) and the assertion was a coin flip.
+# 8 KiB: the rotation then happens within seconds of the first lines. A cap at or
+# above the daemon's ~30-60 KB/min output made the assertion a coin flip (measured:
+# 39 KB, 56 KB, 57 KB in three 60 s runs, never a rotation; the volume is
+# activity-bound, so raising `modules.log.level` to `trace` did not change it either).
+UPERF_TEST_LOG_MAX=8192
 if start_test_daemon; then
     # The shipped cadence: 15 s between samples. Measured against the naive scan
     # (`readlink|sed` per pid) this used to be ~20 s of cpu per sample, i.e. the
@@ -355,6 +380,18 @@ if start_test_daemon; then
     wait "$WD5" 2>/dev/null
     [ -n "$T0" ] && [ -n "$T1" ] && c=0 || c=1
     check "read the watchdog's own cpu time" "$c"
+    # The daemon bounds its own log (spdlog's rotating sink). 60 s at info level
+    # writes far more than 64 KiB, so the rotation must be visible: the base file
+    # stops at the cap and `.1` exists. Without this the log grew to 34 MB/day and
+    # left a 138 MB `.bak` beside it (measured).
+    # This vendored spdlog inserts the index before the extension: `log.txt` rotates
+    # to `log.1.txt`, not `log.txt.1` (see rotating_file_sink.h's own comment).
+    [ -f "$T/daemon_log.1.txt" ] && c=0 || c=1
+    check "the daemon rotated its log (daemon_log.1.txt exists)" "$c"
+    base="$(wc -c <"$T/daemon_log.txt" 2>/dev/null | tr -d ' ')"
+    [ -n "$base" ] && [ "$base" -le 131072 ] && c=0 || c=1
+    check "the base log stayed under the cap (${base:-?} bytes <= 128 KiB)" "$c"
+
     ms=$(( (T1 - T0) * 10 ))
     echo "   watchdog cpu: $((T1 - T0)) ticks = ${ms} ms over 60 s at the shipped 15 s cadence -> $((ms * 100 / 60000)).$((ms * 100000 / 60000 % 1000)) % of one core (CLK_TCK=100)"
     [ $((T1 - T0)) -le 120 ] && c=0 || c=1
