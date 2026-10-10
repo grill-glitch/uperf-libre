@@ -1,4 +1,4 @@
-# Foreground helper — top app without `dumpsys` (④, work in progress)
+# Foreground helper — top app without `dumpsys` (④)
 
 **Why**: `cpp/dfps/source/modules/topapp_monitor.cpp` learns the top app from
 `GetTopAppNameDumpsys()` — a spawned process per lookup — and so gates the lookup on the
@@ -21,38 +21,92 @@ Measured with `FgProbe` — a single-class, reflection-only dex run as
   `getTasks(int, boolean, boolean, int)`. The 1-argument `getTasks(int)` does **not** exist
   on this build.
 
-Not yet verified: that calling those methods actually *returns* the top package here
-(the probe enumerated the API surface but was not extended to call it), i.e. whether the
-`system_server`-side permission checks accept a root `app_process`.
+## Resolution — 2026-10-10 (device-verified)
 
-## Blocker (honest status: this is where ④ stands)
+Two things stood in the way; both are now settled.
 
-Any dex containing **more than one class** is reliably killed in this environment:
+### 1. The "any multi-class dex is SIGKILLed" blocker does not reproduce
 
-| variant | content | result |
+The class-count matrix was re-run on the current boot (`helper/exp/`), capturing rc,
+timing and `dmesg` in one window:
+
+| variant | classes | result |
 |---|---|---|
-| `V1` | single class, writes a file, sleeps 3 s | **rc=0**, prints start and end |
-| `V2` | single class + one unused named inner class, sleeps 3 s | **rc=137 (SIGKILL)** |
-| `V3` | + `Proxy.newProxyInstance(ITaskStackListener)`, registers, sleeps | **rc=137**, but the registration itself printed its progress first |
-| `ForegroundHelper` | the real helper | abort (134) in one form, SIGKILL (137) in another, empty log |
+| `V1` | 1 | **rc=0** |
+| `V2` | 2 | **rc=0** (×10, 0 failures) |
+| `V1big` | 1 (10 methods) | **rc=0** |
+| `V3` | 3 | **rc=0** |
+| `ForegroundHelper` | 2 | ran, registered, served |
 
-`setsid` (own session/process group) does **not** help. Nothing about it appears in
-`logcat -b all` or `-b crash`; the abort we did capture was in `app_process`'s own
-`AndroidRuntime::startReg` → `FindClass` → `ASSERT_NO_PENDING_EXCEPTION`, i.e. before any
-of our code runs. Not yet identified: *who* kills it (kernel OOM from a pathological dex
-verification is the leading hypothesis, unchecked — `dmesg` was not captured in the same
-window) and why the class count matters at all.
+`logcat` shows `AndroidRuntime: Calling main entry V2` / `V3` for each run; no OOM, no
+`lowmemorykiller`, no SIGKILL, no `dmesg` line at the moment of the run. The earlier
+`rc=137` was therefore **device-state dependent** — it cleared with the reboot between then
+and now, and is *not* a property of the dex. What state it was, is still **[U]** (a `dmesg`
+capture was never taken in the failing window); nothing about this environment kills a
+two-class dex today. The `ForegroundHelper`'s "abort (134) / SIGKILL (137), empty log" rows
+in the first report are the same story.
 
-Next steps, in order of information per minute:
+### 2. The real defect was field-vs-getter in `packageOf`
 
-1. Run `V2` with `dmesg | tail -30` and `logcat -d | grep -iE "oom|lowmemory"` in the same
-   window — settles whether it is the kernel killing it.
-2. Build V2's dex **without** `--release`/`--lib` and with `d8` from a different
-   build-tools version — a dex/desugar difference is the other plausible shape.
-3. Only once a two-class dex survives: extend the helper to call `getFocusedRootTaskInfo()`
-   and confirm it reports the real package across `am start` switches. Then the daemon side
-   (read `<USER_PATH>/foreground.txt` per tick, use it as the `topapp.pkgName` source with
-   the C++ monitor as fallback) is a small, testable Rust change.
+With the blocker gone, the helper ran and registered — but `foreground.txt` read `-`
+(no package). `FgProbe2` dumped the actual object: `getFocusedRootTaskInfo()` returns
+`android.app.ActivityTaskManager$RootTaskInfo`, and `topActivity` / `baseActivity` /
+`origActivity` / `realActivity` are **public `ComponentName` fields**, not getters —
+`getClass().getMethod("topActivity")` throws `NoSuchMethodException`. The lookup had been
+getter-only, so *every* task resolved to null. Fixed by reading the field first and falling
+back to a getter (`ForegroundHelper.packageOf` + `pkgOfComponent`).
 
-The Java source and the probe are kept here rather than deleted so none of the above has
-to be rediscovered. `build/` is a local artifact directory and is not committed.
+`FgProbe2` also confirmed the API answers the real question:
+`getFocusedRootTaskInfo().topActivity.getPackageName()` = `com.android.settings` while
+Settings is top, `com.android.launcher3` at home.
+
+## Verified on device (after the fix)
+
+`CLASSPATH=foreground.jar app_process /system/bin ForegroundHelper <out> 1200`, driven by
+`helper/exp/fhtest.sh` (`am start` switches):
+
+| step | helper reported |
+|---|---|
+| t0 (home) | `com.android.launcher3` |
+| `am start -a android.settings.SETTINGS` | `com.android.settings` |
+| home again | `com.android.launcher3` |
+| `am start -n com.android.documentsui/.files.FilesActivity` | `com.android.documentsui` |
+
+The listener's own transitions appear on stderr (`topapp <pkg> @ …`), and the file is
+rewritten `<package> <uptime_ms>` on every poll **and** every callback (atomic tmp+rename).
+Prerequisite on this device: unlock first (`input keyevent KEYCODE_WAKEUP` +
+`wm dismiss-keyguard`), or `am start` is refused while the keyguard is up.
+
+## Daemon side (done — queue item ④ closed)
+
+`rust/uperf-core/src/foreground.rs` is the consumer. Each dispatcher tick re-reads
+`<USER_PATH>/foreground.txt` and, when the timestamp is fresh, feeds the line as a
+`topapp.pkgName` event through the *same* path a C++-published one takes; a stale or absent
+file yields nothing, so the vendored monitor stays the fallback. Wired in
+`topic_dispatch.rs` (`recv_timeout` tick + a shared `handle`) and `lib.rs`
+(`foreground::from_env(cfg_dir)`).
+
+* `UPERF_FOREGROUND=0` disables the source (C++ monitor only, as before).
+* `UPERF_FOREGROUND_FILE` overrides the path; default `<config dir>/foreground.txt`.
+* `UPERF_FOREGROUND_MAX_AGE_MS` (default 10000) — must exceed the helper's poll interval.
+* `UPERF_FOREGROUND_TICK_MS` (default 500).
+
+Device e2e (`helper/exp/fg-e2e.sh`, real built daemon under `UPERF_FAKE_ROOT`):
+`Rust: foreground helper file source = …/foreground.txt` at startup, then
+`Rust: topapp.pkgName = com.android.settings / com.android.launcher3 /
+com.android.documentsui` matching the `am start` switches, and the scheduler summary
+`top=Some("com.android.documentsui")`.
+
+## Not done yet
+
+Nothing **starts** the helper. Launching it — and restarting it if it dies — belongs in the
+module's start path (beside `uperf_watchdog.sh`); until then the file source is inert and
+the C++ monitor is the only source in a normal boot. The helper's poll interval must stay
+below `UPERF_FOREGROUND_MAX_AGE_MS`.
+
+`helper/build/` (compiled classes + jars) is a local artifact directory and is not
+committed; `build.sh` builds the dex by hand (see its header — it is deliberately not wired
+into the repo build). The device harness scripts (`exp/*.sh`) and the probes
+(`FgProbe.java`, `FgProbe2.java`) **are** committed, so none of this has to be
+rediscovered. `exp/` in order: `exp.sh` (class-count matrix), `v2loop.sh` (flakiness),
+`fhtest.sh` (helper across switches), `fg-e2e.sh` (daemon reads the file).
