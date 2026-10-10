@@ -1,96 +1,86 @@
 // Tab 2 — the mode switch: writes `cur_powermode.txt`.
 //
-// The list is built from the **loaded config's** `presets` keys plus `auto`, because
-// the shipped configs differ: sdm865 defines a fifth preset (`crazy`) that the four
-// canonical names would miss, and a config could just as well drop one. Offering a
-// name the config does not define would make the daemon log
-// `Failed to switch to undefined preset '…'`, so the page cannot offer it.
+// One list, one selection. The previous version drew the current preset three times
+// over: a card at the top, a row in the list, and a pinned card at the bottom carrying
+// the same sentence as the row — with "defined by the loaded config" repeated under
+// every entry. Here the current preset is simply the checked row, the explanatory text
+// lives behind the ⓘ, and nothing is said twice.
 //
-// `auto` is a legal value of the file but is *not* a preset name: it hands switching to
-// the per-app rules. The hint says that much and no more.
+// `auto` is presented as a row of the same list because it is one of the choices, not a
+// separate concept: it hands switching to the per-app rules. Both the list and the home
+// page's chips come from `presets.js`, so the two can never offer different sets.
 
 import { getString } from '../language.js';
-import { USER_PATH, setPreset } from '../ctl.js';
+import { glyph, setGlyph, openInfo } from '../ui.js';
+import { USER_PATH } from '../ctl.js';
+import { AUTO, presetLabel, presetNames, isDefinedPreset, applyPreset } from '../presets.js';
 
-/** Names of the canonical presets get a translation; anything else shows as-is. */
-const PRESET_KEYS = {
-    powersave: 'preset_powersave',
-    balance: 'preset_balance',
-    performance: 'preset_performance',
-    fast: 'preset_fast',
-    crazy: 'preset_crazy',
-};
-
-export function presetLabel(name) {
-    const key = PRESET_KEYS[name];
-    return key ? `${getString(key)} (${name})` : name;
-}
-
+/** Set by `render`; the row click needs the app's reload-and-redraw callback. */
 let onChanged = null;
 
 export function render(data, config, onPresetChanged) {
-    onChanged = onPresetChanged;
     const current = data['preset.present'] === '1' ? data['preset.current'] : '';
-    document.getElementById('mode-current').textContent =
-        current ? presetLabel(current) : getString('mode_current_none');
-    document.getElementById('mode-current-hint').textContent = current === 'auto'
-        ? getString('mode_hint_auto')
-        : `${USER_PATH}/cur_powermode.txt`;
+    onChanged = onPresetChanged;
+
+    setGlyph('info', document.getElementById('mode-info-icon'), 16);
+    document.getElementById('mode-info').onclick = () => openInfo('mode_info_title', [
+        { text: 'mode_info_what' },
+        { text: 'mode_hint_auto' },
+        { text: 'mode_info_preset' },
+        { text: 'mode_info_file', params: { path: `${USER_PATH}/cur_powermode.txt` } },
+    ]);
 
     const list = document.getElementById('preset-list');
     list.textContent = '';
 
-    const names = config && config.presets ? Object.keys(config.presets) : [];
-    for (const name of names) {
-        list.append(presetRow(name, current, false));
+    // A value the config does not define can still be in the file (a config was swapped
+    // under it). Showing it as the checked row is honest; hiding it would leave the page
+    // claiming no mode is set while the daemon is running one.
+    if (current && !presetNames(config).includes(current)) {
+        list.append(modeRow(current, current, undefined));
     }
-    list.append(presetRow('auto', current, true));
+    for (const name of presetNames(config)) {
+        list.append(modeRow(name, current, config));
+    }
 
-    document.getElementById('mode-note').textContent = names.length
-        ? getString('mode_hint_preset')
+    document.getElementById('mode-note').textContent = config
+        ? getString('mode_hint_inode', { path: `${USER_PATH}/cur_powermode.txt` })
         : getString('msg_no_config', { path: `${USER_PATH}/uperf.json` });
 }
 
-function presetRow(name, current, isAuto) {
+function modeRow(name, current, config) {
     const row = document.createElement('div');
     row.className = 'preset';
+    row.setAttribute('role', 'radio');
     row.setAttribute('aria-current', String(name === current));
     row.dataset.preset = name;
-
-    const glyph = document.createElement('md-icon');
-    glyph.innerHTML = window.__icon(name === current ? 'check_circle' : 'radio_button_unchecked');
-    row.append(glyph);
+    row.append(document.createElement('md-ripple'));
+    row.append(glyph(name === current ? 'check_circle' : 'radio_button_unchecked', 22, 'sel'));
 
     const text = document.createElement('div');
-    text.className = 'card-text';
+    text.className = 'preset-text';
     const title = document.createElement('div');
-    title.className = 'card-title';
-    title.textContent = isAuto ? `${getString('preset_auto')} (auto)` : presetLabel(name);
-    const detail = document.createElement('div');
-    detail.className = 'card-subtitle';
-    detail.textContent = isAuto ? getString('mode_hint_auto') : getString('preset_defined');
-    text.append(title, detail);
-    row.append(text);
+    title.className = 'preset-title';
+    title.textContent = presetLabel(name);
+    text.append(title);
 
-    row.addEventListener('click', () => apply(name, row));
+    // Only `auto` needs a line of its own, and only when the config is loaded: the
+    // generic "defined by the loaded config" subtitle said nothing about any row.
+    if (config === undefined) {
+        text.append(subLine('preset_undefined'));
+    } else if (name === AUTO) {
+        text.append(subLine('mode_hint_auto'));
+    } else if (config && !isDefinedPreset(config, name)) {
+        text.append(subLine('preset_undefined'));
+    }
+    row.append(text);
+    row.onclick = () => applyPreset(name, row, onChanged);
     return row;
 }
 
-async function apply(name, row) {
-    if (row.getAttribute('aria-current') === 'true') return;
-    row.classList.add('busy');
-    try {
-        const result = await setPreset(name);
-        // The script writes and then re-reads the file, so `preset.ok` is the file's
-        // own content, not the intent.
-        if (result['preset.ok'] !== '1') {
-            throw new Error(result['preset.error'] || 'write failed');
-        }
-        window.__toast(getString('toast_preset_ok', { name: presetLabel(name) }));
-        await onChanged?.();
-    } catch (err) {
-        window.__toast(getString('toast_preset_fail', { err: err.message }));
-    } finally {
-        row.classList.remove('busy');
-    }
+function subLine(key) {
+    const el = document.createElement('div');
+    el.className = 'preset-sub';
+    el.textContent = getString(key);
+    return el;
 }

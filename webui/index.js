@@ -1,4 +1,4 @@
-// Entry point. Holds the shared state, wires the three pages and the refresh loop.
+// Entry point. Holds the shared state, wires the four pages and the refresh loop.
 
 import '@material/web/all.js';
 import { toast } from 'kernelsu-alt';
@@ -35,35 +35,24 @@ async function load() {
     }
 }
 
+/** Every page redraws from the same snapshot, and every write ends in a reload. */
+async function reload() {
+    await load();
+    await render();
+}
+
 async function render() {
-    home.render(state.data, state.config, state.error);
-    mode.render(state.data, state.config, async () => {
-        await load();
-        await render();
-    });
-    dfps.render(state.data, state.config, async () => {
-        await load();
-        await render();
-    });
-    more.render(state.data, () => confirmRestart());
+    home.render(state.data, state.config, state.error, reload);
+    mode.render(state.data, state.config, reload);
+    dfps.render(state.data, state.config, reload);
+    // `more.js` owns the confirmation dialog; it only needs the action itself.
+    more.render(state.data, doRestart);
 }
 
 window.__rerender = () => {
     applyStaticTranslations();
     render();
 };
-
-function confirmRestart() {
-    const dialog = document.getElementById('confirm-dialog');
-    document.getElementById('confirm-title').textContent = getString('confirm_restart_title');
-    document.getElementById('confirm-body').textContent = getString('confirm_restart_body');
-    document.getElementById('confirm-cancel').onclick = () => dialog.close();
-    document.getElementById('confirm-ok').onclick = async () => {
-        dialog.close();
-        await doRestart();
-    };
-    dialog.show();
-}
 
 async function doRestart() {
     try {
@@ -77,20 +66,14 @@ async function doRestart() {
     } catch (err) {
         toast(getString('toast_restart_fail', { err: err.message }));
     }
-    await load();
-    await render();
+    await reload();
 }
 
+// Only the chrome lives here; each page draws its own icons in its own module.
 const STATIC_ICONS = {
     'splash-mark': 'bolt',
     'back-icon': 'arrow_back',
     'refresh-icon': 'refresh',
-    'status-icon': 'speed',
-    'cfg-icon': 'memory',
-    'mode-icon': 'tune',
-    'restart-icon': 'restart_alt',
-    'language-icon': 'language',
-    'log-refresh-icon': 'refresh',
 };
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -120,13 +103,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     document.getElementById('refresh-btn').onclick = async () => {
-        await load();
-        await render();
+        await reload();
         if (currentTab() === 'more') await more.refreshLog();
     };
 
-    await load();
-    await render();
+    await reload();
 
     if (splash) {
         setTimeout(() => splash.classList.add('exit'), 50);

@@ -19,72 +19,109 @@
         <div class="top-bar">
             <md-icon-button id="back-btn" aria-label="exit" class="hidden"><md-icon id="back-icon"></md-icon></md-icon-button>
             <div class="title" id="title">Uperf</div>
-            <md-icon-button id="refresh-btn" aria-label="refresh"><md-icon id="refresh-icon"></md-icon></md-icon-button>
+            <!-- One action, but it says what it acts on: the label is re-set per tab
+                 (route.js) so "refresh" is never a guess about its scope. -->
+            <md-text-button id="refresh-btn">
+                <md-icon slot="icon" id="refresh-icon"></md-icon>
+                <span id="refresh-label" data-i18n="refresh_state">Refresh state</span>
+            </md-text-button>
         </div>
 
         <div class="content" id="content">
             <!-- ------------------------------------------------ 1. 首页 -->
             <div id="home-page" class="page active">
                 <div class="page-content">
-                    <div class="card status-card" id="status-card">
-                        <md-ripple></md-ripple>
-                        <md-icon class="leading-icon" id="status-icon"></md-icon>
-                        <div class="card-text">
-                            <div class="card-title" id="status-title" data-i18n="state_unknown">…</div>
-                            <div class="card-subtitle" id="status-subtitle"></div>
-                        </div>
-                        <div class="badge" id="gov-badge"></div>
-                    </div>
-
-                    <div class="section-label" data-i18n="section_supervision">守护</div>
-                    <div class="card" id="supervision-card"></div>
-
-                    <div class="section-label" data-i18n="section_current_config">当前配置</div>
-                    <div class="card">
-                        <div class="row"><md-icon class="row-icon" id="cfg-icon"></md-icon>
-                            <div class="row-text">
-                                <div class="row-title" id="cfg-name"></div>
-                                <div class="row-detail" id="cfg-author"></div>
-                                <div class="row-detail" id="cfg-extra"></div>
+                    <!-- The one card allowed to shout: orientation comes from the icon
+                         chip, the number strip and the colour, not from reading a
+                         sentence. -->
+                    <div class="card hero" id="status-card">
+                        <div class="hero-top">
+                            <div class="icon-chip" id="status-chip"><md-icon id="status-icon"></md-icon></div>
+                            <div class="hero-text">
+                                <div class="hero-title" id="status-title" data-i18n="state_unknown">…</div>
+                                <div class="hero-sub" id="status-subtitle"></div>
+                            </div>
+                            <div class="badge" id="gov-badge" role="button" tabindex="0">
+                                <md-ripple></md-ripple>
+                                <span class="badge-dot"></span>
+                                <span id="gov-badge-text"></span>
+                                <md-icon class="glyph s14" id="gov-badge-icon"></md-icon>
                             </div>
                         </div>
+                        <div class="stat-row" id="status-stats"></div>
                     </div>
 
-                    <div class="section-label" data-i18n="section_device">设备</div>
-                    <div class="card" id="device-card"></div>
+                    <div class="section-label" id="config-label" data-i18n="section_current_config">Current config</div>
+                    <div class="card" id="config-card">
+                        <div class="kv" id="config-kv"></div>
+                        <!-- The quick toggle: the same write the 模式切换 tab makes, so
+                             the most common action is one tap from the landing screen. -->
+                        <div class="chip-row" id="preset-chips"></div>
+                        <div class="hint" id="cfg-hint"></div>
+                    </div>
 
-                    <div class="section-label" data-i18n="section_module">模块</div>
-                    <div class="card" id="module-card"></div>
+                    <div class="section-label" id="supervision-label" data-i18n="section_supervision">Supervision</div>
+                    <div class="card" id="supervision-card">
+                        <div class="kv" id="supervision-kv"></div>
+                    </div>
+
+                    <!-- Static hardware facts are reference material: collapsed by
+                         default so the fold belongs to what changes. -->
+                    <button class="disclosure" id="device-toggle" aria-expanded="false" aria-controls="device-body">
+                        <md-ripple></md-ripple>
+                        <md-icon class="glyph s20 dim" id="device-toggle-icon"></md-icon>
+                        <span id="device-toggle-label"></span>
+                        <md-icon class="glyph s20 chev" id="device-toggle-chev"></md-icon>
+                    </button>
+                    <div class="disclosure-body" id="device-body">
+                        <div class="group">
+                            <div class="group-title" data-i18n="section_device">Device</div>
+                            <div class="kv" id="device-kv"></div>
+                        </div>
+                        <div class="group">
+                            <div class="group-title" data-i18n="section_module">Module</div>
+                            <div class="kv" id="module-kv"></div>
+                        </div>
+                    </div>
                 </div>
             </div>
 
             <!-- ------------------------------------------------ 2. 模式切换 -->
             <div id="mode-page" class="page">
                 <div class="page-content">
-                    <div class="card current-card">
-                        <md-icon class="leading-icon" id="mode-icon"></md-icon>
-                        <div class="card-text">
-                            <div class="card-title" id="mode-current"></div>
-                            <div class="card-subtitle" id="mode-current-hint"></div>
-                        </div>
+                    <div class="section-head">
+                        <div class="section-label" data-i18n="section_presets">Presets</div>
+                        <button class="mini" id="mode-info" type="button">
+                            <md-icon class="glyph s16" id="mode-info-icon"></md-icon>
+                            <span data-i18n="button_help">About</span>
+                        </button>
                     </div>
+                    <!-- One list, one selection: the current preset is the checked row,
+                         and `auto` is a row of the same list rather than a second card
+                         that repeats it. -->
                     <div class="preset-list" id="preset-list"></div>
-                    <div class="hint" id="mode-note"></div>
+                    <div class="hint mono" id="mode-note"></div>
                 </div>
             </div>
 
             <!-- ------------------------------------------------ 3. 刷新率 (dfps) -->
             <div id="dfps-page" class="page">
                 <div class="page-content">
-                    <div class="card current-card">
-                        <md-icon class="leading-icon" id="dfps-cur-icon"></md-icon>
-                        <div class="card-text">
-                            <div class="card-title" id="dfps-cur-label" data-i18n="dfps_cur_title">Current refresh rate</div>
-                            <div class="card-subtitle" id="dfps-cur">—</div>
-                            <div class="card-subtitle" id="dfps-config-path"></div>
+                    <div class="card">
+                        <div class="kv">
+                            <div class="kv-label" data-i18n="dfps_cur_title">Current refresh rate</div>
+                            <div class="kv-value dfps-hz" id="dfps-cur">—</div>
+                            <div class="kv-label" data-i18n="label_config">Config file</div>
+                            <div class="kv-value mono" id="dfps-config-path"></div>
                         </div>
                     </div>
-                    <div class="section-label" data-i18n="section_dfps_rules">Rules</div>
+                    <div class="section-head">
+                        <div class="section-label"><span data-i18n="section_dfps_rules">Rules</span> <span class="section-count" id="dfps-rule-count"></span></div>
+                        <button class="mini" id="dfps-add" type="button">
+                            <md-icon class="glyph s16" id="dfps-add-icon"></md-icon>
+                            <span data-i18n="dfps_add_rule">Add rule</span>
+                        </button>
+                    </div>
                     <div class="preset-list" id="dfps-rules"></div>
                 </div>
             </div>
@@ -93,38 +130,46 @@
             <div id="more-page" class="page">
                 <div class="page-content">
                     <div class="card list-card">
-                        <label class="list-item" id="restart-item">
+                        <div class="list-item" id="restart-item">
                             <md-ripple></md-ripple>
                             <md-icon id="restart-icon"></md-icon>
                             <div class="list-item-content">
-                                <div class="row-title" data-i18n="action_restart">重启 uperf daemon</div>
-                                <div class="row-detail" data-i18n="action_restart_detail">停止并按当前配置重新启动</div>
+                                <div class="list-title" data-i18n="action_restart">Restart uperf daemon</div>
+                                <div class="list-sub" data-i18n="action_restart_detail">Stop and start again with the current config</div>
                             </div>
-                        </label>
+                        </div>
                         <div class="list-item" id="language-item">
                             <md-ripple></md-ripple>
                             <md-icon id="language-icon"></md-icon>
                             <div class="list-item-content">
-                                <div class="row-title" data-i18n="action_language">语言</div>
-                                <div class="row-detail" id="current-language"></div>
+                                <div class="list-title" data-i18n="action_language">Language</div>
+                                <div class="list-sub" id="current-language"></div>
                             </div>
                         </div>
                     </div>
 
-                    <div class="section-label" data-i18n="section_log">日志</div>
-                    <div class="card log-card">
+                    <div class="section-label" data-i18n="section_log">Log</div>
+                    <div class="card log-card" id="log-card">
                         <div class="log-toolbar">
-                            <md-text-button id="log-refresh"><md-icon slot="icon" id="log-refresh-icon"></md-icon><span data-i18n="button_refresh">刷新</span></md-text-button>
+                            <md-text-button id="log-refresh"><md-icon slot="icon" id="log-refresh-icon"></md-icon><span data-i18n="button_refresh">Refresh</span></md-text-button>
+                            <span class="spacer"></span>
+                            <md-icon-button id="log-wrap" data-i18n-title="log_wrap"><md-icon id="log-wrap-icon"></md-icon></md-icon-button>
+                            <md-icon-button id="log-copy" data-i18n-title="log_copy"><md-icon id="log-copy-icon"></md-icon></md-icon-button>
+                            <md-icon-button id="log-export" data-i18n-title="log_export"><md-icon id="log-export-icon"></md-icon></md-icon-button>
+                            <md-icon-button id="log-fullscreen" data-i18n-title="log_fullscreen"><md-icon id="log-fullscreen-icon"></md-icon></md-icon-button>
+                        </div>
+                        <div class="log-toolbar">
                             <div class="log-lines">
                                 <md-text-button data-lines="100">100</md-text-button>
                                 <md-text-button data-lines="500">500</md-text-button>
                                 <md-text-button data-lines="2000">2000</md-text-button>
                             </div>
                         </div>
-                        <pre class="log" id="log-view"></pre>
+                        <pre class="log wrap" id="log-view"></pre>
+                        <div class="hint mono" id="log-meta"></div>
                     </div>
 
-                    <div class="section-label" data-i18n="section_about">关于项目</div>
+                    <div class="section-label" data-i18n="section_about">About</div>
                     <div class="card" id="about-card"></div>
                 </div>
             </div>
@@ -133,30 +178,66 @@
         <div class="bottom-bar">
             <div class="bottom-bar-item" id="home" selected>
                 <md-icon class="bottom-icon" data-icon="home"></md-icon>
-                <div class="bottom-bar-item-text" data-i18n="tab_home">首页</div>
+                <div class="bottom-bar-item-text" data-i18n="tab_home">Home</div>
             </div>
             <div class="bottom-bar-item" id="mode">
                 <md-icon class="bottom-icon" data-icon="tune"></md-icon>
-                <div class="bottom-bar-item-text" data-i18n="tab_mode">模式切换</div>
+                <div class="bottom-bar-item-text" data-i18n="tab_mode">Mode</div>
             </div>
             <div class="bottom-bar-item" id="dfps">
                 <md-icon class="bottom-icon" data-icon="speed"></md-icon>
-                <div class="bottom-bar-item-text" data-i18n="tab_dfps">刷新率</div>
+                <div class="bottom-bar-item-text" data-i18n="tab_dfps">Refresh rate</div>
             </div>
             <div class="bottom-bar-item" id="more">
                 <md-icon class="bottom-icon" data-icon="more_horiz"></md-icon>
-                <div class="bottom-bar-item-text" data-i18n="tab_more">更多</div>
+                <div class="bottom-bar-item-text" data-i18n="tab_more">More</div>
             </div>
         </div>
     </div>
 
     <div class="dialog-wrapper" unresolved>
+        <!-- Everything the page explains lives in one dialog rather than in paragraphs
+             pinned under the content: the explanation is available, and it is not
+             competing with the controls for the fold. -->
+        <md-dialog id="info-dialog">
+            <div slot="headline" id="info-title"></div>
+            <div slot="content" class="dialog-body" id="info-body"></div>
+            <div slot="actions">
+                <md-text-button id="info-ok" data-i18n="button_close">Close</md-text-button>
+            </div>
+        </md-dialog>
+
         <md-dialog id="confirm-dialog">
             <div slot="headline" id="confirm-title"></div>
-            <div slot="content" id="confirm-body"></div>
+            <div slot="content" class="dialog-body" id="confirm-body"></div>
             <div slot="actions">
-                <md-text-button id="confirm-cancel" data-i18n="button_cancel">取消</md-text-button>
-                <md-text-button id="confirm-ok" data-i18n="button_ok">确定</md-text-button>
+                <md-text-button id="confirm-cancel" data-i18n="button_cancel">Cancel</md-text-button>
+                <md-text-button id="confirm-ok" data-i18n="button_ok">OK</md-text-button>
+            </div>
+        </md-dialog>
+
+        <!-- Replaces the two chained `prompt()` boxes the rule editor used: prompts are
+             suppressed outright in some WebViews, and two of them cannot show the old
+             values side by side. -->
+        <md-dialog id="field-dialog">
+            <div slot="headline" id="field-title"></div>
+            <div slot="content">
+                <div class="dialog-field" id="field-pkg-wrap">
+                    <md-outlined-text-field id="field-pkg" label="" data-i18n-label="dfps_field_pkg"></md-outlined-text-field>
+                </div>
+                <div class="dialog-row">
+                    <div class="dialog-field">
+                        <md-outlined-text-field id="field-idle" type="number" inputmode="numeric" data-i18n-label="dfps_field_idle"></md-outlined-text-field>
+                    </div>
+                    <div class="dialog-field">
+                        <md-outlined-text-field id="field-active" type="number" inputmode="numeric" data-i18n-label="dfps_field_active"></md-outlined-text-field>
+                    </div>
+                </div>
+                <div class="dialog-note" id="field-note"></div>
+            </div>
+            <div slot="actions">
+                <md-text-button id="field-cancel" data-i18n="button_cancel">Cancel</md-text-button>
+                <md-text-button id="field-save" data-i18n="button_save">Save</md-text-button>
             </div>
         </md-dialog>
     </div>

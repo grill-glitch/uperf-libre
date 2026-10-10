@@ -22,30 +22,34 @@ const root = join(here, '..');
 // icon -> where it is used. Keep the comment: it is what makes a stale entry obvious.
 const ICONS = {
     home: 'bottom bar: 首页',
-    tune: 'bottom bar: 模式切换',
+    tune: 'bottom bar: 模式切换 / home: armed clusters stat',
     more_horiz: 'bottom bar: 更多',
-    refresh: 'top bar / log refresh',
-    speed: 'home: work status card / bottom bar: 刷新率',
-    memory: 'home: config card',
-    devices: 'home: device card',
-    package_2: 'home: module card',
-    bolt: 'splash mark',
+    refresh: 'top bar refresh button / log refresh',
+    speed: 'home: hero status card / bottom bar: 刷新率',
+    devices: 'home: the device/module disclosure and its rows',
+    bolt: 'splash mark / home: daemon pid stat',
     check_circle: 'mode: current preset',
     radio_button_unchecked: 'mode: selectable preset',
-    description: 'more: log',
     restart_alt: 'more: restart daemon',
-    info: 'more: about',
+    info: 'more: about / the per-section explainer dialogs',
     open_in_new: 'about: external links',
     error: 'error card',
     warning: 'warning state',
     arrow_back: 'top bar: exit the WebUI',
     layers: 'about: platform layer',
     language: 'more: language row',
-    sync: 'restart in progress',
     all_inclusive: 'dfps: the universal "*" rule row',
     bedtime: 'dfps: the offscreen "-" rule row',
     apps: 'dfps: a per-app rule row',
-    verified_user: 'home: supervision card',
+    keyboard_arrow_down: 'collapsed disclosure',
+    keyboard_arrow_up: 'expanded disclosure',
+    edit: 'dfps: edit a rule',
+    add: 'dfps: add a rule',
+    content_copy: 'log: copy',
+    download: 'log: export',
+    fullscreen: 'log: enter full screen',
+    fullscreen_exit: 'log: leave full screen',
+    wrap_text: 'log: wrap long lines',
 };
 
 // --- 1. every listed icon must exist in the package -------------------------
@@ -73,19 +77,22 @@ if (missing.length) {
 
 // --- 2. every name a call site uses must be listed --------------------------
 //
-// Scans for `icon(...)` / `__icon(...)` and collects every lowercase string
-// literal inside the call's parentheses. Parentheses are matched by depth and
-// *all* literals are taken, because the call is often a ternary:
+// Scans for `icon(...)` / `__icon(...)` / `glyph(...)` / `setGlyph(...)` and collects
+// every lowercase string literal inside the call's parentheses. Parentheses are matched
+// by depth and *all* literals are taken, because the call is often a ternary:
 //
-//     __icon(pkg === '*' ? 'all_inclusive' : pkg === '-' ? 'bedtime' : 'apps')
+//     glyph(name === current ? 'check_circle' : 'radio_button_unchecked')
 //
-// which a regex anchored on `icon('` misses entirely — the same blind spot that
-// let the original bug through. `data-icon="..."` attributes are checked too.
+// which a regex anchored on `icon('` misses entirely — the same blind spot that let the
+// original bug through. `ui.js` wraps the icon set behind `glyph()`/`setGlyph()`; those
+// names are scanned too, so the wrapper cannot hide a name with no glyph behind it.
+// `data-icon="..."` attributes are checked as well.
 //
-// Only literals are seen, so a name passed through a variable (index.js's
-// STATIC_ICONS map) is not checked; those are reported as a warning instead.
+// Only literals are seen, so a name passed through a variable (the STATIC_ICONS maps)
+// is not checked; those are reported as a warning instead.
 
 const SCAN_EXT = new Set(['.js', '.mjs', '.html']);
+const SCAN_CALLS = ['__icon', 'icon', 'glyph', 'setGlyph'];
 // `tools/` holds the build-time generators, not UI code: they contain `icon(`
 // inside comments and inside the `icons.js` template they emit, whose string
 // literals ('node_modules', 'utf8', …) would otherwise be reported as unlisted
@@ -122,6 +129,31 @@ function* callArgs(text, name) {
     }
 }
 
+/**
+ * Everything before the first top-level comma — i.e. the icon-name argument.
+ *
+ * Only the name is checked. `glyph('edit', 18, 'dim')` passes CSS class names in the
+ * later positions, and taking every literal in the call reported `dim`, `sel` and `chev`
+ * as icons that are "used but not listed". Escaped quotes are not handled: none of these
+ * call sites has one, and the only job here is finding the first top-level comma.
+ */
+function firstArg(args) {
+    let depth = 0;
+    let quote = null;
+    for (let i = 0; i < args.length; i += 1) {
+        const c = args[i];
+        if (quote) {
+            if (c === quote) quote = null;
+            continue;
+        }
+        if (c === "'" || c === '"' || c === '`') { quote = c; continue; }
+        if (c === '(' || c === '[' || c === '{') depth += 1;
+        else if (c === ')' || c === ']' || c === '}') depth -= 1;
+        else if (c === ',' && depth === 0) return args.slice(0, i);
+    }
+    return args;
+}
+
 const referenced = new Map(); // name -> Set(where)
 const note = (name, where) => {
     if (!referenced.has(name)) referenced.set(name, new Set());
@@ -131,9 +163,9 @@ const note = (name, where) => {
 for (const file of sourceFiles(root)) {
     const text = readFileSync(file, 'utf8');
     const where = relative(root, file);
-    for (const fn of ['__icon', 'icon']) {
+    for (const fn of SCAN_CALLS) {
         for (const args of callArgs(text, fn)) {
-            for (const [, lit] of args.matchAll(/'([a-z_0-9]+)'/g)) note(lit, `${where}:${fn}`);
+            for (const [, lit] of firstArg(args).matchAll(/'([a-z_0-9]+)'/g)) note(lit, `${where}:${fn}`);
         }
     }
     for (const [, lit] of text.matchAll(/data-icon="([a-z_0-9]+)"/g)) note(lit, `${where}:data-icon`);

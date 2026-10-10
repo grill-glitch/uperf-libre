@@ -1,29 +1,19 @@
-// Tab 1 — work state, the loaded config, the device and the module.
+// Tab 1 — work state, the loaded config + quick preset toggle, supervision, and the
+// static device/module facts behind a disclosure.
 //
 // Every value shown here comes from `webui.sh` (already verified from a shell) or from
 // the config JSON the daemon itself loads. Nothing is estimated: when a field is
 // missing the row is omitted rather than filled with a guess.
+//
+// Layout rule this page follows: what changes goes above the fold and gets the numbers
+// treatment; what is fixed about the phone (SoC, kernel, ABI, module author) is
+// reference material and stays collapsed. The previous version interleaved both at equal
+// weight, which is why the fold was spent on a kernel string.
 
 import { getString } from '../language.js';
-
-function row(iconEl, container) {
-    const wrap = document.createElement('div');
-    wrap.className = 'row';
-    if (iconEl) wrap.append(iconEl);
-    const text = document.createElement('div');
-    text.className = 'row-text';
-    wrap.append(text);
-    container.append(wrap);
-    return text;
-}
-
-function addDetail(textEl, label, value) {
-    if (value === undefined || value === null || value === '') return;
-    const line = document.createElement('div');
-    line.className = 'row-detail';
-    line.textContent = `${label}: ${value}`;
-    textEl.append(line);
-}
+import { glyph, setGlyph, kvRows, openInfo } from '../ui.js';
+import { USER_PATH } from '../ctl.js';
+import { presetNames, shortPresetLabel, applyPreset } from '../presets.js';
 
 function formatUptime(seconds) {
     const s = Number(seconds);
@@ -51,140 +41,230 @@ function basename(path) {
     return String(path || '').split('/').filter(Boolean).pop() || '';
 }
 
-export function render(data, config, error) {
-    const statusCard = document.getElementById('status-card');
+export function render(data, config, error, onPresetChanged) {
+    renderHero(data, error);
+
+    // Without the bridge there is no data at all: `webui.sh` is the only source for the
+    // config, the supervision rows and the device facts, so the rest of the page would be
+    // a grid of empty values. One honest message in the hero beats four blank cards.
+    const hasData = !error;
+    for (const id of ['config-label', 'config-card', 'supervision-label', 'supervision-card',
+                      'device-toggle', 'device-body']) {
+        document.getElementById(id).hidden = !hasData;
+    }
+    if (!hasData) return;
+
+    renderConfig(data, config, onPresetChanged);
+    renderSupervision(data);
+    renderDeviceModule(data);
+    setupDeviceToggle();
+    document.getElementById('cfg-hint').textContent = getString('mode_hint_inode', {
+        path: `${USER_PATH}/cur_powermode.txt`,
+    });
+}
+
+function renderHero(data, error) {
+    const card = document.getElementById('status-card');
     const title = document.getElementById('status-title');
-    const subtitle = document.getElementById('status-subtitle');
+    const sub = document.getElementById('status-subtitle');
     const badge = document.getElementById('gov-badge');
+    const stats = document.getElementById('status-stats');
 
     if (error) {
         // One honest place to show a failure, instead of a page of empty values.
-        statusCard.classList.remove('ok');
-        statusCard.classList.add('down');
+        card.classList.remove('ok');
+        card.classList.add('down');
+        setGlyph('error', document.getElementById('status-icon'), 24);
         title.textContent = error.includes('ksu is not defined')
             ? getString('msg_no_ksu')
             : getString('msg_load_fail', { err: error });
-        subtitle.textContent = '';
-        badge.textContent = '';
-        badge.classList.remove('on');
+        sub.textContent = '';
+        badge.hidden = true;
+        stats.hidden = true;
         return;
     }
 
+    badge.hidden = false;
+    stats.hidden = false;
+
     const running = Number(data['daemon.count'] || 0) > 0;
-    statusCard.classList.toggle('ok', running);
-    statusCard.classList.toggle('down', !running);
+    card.classList.toggle('ok', running);
+    card.classList.toggle('down', !running);
+    setGlyph(running ? 'speed' : 'warning', document.getElementById('status-icon'), 24);
     title.textContent = running ? getString('state_running') : getString('state_stopped');
-    subtitle.textContent = running
+    sub.textContent = running
         ? getString('state_running_detail', {
             pids: (data['daemon.pids'] || '').trim(),
             uptime: formatUptime(data['uptime.sec']),
         })
         : getString('state_stopped_detail');
 
+    renderStats(data);
+    renderGovernorBadge(data);
+}
+
+/**
+ * The three numbers that move. Pids and armed-cluster count are what the watchdog and
+ * the daemon status file report, so they are shown verbatim — a dash when the script
+ * printed nothing, never a zero standing in for "unknown".
+ */
+function renderStats(data) {
+    const row = document.getElementById('status-stats');
+    row.textContent = '';
+    const pids = (data['daemon.pids'] || '').trim();
+    const armed = String(data['daemon.armed'] ?? '').trim();
+    const uptime = formatUptime(data['uptime.sec']);
+    row.append(
+        statTile(getString('stat_uptime'), uptime || '—'),
+        statTile(getString('stat_pids'), pids || '—'),
+        statTile(getString('stat_armed'), armed || '—'),
+    );
+}
+
+function statTile(label, value) {
+    const el = document.createElement('div');
+    el.className = 'stat';
+    const l = document.createElement('div');
+    l.className = 'stat-label';
+    l.textContent = label;
+    const v = document.createElement('div');
+    v.className = 'stat-value';
+    v.textContent = value;
+    el.append(l, v);
+    return el;
+}
+
+/**
+ * The governor badge is interactive on purpose. It reads as a state, but the question it
+ * provokes ("why is the tuner not touching the governor?") is the one thing on this
+ * screen a user cannot answer from the page — so tapping it explains what takeover
+ * means, why it is off by default on this kernel, and what the policies currently are.
+ */
+function renderGovernorBadge(data) {
+    const badge = document.getElementById('gov-badge');
     const takeover = data['governor.takeover'] === '1';
-    badge.textContent = takeover ? getString('badge_governor_on') : getString('badge_governor_off');
     badge.classList.toggle('on', takeover);
+    document.getElementById('gov-badge-text').textContent =
+        takeover ? getString('badge_governor_on') : getString('badge_governor_off');
+    setGlyph('info', document.getElementById('gov-badge-icon'), 14);
+    badge.onclick = () => openInfo('badge_info_title', [
+        { text: 'badge_info_what' },
+        { text: takeover ? 'badge_info_on' : 'badge_info_off' },
+        { text: 'badge_info_policies', params: { policies: String(data['governor.policies'] || '—').trim() } },
+        { text: 'badge_info_recorded', params: { recorded: String(data['governor.recorded'] || '—').trim() } },
+    ]);
+}
 
-    document.getElementById('cfg-name').textContent = basename(data['config.path']) || '—';
-    document.getElementById('cfg-author').textContent = config
-        ? `${config.meta?.name ?? ''}`
-        : getString('msg_no_config', { path: `${data['user.path']}/uperf.json` });
-    document.getElementById('cfg-extra').textContent = [
-        data['preset.present'] === '1'
-            ? `${getString('label_preset')}: ${data['preset.current']}`
-            : `${getString('label_preset')}: ${getString('mode_current_none')}`,
-        data['config.present'] === '1'
-            ? `${getString('label_sha')}: ${String(data['config.sha256'] || '').slice(0, 16)}`
-            : '',
-    ].filter(Boolean).join(' · ');
+function renderConfig(data, config, onPresetChanged) {
+    kvRows(document.getElementById('config-kv'), [
+        [getString('label_config'), basename(data['config.path'])],
+        [getString('label_meta'), config?.meta?.name ?? getString('msg_no_config', { path: `${USER_PATH}/uperf.json` })],
+        [getString('label_sha'), data['config.present'] === '1' ? String(data['config.sha256'] || '').slice(0, 16) : '', { mono: true }],
+        [getString('label_path'), data['config.path'], { mono: true }],
+    ]);
 
-    // Supervision: what the daemon claims (`uperf.state`) and what the watchdog says
-    // (`uperf_watchdog.state`). The two together are what make a kill visible — a
-    // stale `daemon.state=running` with no process is the documented signature of one,
-    // and `watchdog.state=gave-up` means the restart budget was spent and the platform
-    // governor is in charge on purpose (docs/m9-watchdog.md).
-    const supervision = document.getElementById('supervision-card');
-    supervision.textContent = '';
+    const chips = document.getElementById('preset-chips');
+    chips.textContent = '';
+    chips.hidden = !config;
+    if (!config) return;
+
+    const current = data['preset.present'] === '1' ? data['preset.current'] : '';
+    for (const name of presetNames(config)) {
+        const chip = document.createElement('div');
+        chip.className = 'chip';
+        chip.setAttribute('role', 'button');
+        chip.setAttribute('aria-current', String(name === current));
+        chip.append(document.createElement('md-ripple'));
+        if (name === current) chip.append(glyph('check_circle', 16));
+        const label = document.createElement('span');
+        label.textContent = shortPresetLabel(name);
+        chip.append(label);
+        chip.onclick = () => applyPreset(name, chip, onPresetChanged);
+        chips.append(chip);
+    }
+}
+
+/**
+ * What the daemon claims (`uperf.state`) and what the watchdog says
+ * (`uperf_watchdog.state`). The two together are what make a kill visible — a stale
+ * `daemon.state=running` with no process is the documented signature of one, and
+ * `watchdog.state=gave-up` means the restart budget was spent and the platform governor
+ * is in charge on purpose (docs/m9-watchdog.md).
+ */
+function renderSupervision(data) {
+    const running = Number(data['daemon.count'] || 0) > 0;
     const wdState = String(data['watchdog.state'] || '').trim();
     const claim = String(data['daemon.state'] || '').trim();
     const killed = claim === 'running' && !running;
-    const rows = [
+
+    const pairs = [
         [getString('label_watchdog_state'), wdState ? stateLabel(wdState) : getString('state_unknown')],
-        [getString('label_watchdog_pid'), data['watchdog.pid']],
-        [getString('label_watchdog_restarts'), data['watchdog.restarts']],
-        [getString('label_daemon_claim'), killed
-            ? getString('daemon_claim_killed')
-            : (claim ? stateLabel(claim) : '')],
-        [getString('label_armed_clusters'), data['daemon.armed']],
+        [getString('label_watchdog_pid'), (data['watchdog.pid'] || '').trim()],
+        [getString('label_watchdog_restarts'), (data['watchdog.restarts'] || '').trim()],
+        [getString('label_daemon_claim'), killed ? getString('daemon_claim_killed') : (claim ? stateLabel(claim) : '')],
     ];
+
     // The frame source only when it is being supervised: `off` means the module is not
     // injecting into surfaceflinger, and a row saying so every time would be noise.
     const sfState = String(data['watchdog.sf_state'] || '').trim();
     if (sfState && sfState !== 'off') {
-        rows.push([getString('label_frame_source'), stateLabel(sfState)]);
-        rows.push([getString('label_frame_injected'), data['watchdog.sf_injects'] || '0']);
-        rows.push([getString('label_frame_failed'), data['watchdog.sf_fails'] || '0']);
+        pairs.push([getString('label_frame_source'), stateLabel(sfState)]);
+        pairs.push([getString('label_frame_injected'), (data['watchdog.sf_injects'] || '0').trim()]);
+        pairs.push([getString('label_frame_failed'), (data['watchdog.sf_fails'] || '0').trim()]);
     }
     // ⑤ the daemon's own frame leg (opt-in `UPERF_SF_BINDER=1`): `hint` while the
     // injected hint is fresh, `fps` when the direct-binder leg had to take over.
     const leg = String(data['frame.source'] || '').trim();
     if (leg) {
-        rows.push([getString('label_frame_leg'), leg]);
+        pairs.push([getString('label_frame_leg'), leg]);
         const fps = String(data['frame.fps'] || '').trim();
-        if (fps && fps !== '-') {
-            rows.push([getString('label_frame_fps'), fps]);
-        }
+        if (fps && fps !== '-') pairs.push([getString('label_frame_fps'), fps]);
     }
-    addRow(supervision, 'verified_user', rows, getString('section_supervision'));
 
-    const device = document.getElementById('device-card');
-    device.textContent = '';
-    addRow(device, 'memory', [
-        [getString('label_model'), data['device.model']],
-        [getString('label_soc'), [data['soc.platform'], data['soc.model']].filter(Boolean).join(' / ')],
-        [getString('label_android'), [data['android.release'], data['android.sdk'] ? `API ${data['android.sdk']}` : ''].filter(Boolean).join(' · ')],
-        [getString('label_kernel'), data['kernel.release']],
-        [getString('label_selinux'), data['selinux']],
-        // ⑩: the module ships arm64-only binaries, so say it rather than let a user
-        // wonder why nothing runs.
-        [getString('label_abi'), data['device.abi']
-            ? (data['module.arch_supported'] === '1'
-                ? data['device.abi']
-                : `${data['device.abi']} (${getString('value_unsupported')})`)
-            : ''],
-    ]);
-
-    const module = document.getElementById('module-card');
-    module.textContent = '';
-    addRow(module, 'package_2', [
-        [getString('label_author'), data['module.author']],
-        [getString('label_description'), data['module.description']],
-    ], `${data['module.name'] || ''}`, [data['module.version'], data['module.versioncode'] ? `(${data['module.versioncode']})` : ''].filter(Boolean).join(' '));
+    kvRows(document.getElementById('supervision-kv'), pairs);
 }
 
-/** A card with a leading icon, an optional title/subtitle, and label/value rows. */
-function addRow(container, iconName, pairs, heading, subheading) {
-    const wrap = document.createElement('div');
-    wrap.className = 'row';
-    const glyph = document.createElement('md-icon');
-    glyph.className = 'row-icon';
-    glyph.innerHTML = window.__icon(iconName);
-    wrap.append(glyph);
-    const text = document.createElement('div');
-    text.className = 'row-text';
-    if (heading) {
-        const h = document.createElement('div');
-        h.className = 'row-title';
-        h.textContent = heading;
-        text.append(h);
-    }
-    if (subheading) {
-        const s = document.createElement('div');
-        s.className = 'row-detail';
-        s.textContent = subheading;
-        text.append(s);
-    }
-    for (const [label, value] of pairs) addDetail(text, label, value);
-    wrap.append(text);
-    container.append(wrap);
+function renderDeviceModule(data) {
+    // ⑩: the module ships arm64-only binaries, so say it rather than let a user
+    // wonder why nothing runs.
+    const abi = data['device.abi']
+        ? (data['module.arch_supported'] === '1' ? data['device.abi'] : `${data['device.abi']} (${getString('value_unsupported')})`)
+        : '';
+
+    kvRows(document.getElementById('device-kv'), [
+        [getString('label_model'), (data['device.model'] || '').trim()],
+        [getString('label_soc'), [data['soc.platform'], data['soc.model']].filter(Boolean).join(' / ')],
+        [getString('label_android'), [data['android.release'], data['android.sdk'] ? `API ${data['android.sdk']}` : ''].filter(Boolean).join(' · ')],
+        [getString('label_kernel'), (data['kernel.release'] || '').trim(), { mono: true }],
+        [getString('label_selinux'), (data['selinux'] || '').trim()],
+        [getString('label_abi'), abi],
+    ]);
+
+    kvRows(document.getElementById('module-kv'), [
+        [getString('label_name'), (data['module.name'] || '').trim()],
+        [getString('label_version'), [(data['module.version'] || '').trim(), data['module.versioncode'] ? `(${data['module.versioncode'].trim()})` : ''].filter(Boolean).join(' ')],
+        [getString('label_author'), (data['module.author'] || '').trim()],
+        [getString('label_description'), (data['module.description'] || '').trim()],
+        [getString('label_module_dir'), (data['module.dir'] || '').trim(), { mono: true }],
+    ]);
+}
+
+/** Open/closed state lives on the body element, so a re-render does not reset it. */
+function setupDeviceToggle() {
+    const toggle = document.getElementById('device-toggle');
+    const body = document.getElementById('device-body');
+    const label = document.getElementById('device-toggle-label');
+    setGlyph('devices', document.getElementById('device-toggle-icon'), 20, 'dim');
+    label.textContent = getString('section_device_module');
+
+    const paint = () => {
+        const open = body.classList.contains('open');
+        setGlyph(open ? 'keyboard_arrow_up' : 'keyboard_arrow_down', document.getElementById('device-toggle-chev'), 20, 'chev');
+        toggle.setAttribute('aria-expanded', String(open));
+    };
+    toggle.onclick = () => {
+        body.classList.toggle('open');
+        paint();
+    };
+    paint();
 }

@@ -1,23 +1,58 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- tabs -->
     <string name="tab_home">首页</string>
     <string name="tab_mode">模式切换</string>
     <string name="tab_dfps">刷新率</string>
     <string name="tab_more">更多</string>
+
+    <!-- shared controls -->
+    <string name="button_refresh">刷新</string>
+    <string name="button_cancel">取消</string>
+    <string name="button_ok">确定</string>
+    <string name="button_save">保存</string>
+    <string name="button_close">关闭</string>
+    <string name="button_help">说明</string>
+
+    <!-- the top-bar action names its own scope, per tab -->
+    <string name="refresh_state">刷新状态</string>
+    <string name="refresh_reload">重新读取</string>
+    <string name="refresh_log">刷新日志</string>
+
+    <!-- hero -->
     <string name="state_unknown">读取中…</string>
     <string name="state_running">运行中</string>
     <string name="state_stopped">未运行</string>
-    <string name="state_running_detail">pids {pids} · 已运行 {uptime}</string>
+    <string name="state_running_detail">pids {pids} · {uptime}</string>
+    <string name="section_presets">预设</string>
     <string name="state_stopped_detail">uperf daemon 未在运行</string>
+    <string name="stat_uptime">运行时长</string>
+    <string name="stat_pids">守护 PID</string>
+    <string name="stat_armed">已接管集群</string>
+
+    <!-- interactive governor badge -->
     <string name="badge_governor_on">调频器接管中</string>
     <string name="badge_governor_off">未接管调频器</string>
+    <string name="badge_info_title">CPU 调频器</string>
+    <string name="badge_info_what">「接管」指本模块把每个 CPU policy 的 scaling_governor 换成 userspace，并每周期下发目标频点。不接管时由系统自己的 governor（本机是 schedutil）决定频点。</string>
+    <string name="badge_info_off">当前未接管，这是默认行为：本机 scaling_max_freq 在驱动层就是只读的，所以调频只能走 userspace 全权接管——收益不抵风险，需要显式设置 UPERF_CPU_GOVERNOR=1 才开启。</string>
+    <string name="badge_info_on">当前已接管。daemon 停止或被杀死时，看门狗会把 governor 还原成接管前记录的值。</string>
+    <string name="badge_info_policies">此刻各 policy 的 governor：{policies}</string>
+    <string name="badge_info_recorded">接管前记录的原值：{recorded}</string>
+
+    <!-- sections -->
     <string name="section_current_config">当前配置</string>
+    <string name="section_supervision">守护</string>
     <string name="section_device">设备</string>
     <string name="section_module">模块</string>
+    <string name="section_device_module">设备与模块</string>
     <string name="section_log">日志</string>
     <string name="section_about">关于项目</string>
+    <string name="section_dfps_rules">规则</string>
+
+    <!-- labels -->
     <string name="label_config">配置文件</string>
-    <string name="label_preset">当前预设</string>
+    <string name="label_path">路径</string>
     <string name="label_meta">配置标识</string>
     <string name="label_sha">SHA-256</string>
     <string name="label_model">型号</string>
@@ -25,63 +60,32 @@
     <string name="label_android">Android</string>
     <string name="label_kernel">内核</string>
     <string name="label_abi">指令集</string>
-    <string name="value_unsupported">不支持</string>
     <string name="label_selinux">SELinux</string>
+    <string name="label_name">名称</string>
+    <string name="label_version">版本</string>
     <string name="label_author">作者</string>
     <string name="label_description">说明</string>
+    <string name="label_module_dir">模块目录</string>
     <string name="label_source_repo">源码仓库</string>
     <string name="label_upstream">原项目</string>
     <string name="label_platform">平台层</string>
     <string name="label_license">协议</string>
-    <string name="label_attribution">署名</string>
+    <string name="value_unsupported">不支持</string>
     <string name="attr_text">策略引擎用 Rust 重写，平台层复用 dfps 的 C++。uperf 作者 Matt Yang（yc9559）；dfps 同作者（Apache-2.0，已 vendored）。</string>
-    <string name="mode_current">当前模式</string>
-    <string name="mode_current_none">未设置</string>
-    <string name="mode_hint_inode">写入 {path}，daemon 在运行中即时生效。</string>
-    <string name="mode_hint_auto">auto 表示交给 perapp_powermode.txt 中的分应用规则决定。</string>
-    <string name="mode_hint_preset">预设名来自已加载的配置，因此只提供该配置定义的预设。</string>
-    <string name="action_restart">重启 uperf daemon</string>
-    <string name="action_restart_detail">按当前配置停止并重新启动</string>
-    <string name="action_language">语言</string>
-    <string name="button_refresh">刷新</string>
-    <string name="button_cancel">取消</string>
-    <string name="button_ok">确定</string>
-    <string name="confirm_restart_title">重启 uperf？</string>
-    <string name="confirm_restart_body">将停止 daemon 并按配置重新启动，策略状态由配置重新应用。</string>
-    <string name="toast_preset_ok">已切换到 {name}</string>
-    <string name="toast_preset_fail">切换失败：{err}</string>
-    <string name="toast_restart_ok">uperf 已重启</string>
-    <string name="toast_restart_fail">重启失败：{err}</string>
-    <string name="toast_copied">已复制</string>
-    <string name="msg_no_ksu">请从 KernelSU 管理器中打开本页：shell 通道不可用。</string>
-    <string name="msg_load_fail">无法读取 daemon 状态：{err}</string>
-    <string name="msg_no_config">找不到配置文件 {path}</string>
-    <string name="msg_loading">读取中…</string>
-    <string name="msg_no_log">（日志为空）</string>
-    <string name="msg_open_fail">无法打开链接</string>
-    <string name="preset_powersave">省电</string>
-    <string name="preset_balance">均衡</string>
-    <string name="preset_performance">性能</string>
-    <string name="preset_fast">快速</string>
-    <string name="preset_crazy">极致</string>
-    <string name="preset_auto">自动</string>
-    <string name="preset_defined">由已加载的配置定义</string>
-    <string name="dfps_cur_title">当前刷新率</string>
-    <string name="section_dfps_rules">规则</string>
-    <string name="dfps_idle">待机</string>
-    <string name="dfps_active">活动</string>
-    <string name="dfps_prompt_idle">{pkg} 的待机 Hz（原 {idle}）</string>
-    <string name="dfps_prompt_active">{pkg} 的活动 Hz（原 {active}）</string>
-    <string name="toast_rule_ok">{pkg} 的规则已更新</string>
-    <string name="toast_rule_fail">更新规则失败：{err}</string>
-        <string name="section_supervision">守护</string>
+
+    <!-- supervision -->
     <string name="label_watchdog_state">看门狗</string>
     <string name="label_watchdog_pid">看门狗 PID</string>
     <string name="label_watchdog_restarts">本次开机重启次数</string>
     <string name="label_daemon_claim">守护进程自报</string>
-    <string name="label_armed_clusters">已接管集群</string>
     <string name="daemon_claim_killed">已被杀（状态文件是陈旧的）</string>
-    <string name="state_running">运行中</string>
+    <string name="label_frame_source">帧源</string>
+    <string name="label_frame_injected">注入次数</string>
+    <string name="label_frame_failed">注入失败</string>
+    <string name="label_frame_leg">帧源分支</string>
+    <string name="label_frame_fps">实测 FPS</string>
+
+    <!-- values the daemon/watchdog write into their state files -->
     <string name="state_starting">启动中</string>
     <string name="state_recovering">恢复中</string>
     <string name="state_restarting">重启中</string>
@@ -89,16 +93,83 @@
     <string name="state_restart_failed">重启失败</string>
     <string name="state_restored">已恢复</string>
     <string name="state_gave_up">已放弃</string>
-    <string name="state_stopped">已停止</string>
-    <string name="label_frame_source">帧源</string>
-    <string name="label_frame_injected">注入次数</string>
-    <string name="label_frame_leg">帧源分支</string>
-    <string name="label_frame_fps">实测 FPS</string>
-    <string name="label_frame_failed">注入失败</string>
     <string name="state_injected">已注入（我们放的）</string>
     <string name="state_healthy">本来就在</string>
     <string name="state_absent">目标未运行</string>
     <string name="state_waiting">重试中</string>
     <string name="state_failed">本次尝试失败</string>
     <string name="state_disabled">已关闭（无注入器）</string>
+
+    <!-- mode tab -->
+    <string name="mode_info_title">模式切换是怎么工作的</string>
+    <string name="mode_info_what">选中的模式写进一个文件；daemon 监听该文件，在运行中即时重新下发策略，所以不需要重启。</string>
+    <string name="mode_hint_auto">auto 表示交给 perapp_powermode.txt 中的分应用规则决定。</string>
+    <string name="mode_info_preset">预设名来自已加载的配置，因此只提供该配置定义的预设——本机配置定义的预设就是列表里这些。</string>
+    <string name="mode_info_file">写入的文件：{path}</string>
+    <string name="mode_hint_inode">写入 {path}，daemon 在运行中即时生效。</string>
+    <string name="preset_undefined">不在已加载的配置中定义</string>
+
+    <!-- presets -->
+    <string name="preset_powersave">省电</string>
+    <string name="preset_balance">均衡</string>
+    <string name="preset_performance">性能</string>
+    <string name="preset_fast">快速</string>
+    <string name="preset_crazy">极致</string>
+    <string name="preset_auto">自动</string>
+
+    <!-- more tab -->
+    <string name="action_restart">重启 uperf daemon</string>
+    <string name="action_restart_detail">按当前配置停止并重新启动</string>
+    <string name="action_language">语言</string>
+    <string name="confirm_restart_title">重启 uperf？</string>
+    <string name="confirm_restart_body">将停止 daemon 并按配置重新启动，策略状态由配置重新应用。</string>
+
+    <!-- refresh-rate tab -->
+    <string name="dfps_cur_title">当前刷新率</string>
+    <string name="dfps_add_rule">添加规则</string>
+    <string name="dfps_idle">待机</string>
+    <string name="dfps_active">活动</string>
+    <string name="dfps_any_app">所有应用</string>
+    <string name="dfps_offscreen">熄屏</string>
+    <string name="dfps_no_rules">（无规则——使用默认刷新率）</string>
+    <string name="dfps_no_status">无法读取刷新率状态：dfps 控制脚本不可用。</string>
+    <string name="dfps_edit_title">{pkg} 的规则</string>
+    <string name="dfps_add_title">添加一条规则</string>
+    <string name="dfps_note_edit">下次评估规则时生效。规则文件会被整体重写。</string>
+    <string name="dfps_note_add">`*` 表示所有应用，`-` 表示熄屏状态，其余按包名处理。</string>
+    <string name="dfps_field_pkg">包名（*、- 或 com.example.app）</string>
+    <string name="dfps_field_idle">待机 Hz</string>
+    <string name="dfps_field_active">活动 Hz</string>
+    <string name="dfps_err_pkg">请填写包名</string>
+    <string name="dfps_err_hz">刷新率是整数 Hz</string>
+
+    <!-- log -->
+    <string name="log_fullscreen">全屏</string>
+    <string name="log_exit_fullscreen">退出全屏</string>
+    <string name="log_wrap">自动换行</string>
+    <string name="log_copy">复制到剪贴板</string>
+    <string name="log_export">导出为文件</string>
+    <string name="log_meta_lines">{n} 行</string>
+    <string name="log_meta_exported">已导出 → {path}</string>
+
+    <!-- messages and toasts -->
+    <string name="msg_no_ksu">请从 KernelSU 管理器中打开本页：shell 通道不可用。</string>
+    <string name="msg_load_fail">无法读取 daemon 状态：{err}</string>
+    <string name="msg_no_config">找不到配置文件 {path}</string>
+    <string name="msg_loading">读取中…</string>
+    <string name="msg_no_log">（日志为空）</string>
+    <string name="msg_no_data">无数据</string>
+    <string name="msg_open_fail">无法打开链接</string>
+    <string name="toast_preset_ok">已切换到 {name}</string>
+    <string name="toast_preset_fail">切换失败：{err}</string>
+    <string name="toast_restart_ok">uperf 已重启</string>
+    <string name="toast_restart_fail">重启失败：{err}</string>
+    <string name="toast_copied">日志已复制</string>
+    <string name="toast_copy_fail">无法访问剪贴板</string>
+    <string name="toast_copy_select">日志已选中，长按可复制</string>
+    <string name="toast_export_ok">已导出到 {path}</string>
+    <string name="toast_export_fail">导出失败：{err}</string>
+    <string name="toast_rule_ok">{pkg} 的规则已更新</string>
+    <string name="toast_rule_added">已添加 {pkg} 的规则</string>
+    <string name="toast_rule_fail">更新规则失败：{err}</string>
 </resources>

@@ -1,23 +1,58 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- tabs -->
     <string name="tab_home">Home</string>
     <string name="tab_mode">Mode</string>
     <string name="tab_dfps">Refresh rate</string>
     <string name="tab_more">More</string>
+
+    <!-- shared controls -->
+    <string name="button_refresh">Refresh</string>
+    <string name="button_cancel">Cancel</string>
+    <string name="button_ok">OK</string>
+    <string name="button_save">Save</string>
+    <string name="button_close">Close</string>
+    <string name="button_help">About</string>
+
+    <!-- the top-bar action names its own scope, per tab -->
+    <string name="refresh_state">Refresh state</string>
+    <string name="refresh_reload">Reload</string>
+    <string name="refresh_log">Refresh log</string>
+
+    <!-- hero -->
     <string name="state_unknown">Reading…</string>
     <string name="state_running">Running</string>
     <string name="state_stopped">Not running</string>
     <string name="state_running_detail">pids {pids} · up {uptime}</string>
+    <string name="section_presets">Presets</string>
     <string name="state_stopped_detail">uperf daemon is not running</string>
+    <string name="stat_uptime">Uptime</string>
+    <string name="stat_pids">Daemon pids</string>
+    <string name="stat_armed">Armed clusters</string>
+
+    <!-- interactive governor badge -->
     <string name="badge_governor_on">governor takeover</string>
     <string name="badge_governor_off">governor untouched</string>
+    <string name="badge_info_title">CPU governor</string>
+    <string name="badge_info_what">"Takeover" means this module switches each CPU policy's scaling_governor to userspace and publishes a target frequency every cycle. Without it the platform's own governor (schedutil here) picks frequencies.</string>
+    <string name="badge_info_off">Right now the governor is untouched, which is the default: on this device scaling_max_freq is read-only at the driver level, so tuning can only happen through full userspace takeover — more risk than benefit unless it is asked for explicitly with UPERF_CPU_GOVERNOR=1.</string>
+    <string name="badge_info_on">Right now the governor is taken over. If the daemon stops or is killed, the watchdog restores the value recorded before takeover.</string>
+    <string name="badge_info_policies">Current governors: {policies}</string>
+    <string name="badge_info_recorded">Recorded before takeover: {recorded}</string>
+
+    <!-- sections -->
     <string name="section_current_config">Current config</string>
+    <string name="section_supervision">Supervision</string>
     <string name="section_device">Device</string>
     <string name="section_module">Module</string>
+    <string name="section_device_module">Device &amp; module</string>
     <string name="section_log">Log</string>
     <string name="section_about">About</string>
+    <string name="section_dfps_rules">Rules</string>
+
+    <!-- labels -->
     <string name="label_config">Config file</string>
-    <string name="label_preset">Preset</string>
+    <string name="label_path">Path</string>
     <string name="label_meta">Config identity</string>
     <string name="label_sha">SHA-256</string>
     <string name="label_model">Model</string>
@@ -25,63 +60,32 @@
     <string name="label_android">Android</string>
     <string name="label_kernel">Kernel</string>
     <string name="label_abi">ABI</string>
-    <string name="value_unsupported">unsupported</string>
     <string name="label_selinux">SELinux</string>
+    <string name="label_name">Name</string>
+    <string name="label_version">Version</string>
     <string name="label_author">Author</string>
     <string name="label_description">Description</string>
+    <string name="label_module_dir">Module directory</string>
     <string name="label_source_repo">Source repository</string>
     <string name="label_upstream">Original project</string>
     <string name="label_platform">Platform layer</string>
     <string name="label_license">License</string>
-    <string name="label_attribution">Attribution</string>
+    <string name="value_unsupported">unsupported</string>
     <string name="attr_text">Policy engine rewritten in Rust on the dfps C++ platform. uperf by Matt Yang (yc9559); dfps by the same author (Apache-2.0, vendored).</string>
-    <string name="mode_current">Current preset</string>
-    <string name="mode_current_none">Not set</string>
-    <string name="mode_hint_inode">Written to {path}, the daemon picks it up while running.</string>
-    <string name="mode_hint_auto">auto hands switching to the per-app rules in perapp_powermode.txt.</string>
-    <string name="mode_hint_preset">Preset names come from the loaded config, so only presets it defines are offered.</string>
-    <string name="action_restart">Restart uperf daemon</string>
-    <string name="action_restart_detail">Stop and start again with the current config</string>
-    <string name="action_language">Language</string>
-    <string name="button_refresh">Refresh</string>
-    <string name="button_cancel">Cancel</string>
-    <string name="button_ok">OK</string>
-    <string name="confirm_restart_title">Restart uperf?</string>
-    <string name="confirm_restart_body">The daemon is stopped and started again. Policy state is re-applied from the config.</string>
-    <string name="toast_preset_ok">Preset set to {name}</string>
-    <string name="toast_preset_fail">Failed to set the preset: {err}</string>
-    <string name="toast_restart_ok">uperf restarted</string>
-    <string name="toast_restart_fail">Restart failed: {err}</string>
-    <string name="toast_copied">Copied</string>
-    <string name="msg_no_ksu">Open this page from the KernelSU manager: the shell bridge is unavailable.</string>
-    <string name="msg_load_fail">Could not read the daemon state: {err}</string>
-    <string name="msg_no_config">No config file at {path}</string>
-    <string name="msg_loading">Reading…</string>
-    <string name="msg_no_log">(log is empty)</string>
-    <string name="msg_open_fail">Could not open the link</string>
-    <string name="preset_powersave">Power save</string>
-    <string name="preset_balance">Balanced</string>
-    <string name="preset_performance">Performance</string>
-    <string name="preset_fast">Fast</string>
-    <string name="preset_crazy">Extreme</string>
-    <string name="preset_auto">Auto</string>
-    <string name="preset_defined">Defined by the loaded config</string>
-    <string name="dfps_cur_title">Current refresh rate</string>
-    <string name="section_dfps_rules">Rules</string>
-    <string name="dfps_idle">idle</string>
-    <string name="dfps_active">active</string>
-    <string name="dfps_prompt_idle">New idle Hz for {pkg} (was {idle})</string>
-    <string name="dfps_prompt_active">New active Hz for {pkg} (was {active})</string>
-    <string name="toast_rule_ok">Rule for {pkg} updated</string>
-    <string name="toast_rule_fail">Failed to update rule: {err}</string>
-    <string name="section_supervision">Supervision</string>
+
+    <!-- supervision -->
     <string name="label_watchdog_state">Watchdog</string>
     <string name="label_watchdog_pid">Watchdog pid</string>
     <string name="label_watchdog_restarts">Restarts this boot</string>
     <string name="label_daemon_claim">Daemon status file</string>
-    <string name="label_armed_clusters">Armed clusters</string>
     <string name="daemon_claim_killed">was killed (stale claim)</string>
-    <string name="state_running">running</string>
+    <string name="label_frame_source">Frame source</string>
+    <string name="label_frame_injected">Injections</string>
+    <string name="label_frame_failed">Failed injections</string>
+    <string name="label_frame_leg">Frame leg</string>
+    <string name="label_frame_fps">Measured FPS</string>
+
+    <!-- values the daemon/watchdog write into their state files -->
     <string name="state_starting">starting</string>
     <string name="state_recovering">recovering</string>
     <string name="state_restarting">restarting</string>
@@ -89,16 +93,83 @@
     <string name="state_restart_failed">restart failed</string>
     <string name="state_restored">restored</string>
     <string name="state_gave_up">gave up</string>
-    <string name="state_stopped">stopped</string>
-    <string name="label_frame_source">Frame source</string>
-    <string name="label_frame_injected">Injections</string>
-    <string name="label_frame_leg">Frame leg</string>
-    <string name="label_frame_fps">Measured FPS</string>
-    <string name="label_frame_failed">Failed injections</string>
     <string name="state_injected">injected (ours)</string>
     <string name="state_healthy">already present</string>
     <string name="state_absent">target not running</string>
     <string name="state_waiting">retrying</string>
     <string name="state_failed">attempt failed</string>
     <string name="state_disabled">disabled (no injector)</string>
+
+    <!-- mode tab -->
+    <string name="mode_info_title">How mode switching works</string>
+    <string name="mode_info_what">The selected mode is written to a single file; the daemon watches that file and re-applies its policy while running, so no restart is needed.</string>
+    <string name="mode_hint_auto">auto hands switching to the per-app rules in perapp_powermode.txt.</string>
+    <string name="mode_info_preset">Preset names come from the loaded config, so only the presets it defines are offered — this device's config defines exactly what you see in the list.</string>
+    <string name="mode_info_file">File written: {path}</string>
+    <string name="mode_hint_inode">Written to {path}; the daemon picks it up while running.</string>
+    <string name="preset_undefined">not defined by the loaded config</string>
+
+    <!-- presets -->
+    <string name="preset_powersave">Power save</string>
+    <string name="preset_balance">Balanced</string>
+    <string name="preset_performance">Performance</string>
+    <string name="preset_fast">Fast</string>
+    <string name="preset_crazy">Extreme</string>
+    <string name="preset_auto">Auto</string>
+
+    <!-- more tab -->
+    <string name="action_restart">Restart uperf daemon</string>
+    <string name="action_restart_detail">Stop and start again with the current config</string>
+    <string name="action_language">Language</string>
+    <string name="confirm_restart_title">Restart uperf?</string>
+    <string name="confirm_restart_body">The daemon is stopped and started again. Policy state is re-applied from the config.</string>
+
+    <!-- refresh-rate tab -->
+    <string name="dfps_cur_title">Current refresh rate</string>
+    <string name="dfps_add_rule">Add rule</string>
+    <string name="dfps_idle">idle</string>
+    <string name="dfps_active">active</string>
+    <string name="dfps_any_app">Any app</string>
+    <string name="dfps_offscreen">Screen off</string>
+    <string name="dfps_no_rules">(no rules — the default refresh rate applies)</string>
+    <string name="dfps_no_status">Could not read the refresh-rate state: the dfps control script is unavailable.</string>
+    <string name="dfps_edit_title">Rule for {pkg}</string>
+    <string name="dfps_add_title">Add a rule</string>
+    <string name="dfps_note_edit">Applies the next time the rule is evaluated. The rule file is rewritten in full.</string>
+    <string name="dfps_note_add">Use * for every app and - for the screen-off state; anything else is a package name.</string>
+    <string name="dfps_field_pkg">Package name (*, - or com.example.app)</string>
+    <string name="dfps_field_idle">Idle Hz</string>
+    <string name="dfps_field_active">Active Hz</string>
+    <string name="dfps_err_pkg">Enter a package name</string>
+    <string name="dfps_err_hz">A refresh rate is a whole number of Hz</string>
+
+    <!-- log -->
+    <string name="log_fullscreen">Full screen</string>
+    <string name="log_exit_fullscreen">Exit full screen</string>
+    <string name="log_wrap">Wrap long lines</string>
+    <string name="log_copy">Copy to clipboard</string>
+    <string name="log_export">Export to a file</string>
+    <string name="log_meta_lines">{n} lines</string>
+    <string name="log_meta_exported">exported → {path}</string>
+
+    <!-- messages and toasts -->
+    <string name="msg_no_ksu">Open this page from the KernelSU manager: the shell bridge is unavailable.</string>
+    <string name="msg_load_fail">Could not read the daemon state: {err}</string>
+    <string name="msg_no_config">No config file at {path}</string>
+    <string name="msg_loading">Reading…</string>
+    <string name="msg_no_log">(log is empty)</string>
+    <string name="msg_no_data">No data</string>
+    <string name="msg_open_fail">Could not open the link</string>
+    <string name="toast_preset_ok">Preset set to {name}</string>
+    <string name="toast_preset_fail">Failed to set the preset: {err}</string>
+    <string name="toast_restart_ok">uperf restarted</string>
+    <string name="toast_restart_fail">Restart failed: {err}</string>
+    <string name="toast_copied">Log copied</string>
+    <string name="toast_copy_fail">Could not reach the clipboard</string>
+    <string name="toast_copy_select">Log selected — long-press to copy</string>
+    <string name="toast_export_ok">Exported to {path}</string>
+    <string name="toast_export_fail">Export failed: {err}</string>
+    <string name="toast_rule_ok">Rule for {pkg} updated</string>
+    <string name="toast_rule_added">Rule for {pkg} added</string>
+    <string name="toast_rule_fail">Failed to update the rule: {err}</string>
 </resources>

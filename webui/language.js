@@ -71,10 +71,21 @@ export function getString(key, params) {
     return text;
 }
 
-/** Fills every element that carries `data-i18n`. */
+/** Fills every element that carries `data-i18n` (and the attribute variants). */
 export function applyStaticTranslations(root = document) {
     for (const el of root.querySelectorAll('[data-i18n]')) {
         el.textContent = getString(el.dataset.i18n);
+    }
+    // Icon-only controls have no room for a label, so their accessible name and their
+    // long-press tooltip are set from the same locale key as everything else.
+    for (const el of root.querySelectorAll('[data-i18n-title]')) {
+        const text = getString(el.dataset.i18nTitle);
+        el.setAttribute('title', text);
+        if (!el.hasAttribute('aria-label')) el.setAttribute('aria-label', text);
+    }
+    // `md-outlined-text-field` takes its label property, not its text content.
+    for (const el of root.querySelectorAll('[data-i18n-label]')) {
+        el.label = getString(el.dataset.i18nLabel);
     }
     document.documentElement.lang = current;
 }

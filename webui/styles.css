@@ -1,6 +1,19 @@
-/* Layout. Card/bottom-bar idiom follows the reference implementation
- * (KernelSU-Next/KPatch-Next-Module, webui/styles.css, MIT), rewritten for this
- * three-tab page set. */
+/* Layout and component styling for the uperf WebUI.
+ *
+ * The card / bottom-bar idiom follows the reference implementation
+ * (KernelSU-Next/KPatch-Next-Module, webui/styles.css, MIT).
+ *
+ * Two rules govern this file:
+ *
+ *  1. Every colour is a `--md-sys-color-*` role (see theme.css). Nothing hardcodes a
+ *     brand hue, so the manager's dynamic colour still drives the page: the accent is
+ *     `primary`, a failure is `error`, and a state worth noticing without being a
+ *     failure is `tertiary`.
+ *  2. A value the user came for is larger, bolder and closer to the text colour than
+ *     the label describing it. That is what makes a screen scannable, and it is what
+ *     the first pass got wrong by rendering labels and values identically: the
+ *     hardware rows read as one grey block.
+ */
 
 * { box-sizing: border-box; }
 
@@ -14,10 +27,13 @@ html, body {
     -webkit-tap-highlight-color: transparent;
     overscroll-behavior: none;
 }
+body.log-open { overflow: hidden; }
 
 /* Elements carrying `unresolved` are hidden until the module sets up, which avoids a
    flash of unstyled markup before the first paint. */
 [unresolved] { visibility: hidden; }
+/* `hidden` has to win over the component display rules below (`.badge`, `.stat-row`). */
+[hidden] { display: none !important; }
 
 /* ------------------------------------------------------------------ splash */
 .splash {
@@ -40,7 +56,6 @@ html, body {
     transition: opacity .35s ease, transform .35s ease;
 }
 .splash-mark.show { opacity: 1; transform: scale(1); }
-.splash-mark svg { width: 100%; height: 100%; fill: currentColor; }
 
 /* ------------------------------------------------------------------ layout */
 .layout {
@@ -53,8 +68,8 @@ html, body {
 .top-bar {
     display: flex;
     align-items: center;
-    gap: 4px;
-    padding: 6px 8px;
+    gap: 2px;
+    padding: 4px 6px;
     background: var(--md-sys-color-surface-container);
     color: var(--md-sys-color-on-surface);
     flex: 0 0 auto;
@@ -62,24 +77,22 @@ html, body {
 .top-bar .title {
     flex: 1;
     font-size: 20px;
-    font-weight: 500;
-    padding-left: 6px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    padding-left: 4px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 md-icon-button.hidden { display: none; }
-md-icon-button md-icon, .leading-icon, .row-icon, .list-item md-icon {
-    width: 24px;
-    height: 24px;
-    display: block;
-}
-md-icon-button md-icon svg, .leading-icon svg, .row-icon svg,
-.list-item md-icon svg, .bottom-icon svg, .splash-mark svg {
-    width: 100%;
-    height: 100%;
-    display: block;
-    fill: currentColor;
+/* The top-right action carries its scope in words ("Refresh state" / "Reload" /
+   "Refresh log") instead of being a bare glyph whose target the user has to guess. */
+#refresh-btn {
+    --md-text-button-container-height: 36px;
+    --md-text-button-leading-space: 12px;
+    --md-text-button-trailing-space: 14px;
+    --md-text-button-label-text-size: 13px;
+    --md-text-button-label-text-weight: 500;
 }
 
 .content {
@@ -89,15 +102,68 @@ md-icon-button md-icon svg, .leading-icon svg, .row-icon svg,
 }
 .page { display: none; }
 .page.active { display: block; }
-.page-content { padding: 8px 12px 24px; }
+.page-content { padding: 10px 12px 28px; }
 
+/* ------------------------------------------------------------------ glyphs */
+.glyph {
+    flex: 0 0 auto;
+    width: 24px;
+    height: 24px;
+    display: block;
+    color: var(--md-sys-color-primary);
+}
+.glyph.s14 { width: 14px; height: 14px; }
+.glyph.s16 { width: 16px; height: 16px; }
+.glyph.s18 { width: 18px; height: 18px; }
+.glyph.s20 { width: 20px; height: 20px; }
+.glyph.dim { color: var(--md-sys-color-on-surface-variant); }
+md-icon, .bottom-icon, .splash-mark { display: block; }
+md-icon svg, .glyph svg, .bottom-icon svg, .splash-mark svg,
+.rule md-icon svg, .preset md-icon svg, .list-item md-icon svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+    fill: currentColor;
+}
+
+/* --------------------------------------------------------------- section head */
+.section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin: 20px 4px 8px;
+}
 .section-label {
     font-size: 12px;
-    font-weight: 600;
-    letter-spacing: .06em;
+    font-weight: 700;
+    letter-spacing: .07em;
     text-transform: uppercase;
     color: var(--md-sys-color-on-surface-variant);
-    margin: 18px 4px 8px;
+    margin: 20px 4px 8px;
+}
+.section-head .section-label { margin: 0; }
+.section-count { font-weight: 500; opacity: .75; }
+.section-head md-icon-button {
+    --md-icon-button-icon-size: 20px;
+    width: 32px;
+    height: 32px;
+    color: var(--md-sys-color-on-surface-variant);
+}
+button.mini {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border: none;
+    background: none;
+    color: var(--md-sys-color-primary);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 6px 8px;
+    border-radius: 100px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
 }
 
 /* ------------------------------------------------------------------- cards */
@@ -105,113 +171,305 @@ md-icon-button md-icon svg, .leading-icon svg, .row-icon svg,
     position: relative;
     background: var(--md-sys-color-surface-container);
     color: var(--md-sys-color-on-surface);
-    border-radius: 16px;
+    border: 1px solid var(--md-sys-color-outline-variant);
+    border-radius: 18px;
     padding: 14px 16px;
     margin-bottom: 10px;
     overflow: hidden;
 }
-.card.status-card, .card.current-card {
+.card.flush { padding: 0; }
+
+/* Hero: the one card that is allowed to shout. The tinted chip is the focal point,
+   and the orientation is fixed by the leading icon rather than by reading a sentence. */
+.card.hero { padding: 0; }
+.hero-top {
     display: flex;
     align-items: center;
     gap: 14px;
+    padding: 16px;
 }
-.card .leading-icon {
+.hero.ok { background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container); border-color: transparent; }
+.hero.down { background: var(--md-sys-color-error-container); color: var(--md-sys-color-on-error-container); border-color: transparent; }
+.icon-chip {
     flex: 0 0 auto;
-    width: 28px;
-    height: 28px;
-    color: var(--md-sys-color-primary);
-}
-.card.status-card.ok .leading-icon { color: var(--md-sys-color-primary); }
-.card.status-card.down .leading-icon { color: var(--md-sys-color-error); }
-.card-text { flex: 1 1 auto; min-width: 0; }
-.card-title { font-size: 16px; font-weight: 500; }
-.card-subtitle {
-    font-size: 12px;
-    color: var(--md-sys-color-on-surface-variant);
-    margin-top: 2px;
-    word-break: break-all;
-}
-.badge {
-    flex: 0 0 auto;
-    font-size: 11px;
-    padding: 4px 10px;
+    width: 46px;
+    height: 46px;
     border-radius: 100px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     background: var(--md-sys-color-surface-container-highest);
     color: var(--md-sys-color-on-surface-variant);
 }
-.badge.on {
-    background: var(--md-sys-color-primary-container);
-    color: var(--md-sys-color-on-primary-container);
+.icon-chip md-icon { width: 26px; height: 26px; }
+.hero.ok .icon-chip { background: var(--md-sys-color-primary); color: var(--md-sys-color-on-primary); }
+.hero.down .icon-chip { background: var(--md-sys-color-error); color: var(--md-sys-color-on-error); }
+.hero-text { flex: 1 1 auto; min-width: 0; }
+.hero-title { font-size: 19px; font-weight: 600; letter-spacing: -.01em; }
+.hero-sub { font-size: 12.5px; opacity: .85; margin-top: 3px; overflow-wrap: anywhere; }
+
+/* Stat strip: the numbers that change, given tabular figures so they do not jitter. */
+.stat-row {
+    display: flex;
+    border-top: 1px solid var(--md-sys-color-outline-variant);
+}
+/* On the tinted hero the rules are drawn from the text colour, not the surface
+   outline, so they read as part of the card instead of as a grey seam. */
+.hero.ok .stat-row, .hero.down .stat-row {
+    border-top-color: color-mix(in srgb, currentColor 24%, transparent);
+}
+.stat { flex: 1 1 0; min-width: 0; padding: 11px 14px 13px; }
+.stat + .stat { border-left: 1px solid var(--md-sys-color-outline-variant); }
+.hero.ok .stat + .stat, .hero.down .stat + .stat {
+    border-left-color: color-mix(in srgb, currentColor 24%, transparent);
+}
+.stat-label {
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .05em;
+    text-transform: uppercase;
+    opacity: .7;
+}
+.stat-value {
+    font-size: 17px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    margin-top: 3px;
+    overflow-wrap: anywhere;
 }
 
-.row { display: flex; align-items: flex-start; gap: 12px; }
-.row + .row { margin-top: 12px; }
-.row-icon { flex: 0 0 auto; color: var(--md-sys-color-primary); }
-.row-text { min-width: 0; }
-.row-title { font-size: 14px; }
-.row-detail {
-    font-size: 12px;
-    color: var(--md-sys-color-on-surface-variant);
-    margin-top: 2px;
-    word-break: break-all;
-}
-
-/* --------------------------------------------------------------- preset list */
-.preset-list { display: flex; flex-direction: column; gap: 8px; }
-.preset {
+/* ------------------------------------------------- interactive state badge */
+.badge {
     position: relative;
+    overflow: hidden;
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11.5px;
+    font-weight: 600;
+    padding: 7px 10px 7px 12px;
+    border-radius: 100px;
+    background: var(--md-sys-color-surface-container-highest);
+    color: var(--md-sys-color-on-surface-variant);
+    border: 1px solid var(--md-sys-color-outline);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+.badge.on {
+    background: var(--md-sys-color-tertiary-container);
+    color: var(--md-sys-color-on-tertiary-container);
+    border-color: transparent;
+}
+.badge-dot { width: 6px; height: 6px; border-radius: 100px; background: currentColor; }
+.badge .glyph { color: inherit; }
+
+/* ------------------------------------------------------- label/value rows */
+/* Labels take exactly the width they need: the value column is where the long
+   unbreakable strings live (config identity, paths, hashes), and a fixed 31% was
+   wrapping them mid-token. */
+.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 7px 12px; align-items: baseline; }
+.kv-label { font-size: 12px; font-weight: 500; color: var(--md-sys-color-on-surface-variant); }
+.kv-value {
+    font-size: 13.5px;
+    font-weight: 500;
+    color: var(--md-sys-color-on-surface);
+    overflow-wrap: anywhere;
+}
+/* Hashes, paths and versions are reference material, not the answer: muted and
+   monospaced so they are visibly secondary to the row above them. */
+.kv-value.mono {
+    font-family: ui-monospace, "Roboto Mono", monospace;
+    font-size: 11.5px;
+    font-weight: 400;
+    color: var(--md-sys-color-on-surface-variant);
+}
+
+/* ------------------------------------------------------------- disclosure */
+.disclosure {
+    position: relative;
+    overflow: hidden;
+    width: 100%;
     display: flex;
     align-items: center;
     gap: 12px;
     padding: 14px 16px;
-    border-radius: 16px;
     background: var(--md-sys-color-surface-container);
+    color: var(--md-sys-color-on-surface);
+    border: 1px solid var(--md-sys-color-outline-variant);
+    border-radius: 18px;
+    font: inherit;
+    font-size: 14.5px;
+    font-weight: 600;
+    text-align: left;
+    cursor: pointer;
+}
+.disclosure .chev { margin-left: auto; color: var(--md-sys-color-on-surface-variant); }
+.disclosure-body { display: none; }
+.disclosure-body.open {
+    display: block;
+    border: 1px solid var(--md-sys-color-outline-variant);
+    border-top: none;
+    border-radius: 0 0 18px 18px;
+    margin: -12px 0 10px;
+    padding: 14px 16px 6px;
+    background: var(--md-sys-color-surface-container-low);
+}
+.group + .group { margin-top: 16px; }
+.group-title {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .05em;
+    text-transform: uppercase;
+    color: var(--md-sys-color-on-surface-variant);
+    margin-bottom: 8px;
+}
+
+/* ------------------------------------------------------------------ chips */
+.chip-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.chip {
+    position: relative;
+    overflow: hidden;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 9px 15px;
+    border-radius: 100px;
+    font-size: 13px;
+    font-weight: 500;
+    background: var(--md-sys-color-surface-container-highest);
+    color: var(--md-sys-color-on-surface-variant);
     border: 1px solid transparent;
     cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+.chip[aria-current="true"] {
+    background: var(--md-sys-color-primary-container);
+    color: var(--md-sys-color-on-primary-container);
+    border-color: var(--md-sys-color-primary);
+    font-weight: 600;
+}
+.chip.busy, .preset.busy, .rule.busy { opacity: .45; pointer-events: none; }
+
+/* --------------------------------------------------------------- radio list */
+.preset-list { display: flex; flex-direction: column; gap: 8px; }
+.preset {
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 16px;
+    border-radius: 18px;
+    background: var(--md-sys-color-surface-container);
+    border: 1px solid var(--md-sys-color-outline-variant);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
 }
 .preset[aria-current="true"] {
     background: var(--md-sys-color-primary-container);
     color: var(--md-sys-color-on-primary-container);
     border-color: var(--md-sys-color-primary);
 }
-.preset md-icon { flex: 0 0 auto; color: var(--md-sys-color-primary); }
-.preset[aria-current="true"] md-icon { color: var(--md-sys-color-on-primary-container); }
-.preset.busy { opacity: .5; pointer-events: none; }
+.preset .sel { flex: 0 0 auto; color: var(--md-sys-color-on-surface-variant); }
+.preset[aria-current="true"] .sel { color: var(--md-sys-color-primary); }
+.preset-text { flex: 1 1 auto; min-width: 0; }
+.preset-title { font-size: 15px; font-weight: 600; }
+.preset-sub { font-size: 12px; opacity: .8; margin-top: 2px; overflow-wrap: anywhere; }
+.preset[aria-current="true"] .preset-title { font-weight: 700; }
 
+/* ------------------------------------------------------------- rule rows */
+.rule {
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    border-radius: 18px;
+    background: var(--md-sys-color-surface-container);
+    border: 1px solid var(--md-sys-color-outline-variant);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+.rule-text { flex: 1 1 auto; min-width: 0; }
+.rule-pkg { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.rule-hz { display: flex; gap: 14px; flex: 0 0 auto; }
+.rule-hz-item { text-align: right; }
+.rule-hz-value { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.rule-hz-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    color: var(--md-sys-color-on-surface-variant);
+}
+.rule .edit-hint { flex: 0 0 auto; color: var(--md-sys-color-on-surface-variant); }
+
+/* ------------------------------------------------------------------ hint */
 .hint {
     font-size: 12px;
-    line-height: 1.5;
+    line-height: 1.55;
     color: var(--md-sys-color-on-surface-variant);
-    margin: 12px 4px 0;
-    word-break: break-all;
+    margin: 10px 4px 0;
+    overflow-wrap: anywhere;
 }
+.hint.mono { font-family: ui-monospace, "Roboto Mono", monospace; font-size: 11px; }
+.empty {
+    font-size: 13px;
+    color: var(--md-sys-color-on-surface-variant);
+    padding: 16px;
+    text-align: center;
+}
+.kv > .empty { grid-column: 1 / -1; }
+md-icon-button[disabled] { opacity: .4; pointer-events: none; }
 
 /* --------------------------------------------------------------- list items */
 .list-card { padding: 0; }
 .list-item {
     position: relative;
+    overflow: hidden;
     display: flex;
     align-items: center;
     gap: 16px;
     padding: 14px 16px;
     cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
 }
 .list-item + .list-item { border-top: 1px solid var(--md-sys-color-outline-variant); }
 .list-item md-icon { flex: 0 0 auto; color: var(--md-sys-color-on-surface-variant); }
 .list-item-content { flex: 1 1 auto; min-width: 0; }
+.list-title { font-size: 14.5px; font-weight: 600; }
+.list-sub { font-size: 12px; color: var(--md-sys-color-on-surface-variant); margin-top: 2px; }
+
+/* The Hz figure is the answer that page exists for. */
+.dfps-hz { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
 
 /* --------------------------------------------------------------------- log */
-.log-card { padding: 10px 12px; }
-.log-toolbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    flex-wrap: wrap;
+.log-card { padding: 10px 12px; margin-bottom: 10px; }
+.log-toolbar { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; }
+.log-toolbar + .log-toolbar { margin-top: 6px; }
+.log-toolbar .spacer { flex: 1 1 auto; }
+.log-toolbar .hint { margin: 0; text-align: right; }
+.log-toolbar md-icon-button {
+    --md-icon-button-icon-size: 20px;
+    width: 38px;
+    height: 38px;
+    color: var(--md-sys-color-on-surface-variant);
+}
+.log-toolbar md-icon-button[active] {
+    color: var(--md-sys-color-on-primary-container);
+    background: var(--md-sys-color-primary-container);
 }
 .log-lines { display: flex; align-items: center; }
-.log-lines md-text-button { --md-text-button-label-text-size: 12px; }
-.log-lines md-text-button[active] { color: var(--md-sys-color-primary); }
+.log-lines md-text-button {
+    --md-text-button-label-text-size: 12px;
+    --md-text-button-container-height: 32px;
+    --md-text-button-leading-space: 10px;
+    --md-text-button-trailing-space: 10px;
+    color: var(--md-sys-color-on-surface-variant);
+}
+.log-lines md-text-button[active] { color: var(--md-sys-color-primary); font-weight: 700; }
 pre.log {
     margin: 8px 0 0;
     padding: 10px;
@@ -219,13 +477,30 @@ pre.log {
     overflow: auto;
     background: var(--md-sys-color-surface-container-lowest);
     color: var(--md-sys-color-on-surface-variant);
-    border-radius: 10px;
+    border-radius: 12px;
     font-family: ui-monospace, "Roboto Mono", monospace;
     font-size: 11px;
     line-height: 1.45;
     white-space: pre;
     tab-size: 4;
 }
+/* The daemon's sched lines are ~150 columns, so on a phone the default view cuts
+   every line off. Wrapping is the default for that reason; the toggle turns it off
+   when aligned columns matter more than seeing the tail of a line. */
+pre.log.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+.log-card.fullscreen {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    margin: 0;
+    border-radius: 0;
+    border: none;
+    padding: calc(6px + var(--top-inset)) 10px calc(10px + var(--bottom-inset));
+    background: var(--md-sys-color-surface);
+    display: flex;
+    flex-direction: column;
+}
+.log-card.fullscreen pre.log { flex: 1 1 auto; max-height: none; }
 
 /* --------------------------------------------------------------- bottom bar */
 .bottom-bar {
@@ -244,6 +519,7 @@ pre.log {
     color: var(--md-sys-color-on-surface-variant);
     cursor: pointer;
     user-select: none;
+    -webkit-tap-highlight-color: transparent;
 }
 .bottom-bar-item[selected] { color: var(--md-sys-color-on-surface); }
 .bottom-bar-item .bottom-icon {
@@ -261,4 +537,12 @@ pre.log {
 
 /* ------------------------------------------------------------------ dialogs */
 .dialog-wrapper md-dialog { --md-dialog-container-shape: 24px; }
-#confirm-body { font-size: 14px; line-height: 1.5; word-break: break-all; }
+.dialog-body { font-size: 14px; line-height: 1.55; overflow-wrap: anywhere; }
+.dialog-body p { margin: 0 0 10px; }
+.dialog-body ul { margin: 0; padding-left: 18px; }
+.dialog-body li { margin-bottom: 6px; }
+.dialog-field { display: block; margin-top: 12px; }
+.dialog-field md-outlined-text-field { width: 100%; }
+.dialog-note { font-size: 12px; color: var(--md-sys-color-on-surface-variant); margin-top: 10px; }
+.dialog-row { display: flex; gap: 12px; }
+.dialog-row md-outlined-text-field { flex: 1 1 0; }

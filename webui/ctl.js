@@ -80,6 +80,17 @@ export async function readLog(lines) {
     return (await ctl('log', String(lines))).stdout;
 }
 
+/**
+ * Copies a slice of the log to `$USER_PATH/export/` and reports where it landed.
+ *
+ * The log is shown in a WebView `<pre>`, which on a phone cannot be selected and
+ * copied out of; this is the only action that actually gets the text off the device.
+ * The script re-reads the file it wrote, so `export.ok=1` means the bytes are there.
+ */
+export async function exportLog(lines) {
+    return parseKeyValue((await ctl('export', String(lines))).stdout);
+}
+
 export async function restart() {
     return parseKeyValue((await ctl('restart')).stdout);
 }
