@@ -297,7 +297,10 @@ see [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md) and the
   script), **device-verified** on alioth (`scripts/m9-device-verify.sh`, 33
   assertions: `/proc/<pid>/exe` survives dfps' cmdline rewrite, the dead-man path
   restores a real armed daemon after SIGKILL, an orphaned worker disarms itself
-  after the watchdog's SIGTERM, 0.93-1.12 % of one core at the shipped 15 s
+  after the watchdog's SIGTERM, 0.5 % of one core at the shipped 15 s cadence
+  (0.93-1.12 % before the cache-first liveness change: liveness is answered from a
+  cached pid+start-time identity and the full /proc sweep is only paid when that
+  cache goes stale, so six samples cost one sweep)
   cadence) and **install+boot verified** (`scripts/m9-device-boot-verify.sh`, 23
   assertions after `ksud module install` + a restart: KernelSU's `service.sh` path
   starts the watchdog and it survives, and a `webui.sh restart` hands the owner

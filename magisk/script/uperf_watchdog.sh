@@ -87,6 +87,16 @@ WD_GRACE="${UPERF_WATCHDOG_GRACE:-2}"
 WD_MAX_RESTARTS="${UPERF_WATCHDOG_MAX_RESTARTS:-3}"
 WD_TEARDOWN_TICKS="${UPERF_WATCHDOG_TEARDOWN_TICKS:-5}"
 WD_VERIFY_WAIT="${UPERF_WATCHDOG_VERIFY_WAIT:-3}"
+# Liveness is answered from the cached pid set while it still checks out; the full
+# /proc sweep is paid only when the cache goes bad (a pid gone, a start time moved) or
+# every $WD_BACKSTOP samples. The backstop exists for the one thing a cache cannot
+# see: a *second* pair that appears while the first is healthy (a start that raced the
+# lock). 20 samples = 5 min at the shipped interval; the host harness sets it to 1 to
+# test that path on purpose.
+WD_BACKSTOP="${UPERF_WATCHDOG_BACKSTOP:-20}"
+WD_CACHE=""
+WD_SCANS=0
+WD_SINCE_SCAN=0
 
 # `uperf_restore_governors` enumerates policies through `uperf_policy_dirs`, which
 # honours this; exporting it keeps the one definition of "where the policies are".
@@ -194,6 +204,55 @@ wd_scan() {
     return 0
 }
 
+# Classify "<pid>:<start_ticks>:<ppid>" records with the rule `wd_scan` uses, as pure
+# string work: no /proc reads and no forks.
+wd_classify() {
+    local rec pid inner ppid
+    WD_ALL=""
+    for rec in $1; do WD_ALL="$WD_ALL ${rec%%:*}"; done
+    WD_SUP=""
+    WD_WORK=""
+    for rec in $1; do
+        pid="${rec%%:*}"
+        inner="${rec#*:}"
+        ppid="${inner#*:}"
+        case " $WD_ALL " in
+        *" $ppid "*) WD_WORK="$WD_WORK $pid" ;;
+        *) WD_SUP="$WD_SUP $pid" ;;
+        esac
+    done
+    return 0
+}
+
+# Can the cache be reused as-is? A matching pid *and* start time is the same identity
+# rule the owner lock uses, and it is two `read`s of /proc/<pid>/stat — no forks, no
+# sweep. `exe` is deliberately NOT re-read here: it is what decides *membership* of the
+# set, and membership is decided at every sweep (docs/m9-watchdog.md §6). A pid whose
+# start time moved is a different process and fails the check.
+wd_cache_fresh() {
+    local rec pid st
+    [ -n "$WD_CACHE" ] || return 1
+    for rec in $WD_CACHE; do
+        pid="${rec%%:*}"
+        st="${rec#*:}"
+        st="${st%%:*}"
+        wd_stat_fields "$pid" || return 1
+        [ "$WD_START_TICKS" = "$st" ] || return 1
+    done
+    return 0
+}
+
+# Rebuild the cache from a fresh sweep.
+wd_cache_from_scan() {
+    local pid out=""
+    for pid in $WD_ALL; do
+        wd_stat_fields "$pid" || continue
+        out="$out $pid:$WD_START_TICKS:$WD_PPID"
+    done
+    WD_CACHE="${out# }"
+    return 0
+}
+
 # Policies currently reading `userspace` — the live sysfs value. This, not the
 # status file and not a recorded value, is the authority on whether a takeover is
 # in effect.
@@ -268,6 +327,9 @@ wd_state_body() {
     echo "armed=$WD_LAST_ARMED"
     echo "exe=$DAEMON_EXE"
     echo "updated_uptime_ms=$(wd_now_ms)"
+    echo "sweeps=$WD_SCANS"
+    echo "since_sweep=$WD_SINCE_SCAN"
+    echo "backstop=$WD_BACKSTOP"
 }
 
 # Same-directory temp + rename where it works, direct write where it does not: a
@@ -326,6 +388,10 @@ wd_restore_governors() {
 }
 
 wd_recover() {
+    # This path kills things: work off a fresh sweep, never off the cache (the cache is
+    # what broke, so what it holds is exactly what cannot be trusted).
+    wd_scan
+    wd_cache_from_scan
     # No "restart N" here: whether this recovery restarts is decided below, once
     # the takeover has been undone.
     wd_log "recovering: sup=[${WD_SUP# }] workers=[${WD_WORK# }] armed=[$WD_LAST_ARMED] restarts=$WD_RESTARTS/$WD_MAX_RESTARTS"
@@ -448,7 +514,18 @@ main() {
             wd_shutdown "module files are gone (uninstalled)"
         fi
 
-        wd_scan
+        # Cache-first: the sweep below is the whole cost of a sample on a real device
+        # (~0.19 s for 1289 pids, measured), and the answer it gives is unchanged while
+        # the processes it found are still the same processes.
+        WD_SINCE_SCAN=$((WD_SINCE_SCAN + 1))
+        if [ "$WD_SINCE_SCAN" -ge "$WD_BACKSTOP" ] || ! wd_cache_fresh; then
+            WD_SCANS=$((WD_SCANS + 1))
+            WD_SINCE_SCAN=0
+            wd_scan
+            wd_cache_from_scan
+        else
+            wd_classify "$WD_CACHE"
+        fi
         WD_LAST_SUP="${WD_SUP# }"
         set -- $WD_WORK
         WD_LAST_WORKERS=$#
