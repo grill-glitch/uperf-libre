@@ -278,8 +278,11 @@ restarted:
   default nor `UPERF_WATCHDOG_COMM` looks absent. It is only a *filter*, so the
   consequence is a wrong verdict rather than an action on a stranger's process —
   but it is an assumption about a name dfps sets in `cpp/uperf/app_main.cpp`.
-* the WebUI *app* does not display the new status keys yet (the keys themselves are
-  host- and device-verified through `webui.sh status`; surfacing them is UI work);
+* the WebUI's *rendering* of the new keys in the manager's WebView (the keys are
+  host- and device-verified through `webui.sh status`, and the home tab now has a
+  Supervision card reading them — `daemon.state`, `watchdog.state`/`pid`/`restarts`,
+  `daemon.armed`, plus the "was killed" verdict when the claim is stale — but the
+  pixels still need a human look, as with every WebUI change since M7d);
 * the poll-then-drop-lock fallback in `uperf_watchdog_stop` was not exercised
   against a watchdog that refuses to die within 5 s;
 * a full day of uptime (the log cap's long-run behaviour is inferred from the

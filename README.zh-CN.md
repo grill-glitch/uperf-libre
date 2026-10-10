@@ -567,7 +567,7 @@ cat <USER_PATH>/uperf_watchdog.state   # 重启次数、最后一次动作及原
 tail <USER_PATH>/uperf_watchdog.log    # 看门狗的每一次判定
 ```
 
-同一份状态也通过 KernelSU WebUI / adb 的 `sh <module>/script/webui.sh status` 暴露：
+同一份状态在 KernelSU WebUI 首页新增的**守护**卡片里直接可见（看门狗状态/PID/重启次数、守护进程自报、已接管集群、以及"已被杀"判定），也通过 adb 的 `sh <module>/script/webui.sh status` 暴露：
 `daemon.state`、`daemon.armed`、`watchdog.state`、`watchdog.restarts`、`watchdog.pid`。
 
 `uperf.state` 里残留 `state=running` 但没有存活进程，就是被杀的标志；正常停止会写 `state=stopped`。`UPERF_WATCHDOG=0` 可关闭看门狗（排查崩溃循环时有用）。

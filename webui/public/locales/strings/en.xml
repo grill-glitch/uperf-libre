@@ -72,4 +72,20 @@
     <string name="dfps_prompt_active">New active Hz for {pkg} (was {active})</string>
     <string name="toast_rule_ok">Rule for {pkg} updated</string>
     <string name="toast_rule_fail">Failed to update rule: {err}</string>
+    <string name="section_supervision">Supervision</string>
+    <string name="label_watchdog_state">Watchdog</string>
+    <string name="label_watchdog_pid">Watchdog pid</string>
+    <string name="label_watchdog_restarts">Restarts this boot</string>
+    <string name="label_daemon_claim">Daemon status file</string>
+    <string name="label_armed_clusters">Armed clusters</string>
+    <string name="daemon_claim_killed">was killed (stale claim)</string>
+    <string name="state_running">running</string>
+    <string name="state_starting">starting</string>
+    <string name="state_recovering">recovering</string>
+    <string name="state_restarting">restarting</string>
+    <string name="state_restarted">restarted</string>
+    <string name="state_restart_failed">restart failed</string>
+    <string name="state_restored">restored</string>
+    <string name="state_gave_up">gave up</string>
+    <string name="state_stopped">stopped</string>
 </resources>

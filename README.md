@@ -218,7 +218,9 @@ tail <USER_PATH>/uperf_watchdog.log    # every decision the watchdog made
 
 A stale `state=running` in `uperf.state` with no live daemon is the signature of a
 kill; a clean stop writes `state=stopped`. `UPERF_WATCHDOG=0` disables the
-watchdog (useful while bisecting a crash loop).
+watchdog (useful while bisecting a crash loop). The KernelSU WebUI's home tab shows
+all of it as a **Supervision** card (watchdog state/pid/restarts, the daemon's own
+claim, armed clusters, and a "was killed" verdict when the claim is stale).
 
 If the device is ever left in `userspace` with no watchdog around (module removed
 by hand, watchdog disabled), restore with:
