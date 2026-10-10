@@ -88,4 +88,13 @@
     <string name="state_restored">已恢复</string>
     <string name="state_gave_up">已放弃</string>
     <string name="state_stopped">已停止</string>
+    <string name="label_frame_source">帧源</string>
+    <string name="label_frame_injected">注入次数</string>
+    <string name="label_frame_failed">注入失败</string>
+    <string name="state_injected">已注入（我们放的）</string>
+    <string name="state_healthy">本来就在</string>
+    <string name="state_absent">目标未运行</string>
+    <string name="state_waiting">重试中</string>
+    <string name="state_failed">本次尝试失败</string>
+    <string name="state_disabled">已关闭（无注入器）</string>
 </resources>

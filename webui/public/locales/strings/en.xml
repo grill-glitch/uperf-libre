@@ -88,4 +88,13 @@
     <string name="state_restored">restored</string>
     <string name="state_gave_up">gave up</string>
     <string name="state_stopped">stopped</string>
+    <string name="label_frame_source">Frame source</string>
+    <string name="label_frame_injected">Injections</string>
+    <string name="label_frame_failed">Failed injections</string>
+    <string name="state_injected">injected (ours)</string>
+    <string name="state_healthy">already present</string>
+    <string name="state_absent">target not running</string>
+    <string name="state_waiting">retrying</string>
+    <string name="state_failed">attempt failed</string>
+    <string name="state_disabled">disabled (no injector)</string>
 </resources>

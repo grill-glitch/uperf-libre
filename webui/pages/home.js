@@ -108,7 +108,7 @@ export function render(data, config, error) {
     const wdState = String(data['watchdog.state'] || '').trim();
     const claim = String(data['daemon.state'] || '').trim();
     const killed = claim === 'running' && !running;
-    addRow(supervision, 'verified_user', [
+    const rows = [
         [getString('label_watchdog_state'), wdState ? stateLabel(wdState) : getString('state_unknown')],
         [getString('label_watchdog_pid'), data['watchdog.pid']],
         [getString('label_watchdog_restarts'), data['watchdog.restarts']],
@@ -116,7 +116,16 @@ export function render(data, config, error) {
             ? getString('daemon_claim_killed')
             : (claim ? stateLabel(claim) : '')],
         [getString('label_armed_clusters'), data['daemon.armed']],
-    ], getString('section_supervision'));
+    ];
+    // The frame source only when it is being supervised: `off` means the module is not
+    // injecting into surfaceflinger, and a row saying so every time would be noise.
+    const sfState = String(data['watchdog.sf_state'] || '').trim();
+    if (sfState && sfState !== 'off') {
+        rows.push([getString('label_frame_source'), stateLabel(sfState)]);
+        rows.push([getString('label_frame_injected'), data['watchdog.sf_injects'] || '0']);
+        rows.push([getString('label_frame_failed'), data['watchdog.sf_fails'] || '0']);
+    }
+    addRow(supervision, 'verified_user', rows, getString('section_supervision'));
 
     const device = document.getElementById('device-card');
     device.textContent = '';
