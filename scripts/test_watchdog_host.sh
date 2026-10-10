@@ -201,9 +201,10 @@ watchdog_run() { # watchdog_run <seconds> -> prints the pid of timeout(1)
         UPERF_WATCHDOG_BACKSTOP="${WD_BACKSTOP:-20}" \
         UPERF_SF_INJECT="${SF_INJECT:-}" \
         UPERF_SF_TARGET="${SF_TARGET:-$WORK/surfaceflinger}" \
-        UPERF_SF_LIB="${SF_LIB:-$WORK/script/libsfanalysis_rs.so}" \
+        UPERF_SF_LIB="${SF_LIB:-$WORK/libsfanalysis_rs.so}" \
         UPERF_SF_INJECTOR="${SF_INJECTOR:-$WORK/injector}" \
         UPERF_SF_MAX_INJECTS="${SF_MAX_INJECTS:-3}" \
+        UPERF_SF_STAGE="${SF_STAGE:-$WORK/staged/libsfanalysis_rs.so}" \
         UPERF_SF_RETRY_SAMPLES="${SF_RETRY_SAMPLES:-1}" \
         UPERF_WATCHDOG_VERIFY_WAIT="${WD_VERIFY:-1}" \
         UPERF_WATCHDOG_DRY_RUN="${WD_DRY_RUN:-0}" \
@@ -503,6 +504,12 @@ wd_sf_do_inject() {
     return 0
 }
 SFSTUB
+# The staging step copies the library to a path the target can read (`chown`/`chcon` are
+# best effort and absent on a host, the copy is not).
+echo "lib" >"$WORK/libsfanalysis_rs.so"
+SF_STAGE="$WORK/staged/libsfanalysis_rs.so"
+export SF_STAGE
+
 start_sf() {
     rm -f "$WORK"/sf*/stub.log.injected* 2>/dev/null
     "$SF" -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
@@ -623,6 +630,36 @@ eq "$(grep -c 'no usable injector' "$WORK/sf3/wd.log" 2>/dev/null)" "1" "and not
 eq "$(sed -n 's/^sf_state=//p' "$WORK/sf3/wd.state")" "disabled" "and the loop is switched off rather than failing every sample"
 eq "$(sed -n 's/^sf_injects=//p' "$WORK/sf3/wd.state")" "0" "with no attempt recorded"
 kill -KILL "$SFPID5" 2>/dev/null
+
+# ------------------- case 14: the real inject path stages the library, then injects *it*
+
+echo "== case 14: the library is staged for the target domain, and the staged copy is what gets injected"
+new_case sf5 policy0
+echo "modulecopy" >"$WORK/libsfanalysis_rs.so"
+cat >"$WORK/fakeinjector" <<FI
+#!/bin/sh
+echo "\$2" >>"$WORK/sf5/injected-path.txt"
+exit 0
+FI
+chmod 755 "$WORK/fakeinjector"
+cp -f "$EXE" "$WORK/surfaceflinger" 2>/dev/null || true
+start_fake_daemon "$WORK/sf5/pids/a.pids"
+SF_INJECT=1
+SF_INJECTOR="$WORK/fakeinjector"
+WD_INTERVAL=1
+"$WORK/surfaceflinger" -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
+SFPID6=$!
+WD_PID="$(watchdog_run 6)"
+sleep 5
+cp "$WORK/sf5/wd.state" "$WORK/sf5/staged.state"
+eq "$(cat "$SF_STAGE" 2>/dev/null)" "modulecopy" "the library was staged where the target can read it"
+eq "$(stat -c %a "$SF_STAGE" 2>/dev/null)" "755" "the staged copy is world-readable (the target domain is not root)"
+eq "$(head -1 "$WORK/sf5/injected-path.txt" 2>/dev/null)" "$SF_STAGE" "the injector was pointed at the staged copy, not the module's own"
+eq "$(sort -u "$WORK/sf5/injected-path.txt" 2>/dev/null | grep -c .)" "1" "every attempt used that one path (a retry re-stages, never falls back to the module copy)"
+eq "$(sed -n 's/^sf_fails=//p' "$WORK/sf5/staged.state")" "1" "a mapping that never appears after a zero exit is a failure, not a success"
+check_contains "$WORK/sf5/wd.log" "returned success but the mapping is absent" "and it says exactly that"
+kill -KILL "$SFPID6" 2>/dev/null
+stop_watchdog "$WD_PID"
 
 # ------------------------------------------------------- case 9: a killed daemon is seen
 

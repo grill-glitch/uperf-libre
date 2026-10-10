@@ -136,6 +136,17 @@ same reason fas-rs re-reads its own frequency writes), and a give-up that says w
 budget counts *failures*, so a target that legitimately restarts often does not lose its
 frame source for the rest of the boot.
 
+**The library has to be staged first, and that is not optional.** `surfaceflinger` runs
+as `system`, and the module's own directory is not a path that domain can read: injecting
+straight from `<module>/bin/` makes the remote `dlopen` return 0 (`injector` prints
+"Injection failed..."), while the same file copied to `/data/misc/surfaceflinger/` with
+mode 755, owner `system:system` and label `system_file` maps `r-xp` and runs. Measured on
+the device, both ways, in one run. So the supervisor copies `UPERF_SF_LIB` to
+`UPERF_SF_STAGE` (mode/owner/label best effort, the *copy* is not) before every attempt —
+which also self-heals a staged copy that went missing. The injector's own output is kept
+in the log on failure: "the injector returned non-zero" is not a diagnosis, and swallowing
+it to `/dev/null` is precisely how the unreadable-path failure stayed invisible for a round.
+
 State lands in the same file (`sf=`, `sf_state=`, `sf_injects=`, `sf_fails=`,
 `sf_max_injects=`) with `sf_state` distinguishing `injected` (a mapping we put there) from
 `healthy` (it was already there) — the two are different facts, and `healthy` would hide
@@ -352,7 +363,8 @@ restarted:
 | `UPERF_WATCHDOG_VERIFY_WAIT` | 3 | seconds to wait after a restart before judging it |
 | `UPERF_SF_INJECT` | unset | opt-in: also supervise the injected lib in `surfaceflinger` (M8). Unset = one string test per sample and nothing else |
 | `UPERF_SF_TARGET` | `/system/bin/surfaceflinger` | what to keep the lib inside. Identity is `pid:start_ticks`, so a restarted target is noticed |
-| `UPERF_SF_LIB` | `<module>/bin/libsfanalysis_rs.so` | what its `/proc/<pid>/maps` must carry |
+| `UPERF_SF_LIB` | `<module>/bin/libsfanalysis_rs.so` | what its `/proc/<pid>/maps` must carry. Staged before injecting — the target domain cannot read the module's own directory |
+| `UPERF_SF_STAGE` | `/data/misc/surfaceflinger/<lib>` | where it is copied to (mode 755, `system:system`, `system_file`) before an attempt |
 | `UPERF_SF_INJECTOR` | `/data/local/tmp/injector` | where the injector is. **The module does not ship one** (it is a ptrace tool from the test setup); a missing one disables this loop with one log line |
 | `UPERF_SF_MAX_INJECTS` | 3 | **failed** attempts before giving up (successes never spend the budget, so a target that restarts often still gets its frame source back) |
 | `UPERF_SF_RETRY_SAMPLES` | 4 | samples to wait after an attempt before trying the same identity again |
