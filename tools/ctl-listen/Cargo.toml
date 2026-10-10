@@ -1,0 +1,17 @@
+[package]
+name = "ctl-listen"
+version = "0.0.1"
+edition = "2021"
+# Standalone on purpose: NOT a member of rust/ (the workspace members are listed
+# explicitly). It is the peer side of ⑦'s handshake, used to verify the daemon side.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "ctl-listen"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
