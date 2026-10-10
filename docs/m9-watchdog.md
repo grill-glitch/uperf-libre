@@ -10,10 +10,14 @@ recoverable from outside it. Deliverables:
 | `magisk/script/libuperf.sh` | `uperf_watchdog_start` / `uperf_watchdog_stop`, wired into `uperf_start` / `uperf_stop` |
 | `magisk/uninstall.sh` | stops the watchdog by pid before the module files disappear |
 | `magisk/script/webui.sh` | `status` also reports `daemon.state`/`daemon.armed`/`watchdog.*` |
-| `scripts/test_watchdog_host.sh` | host harness, 8 cases / 48 assertions |
+| `scripts/test_watchdog_host.sh` | host harness, 9 cases / 55 assertions |
+| `scripts/m9-device-verify.sh` | device harness (on the phone, via `su -c`), 31 assertions |
 
-Status: **[V] host-verified** (cargo + the harness below); **device verification
-pending** — see §5.
+Status: **[V] host-verified** (cargo + the host harness) and **[V]
+device-verified** (alioth, KernelSU-Next, Enforcing — §5). Still unverified: that
+KernelSU/Magisk keep the watchdog alive across the `service.sh` exit, and the
+WebUI-restart lock handover; both need a module install plus a restart, a separate
+step.
 
 ## 1. The problem
 
@@ -56,6 +60,13 @@ Started by `uperf_start` (last, after the 2 s daemon bring-up), stopped by
    `docs/m7-evidence.md` §1).
    * Why not a recorded pid: a restart can reuse the same pid for the same
    binary. `exe` cannot be reused.
+   * The scan filters candidates on `/proc/<pid>/comm` **first**, because a
+     `readlink` per pid costs ~13 ms on a 1289-process device (measured: an
+     unfiltered pass took 19.9 s, so the loop never finished a sample). The filter
+     uses the fixed name dfps gives both processes (`PROC_NAME` = `uperf`, *not* the
+     binary's file name — a copy at `/data/local/tmp/m9/fake_uperf` still reports
+     `comm=uperf`); `exe` stays the authority, so a process that merely *names*
+     itself `uperf` is rejected. `UPERF_WATCHDOG_COMM` overrides the name.
    * `readlink` reports ` (deleted)` while a running daemon holds a binary that a
    module update replaced; that suffix is stripped.
 2. **Unhealthy for `UPERF_WATCHDOG_GRACE` consecutive samples** (default 2; the
@@ -159,13 +170,65 @@ Two things this milestone found on the host, both fixed:
   (`uperf_watchdog_lock_dir()`); the host harness is what caught it — a
   redirected tree restored nothing.
 
-**[V] Host, `sh scripts/test_watchdog_host.sh`** — 48 assertions, 0 failures,
+**[V] Host, `sh scripts/test_watchdog_host.sh`** — 55 assertions, 0 failures,
 against the real script with a fake cpufreq tree, a fake daemon pair built from a
 copied shell binary, a real `/proc` (the `exe` uniqueness is what makes that
 possible) and a stubbed `uperf_start`; `uperf_restore_governors` is the real one.
 Cases: healthy / dead+armed→budgeted restarts then restore / restart succeeds /
 orphaned worker retired / single-instance lock / two supervisors collapsed /
 `webui.sh status` reporting the new keys / script syntax + module wiring.
+
+**[V] Device, `scripts/m9-device-verify.sh` on alioth** (crDroid Android 16,
+kernel `4.19.325-cip131`, KernelSU-Next, SELinux Enforcing): **31 assertions, 0
+failures.** The real CPU is never taken over — the takeover is exercised against a
+fake sysfs root (`UPERF_FAKE_ROOT`) and the real governors are compared before and
+after; the installed module's daemon is only observed (`UPERF_WATCHDOG_DRY_RUN=1`).
+
+* **`/proc/<pid>/exe` survives the cmdline rewrite.** The installed daemon reports
+  `cmdline=[uperf]` for both processes while `exe=/data/adb/modules/uperf/bin/uperf`
+  — supervisor `ppid=1`, worker `ppid=<supervisor>`. The whole identity argument,
+  checked against the real thing instead of a fake.
+* The watchdog judged that pair **healthy with its real pids**, read the real
+  cpufreq tree (`armed=[]`), produced no false unhealthy sample, and left the
+  module alone (same pids before and after).
+* `/sdcard`: the status file's temp+rename sticks and reads back; `rm` also worked
+  — the FUSE-unlink caveat from M6b did not reproduce on this build.
+* **Dead-man path, real daemon:** armed into the fake root (all three policies
+  `userspace`), then both processes SIGKILLed → the takeover stayed armed → the
+  watchdog restored all three through the real `uperf_restore_governors` and left
+  no zombie.
+* **Graceful path, real daemon:** only the supervisor SIGKILLed → the orphan is
+  classified as a lone supervisor → the watchdog SIGTERMs it → **the daemon's own
+  handler disarms it** (`cpu governor disarmed`), with the policies back before the
+  watchdog's restore would have run.
+* **Cost at the shipped 15 s cadence: 56-67 ticks = 560-670 ms over 60 s =
+  0.93-1.12 % of one core** across three runs; one scan ≈ 0.13-0.19 s (1289
+  processes).
+
+The raw log is kept at [`docs/m9-device-run-alioth.txt`](./m9-device-run-alioth.txt)
+(the harness also writes a `.completed` marker on the device, so a truncated log
+cannot pass for a finished run — that failure mode cost two rounds here).
+
+Three defects only the device could show, all fixed:
+
+1. **The scan was too slow to ever finish a pass.** 1289 pids × a `readlink|sed`
+   pipeline, with a fork costing ~10-13 ms here, took **19.9 s**; the loop logged
+   nothing but start/stop because it never completed a sample. Fixed by filtering on
+   `comm` (a shell builtin: 1289 pids in 0.19 s) and parsing the stat fields with
+   `read` + parameter expansion (`set -- ${line##*) }`) instead of `sed|awk`. The
+   host harness cannot see this class: a desktop has ~200 processes and 30× cheaper
+   forks.
+2. **The filter's name is not the image's file name.** The first fix derived it from
+   `basename "$DAEMON_EXE"`, but dfps sets `PROC_NAME` for both processes, so the
+   test binary at `.../fake_uperf` reported `comm=uperf` and the watchdog saw
+   **zero** processes. The default is now that fixed name.
+3. **`read` returns non-zero at EOF *without a newline*.** The daemon writes the
+   governor value with no trailing newline (`fs::write(.., "userspace")`), so
+   `IFS= read -r g <.../scaling_governor || continue` skipped **every armed policy**
+   and reported `armed=[]` where all three were armed — and the armed check is what
+   decides whether a restore is needed. The `|| continue` is gone; the value
+   comparison decides. The host harness now writes its armed values without a
+   newline for the same reason.
 
 The duplicate-supervisor case came out of the harness itself: a case that leaked
 its restarted pair made the next one see `sup_n=2`, which the watchdog correctly
@@ -175,26 +238,27 @@ premise).
 
 **[U] Device items, still open:**
 
-* that `/proc/<pid>/exe` really survives dfps' cmdline rewrite on the device
-  (the mechanism is standard, but it is the whole identity argument);
-* that the temp+rename onto `/sdcard` sticks, or that the direct-write fallback
-  is what gets used (both are silent by design);
-* that a real `uperf` daemon SIGTERM in the watchdog's teardown path disarms and
-  leaves no zombie (`docs/m6b-evidence.md` §9 covered `killall uperf`; the
-  watchdog's teardown is the same signal pattern, but this is a new caller);
 * that KernelSU/Magisk keep the watchdog alive across the `service.sh` exit
-  (`setsid` is used when present) and re-reap it properly;
+  (`setsid` is used when present) and re-reap it properly — needs a module install
+  plus a restart;
 * the WebUI restart path (`webui.sh restart` → `uperf_stop` + `uperf_start`):
   the lock is released by `uperf_watchdog_stop`, and a new instance starts; the
   poll-then-drop-lock fallback was not exercised against a slow watchdog;
-* cost: one `for` over `/proc` plus a `readlink` per pid every 15 s, plus one
-  small state write per transition — not measured on device yet.
+* that the WebUI status contract holds on device (host-verified through the
+  `UPERF_WEBUI_USER_PATH` / `UPERF_WEBUI_FLAG_PATH` seams; the WebUI app itself
+  does not display the new keys yet — they are for `webui.sh status`, adb, and
+  future UI work);
+* the `comm` filter's failure mode: a daemon whose process name is neither the
+  default nor `UPERF_WATCHDOG_COMM` looks absent. It is only a *filter*, so the
+  consequence is a wrong verdict rather than an action on a stranger's process —
+  but it is an assumption about a name dfps sets in `cpp/uperf/app_main.cpp`.
 
 ## 6. Knobs
 
 | variable | default | purpose |
 |---|---|---|
 | `UPERF_WATCHDOG=0` | — | disable the watchdog entirely (`uperf_start` then starts nothing) |
+| `UPERF_WATCHDOG_COMM` | `uperf` | process name to filter candidates on (the name dfps sets, *not* the file name) |
 | `UPERF_WATCHDOG_SUPPRESS=1` | — | internal: do not spawn a nested watchdog (set by the watchdog itself) |
 | `UPERF_WATCHDOG_INTERVAL` | 15 | healthy sampling period, seconds |
 | `UPERF_WATCHDOG_RETRY_INTERVAL` | 3 | sampling period while unhealthy but inside the grace window |

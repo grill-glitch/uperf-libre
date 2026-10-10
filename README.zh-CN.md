@@ -622,7 +622,7 @@ CPU 调频器通过将每个 `cpufreq` policy 的 `scaling_governor` 切到 `use
 ## 状态
 
 - **稳定**：上游基础参考（25 个 OPP 上与 printout 拟合误差 <0.0015）、能耗模型、PL1/PL2 池算术、scene → sysfs 写入流水线，以及基于 inotify 的 `cur_powermode.txt` / `perapp_powermode.txt` 热重载。
-- **守护（M9）**：主机侧已验证 —— `cargo test --release`（211 个测试）与 `sh scripts/test_watchdog_host.sh`（48 条断言、8 个用例，跑的是真实脚本）。看门狗的真机验证仍未完成：`/proc` 身份判据、`/sdcard` 上的 rename、以及真实 daemon 的收尾。见 [`docs/m9-watchdog.md`](./docs/m9-watchdog.md) §5。
+- **守护（M9）**：主机侧已验证（`cargo test --release` 211 个测试；`sh scripts/test_watchdog_host.sh` 9 用例 / 55 条断言，跑的是真实脚本），并已在 alioth **真机验证**（`scripts/m9-device-verify.sh`，31 条断言）：`/proc/<pid>/exe` 能穿过 dfps 的 cmdline 改写；真机 SIGKILL 后死手路径把已接管的三个 policy 恢复；孤儿 worker 在被看门狗 SIGTERM 后自行 disarm；出厂 15 s 节奏下看门狗占单核 0.93%。过程中发现并修掉三个**只有真机才暴露**的缺陷（扫描开销、进程名过滤器、无换行文件读取）。尚未验证：KernelSU/Magisk 下看门狗能否活过 `service.sh`、以及 WebUI 重启时锁的交接。见 [`docs/m9-watchdog.md`](./docs/m9-watchdog.md) §5。
 - **尽力而为**：延迟平滑（每采样最多一步，除非 predict 触发 —— 上游描述的是连续共享延迟预算，离散近似无法做到逐节拍匹配），以及 guideCap / limitEfficiency 的容量裁剪表（不可直接从闭源二进制观测）。
 - **真机验证**：alioth（crDroid Android 16 / KernelSU Next 3.3.0）与 polaris（LineageOS 22.2 working；Android 16 / 4.19 内核 —— axion 配置 + `KERNEL_CLANG_TRIPLE`）。
 

@@ -69,7 +69,11 @@ eq() { # eq <actual> <expected> <description>
 # ---------------------------------------------------------------- fixtures
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/uperf_watchdog_test.XXXXXX")"
-EXE="$WORK/fake_uperf"
+# Named `uperf`, not `fake_uperf`: the watchdog filters candidates by the process
+# name the daemon sets for itself (`DAEMON_COMM`, default `uperf`), which is
+# independent of the image's file name. Naming it anything else would only test the
+# harness, not the module.
+EXE="$WORK/uperf"
 # A copy (not a symlink) of the shell: /proc/<pid>/exe then reports *this* path,
 # which is what the watchdog matches on. `sh` itself must NOT match, or the
 # harness and the watchdog would be classified as daemon processes.
@@ -128,6 +132,13 @@ new_case() { # new_case <name> [policy...]
     name="$1"
     shift
     kill_leftover_fakes
+    # Per-case knobs are globals: reset them here or one case silently changes the
+    # next one's premise (observed: case 7's state path leaked into case 9, and
+    # case 3's "bring a daemon up" leaked into every later case).
+    WD_VERIFY=1
+    WD_STATE_PATH=""
+    WD_DRY_RUN=0
+    STUB_BRINGUP=0
     W="$WORK/$name"
     rm -rf "$W"
     mkdir -p "$W/flag" "$W/user" "$W/pids" "$W/cpufreq"
@@ -183,6 +194,7 @@ watchdog_run() { # watchdog_run <seconds> -> prints the pid of timeout(1)
         UPERF_WATCHDOG_MAX_RESTARTS="${WD_MAX_RESTARTS:-2}" \
         UPERF_WATCHDOG_TEARDOWN_TICKS="${WD_TEARDOWN:-2}" \
         UPERF_WATCHDOG_VERIFY_WAIT="${WD_VERIFY:-1}" \
+        UPERF_WATCHDOG_DRY_RUN="${WD_DRY_RUN:-0}" \
         UPERF_WATCHDOG_STUB="$W/stub.sh" \
         UPERF_WATCHDOG_STUB_LOG="$W/stub.log" \
         UPERF_WATCHDOG_STUB_BRINGUP="${STUB_BRINGUP:-0}" \
@@ -242,7 +254,7 @@ kill -KILL "$SUP" "$WORKER" 2>/dev/null
 
 echo "== case 2: dead daemon while armed -> budgeted restarts, then restore"
 new_case deadarmed policy0 policy4
-echo userspace >"$WORK/deadarmed/cpufreq/policy0/scaling_governor"
+printf 'userspace' >"$WORK/deadarmed/cpufreq/policy0/scaling_governor"
 # The stub never brings a daemon up, so there is nothing to wait for after a
 # restart: verify immediately and let the budget burn down faster.
 WD_VERIFY=0
@@ -265,7 +277,7 @@ check_contains "$WORK/deadarmed/wd.log" "restart budget spent" "the give-up is l
 
 echo "== case 3: dead daemon, restart brings it back"
 new_case restartok policy0
-echo userspace >"$WORK/restartok/cpufreq/policy0/scaling_governor"
+printf 'userspace' >"$WORK/restartok/cpufreq/policy0/scaling_governor"
 STUB_BRINGUP=1
 WD_PID="$(watchdog_run 20)"
 sleep 8
@@ -287,7 +299,7 @@ new_case orphan policy0
 start_fake_daemon "$WORK/orphan/pids/case.pids"
 SUP="$(pid_super "$WORK/orphan/pids/case.pids")"
 WORKER="$(pid_worker "$WORK/orphan/pids/case.pids")"
-echo userspace >"$WORK/orphan/cpufreq/policy0/scaling_governor"
+printf 'userspace' >"$WORK/orphan/cpufreq/policy0/scaling_governor"
 kill -KILL "$SUP" 2>/dev/null
 sleep 1
 alive "$WORKER" && c=0 || c=1
@@ -370,7 +382,7 @@ echo "== case 8: two supervisors (a raced restart) are collapsed"
 new_case dup policy0
 start_fake_daemon "$WORK/dup/pids/a.pids"
 start_fake_daemon "$WORK/dup/pids/b.pids"
-echo userspace >"$WORK/dup/cpufreq/policy0/scaling_governor"
+printf 'userspace' >"$WORK/dup/cpufreq/policy0/scaling_governor"
 WD_PID="$(watchdog_run 20)"
 sleep 8
 stop_watchdog "$WD_PID"
@@ -382,6 +394,32 @@ done
 eq "$still" "0" "every supervisor/worker pair was retired"
 eq "$(governor_of dup policy0)" "schedutil" "the takeover was undone"
 check_contains "$WORK/dup/stub.log" "called" "a single daemon was restarted"
+
+# ------------------------------------------------------------- case 9: dry run
+
+echo "== case 9: UPERF_WATCHDOG_DRY_RUN=1 reports without acting"
+new_case dryrun policy0
+printf 'userspace' >"$WORK/dryrun/cpufreq/policy0/scaling_governor"
+start_fake_daemon "$WORK/dryrun/pids/case.pids"
+SUP="$(pid_super "$WORK/dryrun/pids/case.pids")"
+WORKER="$(pid_worker "$WORK/dryrun/pids/case.pids")"
+# Kill the supervisor: the pair is now "unhealthy" with the takeover still armed,
+# i.e. exactly the state the watchdog would otherwise recover from.
+kill -KILL "$SUP" 2>/dev/null
+WD_DRY_RUN=1
+WD_PID="$(watchdog_run 10)"
+sleep 6
+stop_watchdog "$WD_PID"
+check_contains "$WORK/dryrun/wd.log" "dry_run=1" "the run is marked as a dry run"
+check_contains "$WORK/dryrun/wd.log" "unhealthy sample" "the verdict is reported"
+eq "$(state_field dryrun state)" "stopped" "no state claim beyond the stop"
+check_contains "$WORK/dryrun/wd.state" "last state: unhealthy" "the observed state survives the stop"
+alive "$WORKER" && c=0 || c=1
+check "the surviving process was NOT retired" "$c"
+eq "$(governor_of dryrun policy0)" "userspace" "the armed policy was NOT restored"
+[ ! -s "$WORK/dryrun/stub.log" ] && c=0 || c=1
+check "no restart was attempted" "$c"
+kill -KILL "$WORKER" 2>/dev/null
 
 # ------------------------------------------------------- case 6: syntax + wiring
 
