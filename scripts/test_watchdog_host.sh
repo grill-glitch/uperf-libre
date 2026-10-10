@@ -138,6 +138,10 @@ new_case() { # new_case <name> [policy...]
     WD_VERIFY=1
     WD_STATE_PATH=""
     WD_BACKSTOP=20
+    SF_INJECT=""
+    SF_MAX_INJECTS=3
+    SF_RETRY_SAMPLES=1
+    SF_INJECTOR="$WORK/injector"
     WD_DRY_RUN=0
     STUB_BRINGUP=0
     W="$WORK/$name"
@@ -195,6 +199,12 @@ watchdog_run() { # watchdog_run <seconds> -> prints the pid of timeout(1)
         UPERF_WATCHDOG_MAX_RESTARTS="${WD_MAX_RESTARTS:-2}" \
         UPERF_WATCHDOG_TEARDOWN_TICKS="${WD_TEARDOWN:-2}" \
         UPERF_WATCHDOG_BACKSTOP="${WD_BACKSTOP:-20}" \
+        UPERF_SF_INJECT="${SF_INJECT:-}" \
+        UPERF_SF_TARGET="${SF_TARGET:-$WORK/surfaceflinger}" \
+        UPERF_SF_LIB="${SF_LIB:-$WORK/script/libsfanalysis_rs.so}" \
+        UPERF_SF_INJECTOR="${SF_INJECTOR:-$WORK/injector}" \
+        UPERF_SF_MAX_INJECTS="${SF_MAX_INJECTS:-3}" \
+        UPERF_SF_RETRY_SAMPLES="${SF_RETRY_SAMPLES:-1}" \
         UPERF_WATCHDOG_VERIFY_WAIT="${WD_VERIFY:-1}" \
         UPERF_WATCHDOG_DRY_RUN="${WD_DRY_RUN:-0}" \
         UPERF_WATCHDOG_STUB="$W/stub.sh" \
@@ -474,6 +484,145 @@ sed -i '/^\/sys\/ro\/path$/d;/^garbage/d' "$LEDGER"
 restore 2
 check_missing "$WORK/sysfs/out.2.log" "kept at" "nothing is left owed"
 [ -f "$LEDGER" ] && bad "the ledger survived a clean restore" || ok "the ledger is cleared once nothing is owed"
+
+# ------------------------ case 13: SF injection supervision (M8, fas-rs' re-attach)
+
+echo "== case 13: a frame source that disappears is re-attached, counted, and given up on"
+new_case sf policy0
+SF="$WORK/surfaceflinger"
+cp -f "$EXE" "$SF" 2>/dev/null   # a copy of the shell under the name whose comm we filter on
+[ -x "$SF" ] || cp -f "$(command -v sh)" "$SF"
+: >"$WORK/injector"; chmod 755 "$WORK/injector"
+cat >>"$WORK/sf/stub.sh" <<'SFSTUB'
+
+# --- test overrides for the M8 injection supervision (sourced after the definitions) ---
+wd_sf_is_injected() { [ -f "$UPERF_WATCHDOG_STUB_LOG.injected.$1" ]; }
+wd_sf_do_inject() {
+    echo "inject pid=$1" >>"$UPERF_WATCHDOG_STUB_LOG.sfinject"
+    touch "$UPERF_WATCHDOG_STUB_LOG.injected.$1"
+    return 0
+}
+SFSTUB
+start_sf() {
+    rm -f "$WORK"/sf*/stub.log.injected* 2>/dev/null
+    "$SF" -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
+    echo $! >"$WORK/sf.pid"
+    sleep 1
+}
+
+# off by default: the sample costs a string test and nothing else
+SF_INJECT=""
+WD_INTERVAL=1
+WD_PID="$(watchdog_run 4)"
+sleep 3
+stop_watchdog "$WD_PID"
+cp "$WORK/sf/wd.state" "$WORK/sf/off.state"
+eq "$(sed -n 's/^sf_state=//p' "$WORK/sf/off.state")" "off" "injection supervision is off unless asked for"
+eq "$(sed -n 's/^sf_injects=//p' "$WORK/sf/off.state")" "0" "and it injected nothing"
+
+# on, with no surfaceflinger running
+new_case sf2 policy0
+cp -f "$EXE" "$WORK/surfaceflinger" 2>/dev/null || true
+: >"$WORK/injector"; chmod 755 "$WORK/injector"
+cat >>"$WORK/sf2/stub.sh" <<'SFSTUB'
+wd_sf_is_injected() { [ -f "$UPERF_WATCHDOG_STUB_LOG.injected.$1" ]; }
+wd_sf_do_inject() {
+    echo "inject pid=$1" >>"$UPERF_WATCHDOG_STUB_LOG.sfinject"
+    touch "$UPERF_WATCHDOG_STUB_LOG.injected.$1"
+    return 0
+}
+SFSTUB
+SF_INJECT=1
+WD_INTERVAL=1
+start_fake_daemon "$WORK/sf2/pids/a.pids"
+WD_PID="$(watchdog_run 4)"
+sleep 2
+cp "$WORK/sf2/wd.state" "$WORK/sf2/absent.state"
+eq "$(sed -n 's/^sf_state=//p' "$WORK/sf2/absent.state")" "absent" "no target running is reported as absent"
+eq "$(sed -n 's/^sf_injects=//p' "$WORK/sf2/absent.state")" "0" "and nothing was attempted"
+
+# the target appears: one injection, then a healthy no-op
+"$WORK/surfaceflinger" -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
+SFPID=$!
+sleep 5
+cp "$WORK/sf2/wd.state" "$WORK/sf2/injected.state"
+eq "$(sed -n 's/^sf_state=//p' "$WORK/sf2/injected.state")" "injected" "the first sight of the target injects once"
+eq "$(sed -n 's/^sf_injects=//p' "$WORK/sf2/injected.state")" "1" "exactly one injection so far"
+sleep 4
+cp "$WORK/sf2/wd.state" "$WORK/sf2/steady.state"
+eq "$(sed -n 's/^sf_injects=//p' "$WORK/sf2/steady.state")" "1" "a healthy mapping is not re-injected"
+eq "$(grep -c '^inject' "$WORK/sf2/stub.log.sfinject" 2>/dev/null)" "1" "the injector was called once in total"
+
+# the target restarts -> a new identity -> re-attach
+kill -KILL "$SFPID" 2>/dev/null
+sleep 2
+"$WORK/surfaceflinger" -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
+SFPID2=$!
+sleep 5
+cp "$WORK/sf2/wd.state" "$WORK/sf2/restart.state"
+eq "$(sed -n 's/^sf_injects=//p' "$WORK/sf2/restart.state")" "2" "a restarted target is re-injected"
+check_contains "$WORK/sf2/wd.log" "restarted" "and the restart is what the log blames"
+
+# More restarts are still served: the budget counts failures, not attempts, so a device
+# whose surfaceflinger restarts often does not lose its frame source for the rest of boot.
+kill -KILL "$SFPID2" 2>/dev/null
+sleep 2
+"$WORK/surfaceflinger" -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
+SFPID3=$!
+sleep 5
+cp "$WORK/sf2/wd.state" "$WORK/sf2/third.state"
+eq "$(sed -n 's/^sf_injects=//p' "$WORK/sf2/third.state")" "3" "a third restart is still injected (successes do not spend the budget)"
+eq "$(sed -n 's/^sf_state=//p' "$WORK/sf2/third.state")" "injected" "and the state says the mapping is ours"
+kill -KILL "$SFPID" "$SFPID2" "$SFPID3" 2>/dev/null
+for p in $(pgrep -f "$WORK/surfaceflinger" 2>/dev/null); do kill -KILL "$p" 2>/dev/null; done
+stop_watchdog "$WD_PID"
+
+# failures do spend it: an injector that keeps failing must stop being retried
+new_case sf4 policy0
+cp -f "$EXE" "$WORK/surfaceflinger" 2>/dev/null || true
+: >"$WORK/injector"; chmod 755 "$WORK/injector"
+cat >>"$WORK/sf4/stub.sh" <<'SFSTUB'
+wd_sf_is_injected() { [ -f "$UPERF_WATCHDOG_STUB_LOG.injected.$1" ]; }
+wd_sf_do_inject() {
+    echo "fail pid=$1" >>"$UPERF_WATCHDOG_STUB_LOG.sfinject"
+    return 1
+}
+SFSTUB
+SF_INJECT=1
+WD_INTERVAL=1
+start_fake_daemon "$WORK/sf4/pids/a.pids"
+"$WORK/surfaceflinger" -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
+SFPID4=$!
+WD_PID="$(watchdog_run 20)"
+sleep 12
+cp "$WORK/sf4/wd.state" "$WORK/sf4/gaveup.state"
+eq "$(sed -n 's/^sf_state=//p' "$WORK/sf4/gaveup.state")" "gave-up" "a failing injector is given up on, not retried forever"
+eq "$(sed -n 's/^sf_fails=//p' "$WORK/sf4/gaveup.state")" "3" "the failure count is what the budget spent"
+check_contains "$WORK/sf4/wd.log" "gave up after 3 failed injection attempt" "the give-up says why, failures included"
+eq "$(grep -c '^fail ' "$WORK/sf4/stub.log.sfinject" 2>/dev/null)" "3" "and it stopped after the budget, not at the end of the run"
+kill -KILL "$SFPID4" 2>/dev/null
+stop_watchdog "$WD_PID"
+
+# no injector at all: disabled once, loudly, instead of failing every sample
+new_case sf3 policy0
+SF_INJECT=1
+SF_INJECTOR="$WORK/definitely-not-here"
+WD_INTERVAL=1
+start_fake_daemon "$WORK/sf3/pids/a.pids"
+# The injector is only consulted when something needs injecting: a target has to be
+# running, or the loop correctly says `absent` and never looks at the injector.
+cp -f "$EXE" "$WORK/surfaceflinger" 2>/dev/null || true
+"$WORK/surfaceflinger" -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
+SFPID5=$!
+WD_PID="$(watchdog_run 4)"
+sleep 3
+stop_watchdog "$WD_PID"
+cp "$WORK/sf3/wd.state" "$WORK/sf3/disabled.state"
+check_contains "$WORK/sf3/wd.log" "no usable injector" "a missing injector is reported once"
+eq "$(grep -c 'no usable injector' "$WORK/sf3/wd.log" 2>/dev/null)" "1" "and not once per sample"
+eq "$(sed -n 's/^sf_state=//p' "$WORK/sf3/wd.state")" "disabled" "and the loop is switched off rather than failing every sample"
+eq "$(sed -n 's/^sf_injects=//p' "$WORK/sf3/wd.state")" "0" "with no attempt recorded"
+kill -KILL "$SFPID5" 2>/dev/null
 
 # ------------------------------------------------------- case 9: a killed daemon is seen
 
