@@ -101,8 +101,29 @@ $ binder-probe /dev/binder --latency 'com.android.launcher3/…QuickstepLauncher
 * `fd` 用 `BINDER_TYPE_FD = 0x66642a85`，并带 offsets 数组；读回用**并发线程**；
 * `dump` **不回包**，故只写发送 + pipe 静默超时结束。
 
-## 6. 未做（⑤ 的剩余）
+## 6. 第三轮：搬进 daemon，`--latency` → FPS 真机跑通（2026-10-10）
 
-`--latency` 文本表解析（首行 = 刷新周期；每行 `desiredPresent / actualPresent /
-frameReady`）→ 滑窗 FPS；再与既有帧源（M8 注入写的 `sfanalysis.hint`）接优先级与降级，
-并把这段 binder 客户端从探针搬进 daemon（`rust/uperf-core/src/`）。仍不臆造。
+客户端已从探针搬进 daemon：`rust/uperf-core/src/sf_binder.rs`
+
+* `SfClient` —— 传输层（同探针），目标 legacy `SurfaceFlinger`；
+* `parse_latency` / `fps_in_window` / `pick_layer` —— **纯函数**，主机单测覆盖
+  （刷新周期、丢掉 `0`/全 `1` 的 padding 行、滑窗计数、`ActivityRecordInputSink` 层
+  必须被跳过——它在真机上 `--latency` 是空表）；
+* `FrameTask` —— opt-in（`UPERF_SF_BINDER=1`），每 tick（默认 1 s）按 top app 解析 layer
+  （`UPERF_SF_BINDER_LAYER` 可钉死）并打一条 FPS 日志；`uperf_rs_stop` 里一并停。
+
+真机 e2e（`tools/binder-probe/e2e-frames.sh`，alioth）：
+
+```
+Rust: sf-binder layer=com.android.launcher3/…QuickstepLauncher#338 refresh_ns=8333333 frames=38 fps=38.0
+Rust: sf-binder layer=…launcher…#338 refresh_ns=8333333 frames=0 fps=0.0     ← 静止时确实是 0
+```
+
+即：动画中 38 fps、静止 0，`refresh_ns=8333333`（120 Hz），layer 解析跳过了
+`ActivityRecordInputSink`。
+
+## 7. 未做（⑤ 的剩余）
+
+FPS **尚未接进帧源优先级**：M8 的 `sfanalysis.hint` 仍是唯一被消费的帧源，本轮只做到
+"daemon 能自己算出 FPS 并记日志"。要做的还有：把 FPS/refresh 接进 hint 或 dfps 的
+场景判断（谁是主源、注入可用时如何降级）、以及把 FPS 暴露到 status/WebUI。仍不臆造。

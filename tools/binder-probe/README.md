@@ -59,8 +59,18 @@ $ binder-probe /dev/binder --latency 'com.android.launcher3/…QuickstepLauncher
 | `DUMP_TRANSACTION` | `0x5f444d50`（`B_PACK_CHARS('_','D','M','P')`） |
 | `kHeader`（/dev/binder） | `0x53595354`（"SYST"） |
 
+## 与 daemon 的关系
+
+客户端已从本探针搬进 daemon：`rust/uperf-core/src/sf_binder.rs`（`SfClient` + 纯函数
+`parse_latency`/`fps_in_window`/`pick_layer` + opt-in `FrameTask`）。本探针保留作最小
+可复现件与调试入口。
+
 ## 下一步（⑤ 剩余）
 
-`--latency` 表解析（首行 = 刷新周期 ns；其后每行 `desiredPresent / actualPresent /
-frameReady`）→ 滑窗 FPS；再与既有帧源（M8 注入写的 `sfanalysis.hint`）接优先级/降级，
-并落进 daemon（`rust/uperf-core/src/`）而不是探针。
+`--latency` 表已能算 FPS（首行 = 刷新周期 ns；每行 `desiredPresent / actualPresent /
+frameReady`）。**layer 选择有个真机坑**：同一 package 下大量 `ActivityRecordInputSink …`
+层，它们的 `--latency` 是**空表**（实测 0 帧），必须跳过；真正的帧在
+`pkg/pkg.Activity#N`（或游戏里的 `SurfaceView[pkg/act](BLAST)#N`）上。
+
+剩下的：把 FPS/refresh 接进帧源优先级（与 M8 注入写的 `sfanalysis.hint` 谁是主源、
+注入可用时如何降级），并暴露到 status/WebUI。
