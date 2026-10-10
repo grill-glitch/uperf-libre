@@ -122,8 +122,27 @@ Rust: sf-binder layer=…launcher…#338 refresh_ns=8333333 frames=0 fps=0.0    
 即：动画中 38 fps、静止 0，`refresh_ns=8333333`（120 Hz），layer 解析跳过了
 `ActivityRecordInputSink`。
 
-## 7. 未做（⑤ 的剩余）
+## 7. 第四轮：主源优先级 + 暴露（2026-10-10）
 
-FPS **尚未接进帧源优先级**：M8 的 `sfanalysis.hint` 仍是唯一被消费的帧源，本轮只做到
-"daemon 能自己算出 FPS 并记日志"。要做的还有：把 FPS/refresh 接进 hint 或 dfps 的
-场景判断（谁是主源、注入可用时如何降级）、以及把 FPS 暴露到 status/WebUI。仍不臆造。
+* **优先级**（`choose_source`，纯函数）：注入的 `sfanalysis.hint` 新鲜
+  （`UPERF_SF_BINDER_HINT_STALE_MS`，默认 3000 ms）时为主源，且 **FPS 腿完全不轮询
+  binder**——优先级有真实成本后果，不只是标签；hint 缺席或过期即自动降级。
+* **状态**：每次 tick 写 `<USER_PATH>/uperf_frames.state`
+  （`source/hint_age_ms/fps/frames/refresh_ns/layer/ts_ms`），`webui.sh status` 转出
+  `frame.*`，WebUI 监督卡加 `label_frame_leg`/`label_frame_fps` 两行。
+
+真机 e2e（`tools/binder-probe/e2e-priority.sh`）：
+
+```
+A no-hint  source=fps  hint_age_ms=-
+B fresh    source=hint hint_age_ms=22   （同一窗口 fps 日志 0 条 —— binder 轮询停了）
+C stale    source=fps  hint_age_ms=6199 refresh_ns=8333333 layer=…Settings#474
+日志：frame source -> fps (hint_age_ms=None) -> hint (Some(103)) -> fps (Some(2061))
+```
+
+## 8. 未做（⑤ 的剩余，[U]）
+
+**FPS 仍只作观测 + 降级源，没有参与 dfps 的刷帧决策**：`sfanalysis.hint` 依旧是唯一
+进 SfHint FSM 的源。要让降级腿真正"接管"，需要定义 FPS/refresh → 场景/刷帧的映射
+（这是新的策略，不是复刻上游），并且 `hint_age_ms` 走的是 mtime（墙钟），需要更硬的
+存活判据。仍不臆造。

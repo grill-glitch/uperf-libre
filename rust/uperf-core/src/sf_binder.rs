@@ -510,14 +510,77 @@ pub fn pick_layer(list_text: &str, package: &str) -> Option<String> {
     names.into_iter().next()
 }
 
+// ---------------------------------------------------------------- source priority
+
+/// Which frame source is primary.
+///
+/// The M8-injected `sfanalysis.hint` wins whenever it is fresh — it is the real
+/// thing, a per-vsync event from inside SurfaceFlinger. The direct-binder FPS leg is
+/// the **degraded fallback** for when that library is not injected. While the hint is
+/// live the FPS leg is not even polled: each poll is a binder round trip plus a pipe
+/// read, so the priority has a real cost consequence, not just a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameSource {
+    Hint,
+    Fps,
+}
+
+impl FrameSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FrameSource::Hint => "hint",
+            FrameSource::Fps => "fps",
+        }
+    }
+}
+
+/// Pick the primary source from the hint file's age. `None` (absent/unreadable) means
+/// the hint leg is not there at all.
+pub fn choose_source(hint_age_ms: Option<u64>, stale_after_ms: u64) -> FrameSource {
+    match hint_age_ms {
+        Some(age) if age <= stale_after_ms => FrameSource::Hint,
+        _ => FrameSource::Fps,
+    }
+}
+
+/// Age of the hint file in milliseconds, from its mtime. The hint carries no timestamp
+/// of its own (one raw byte, spec §2.2), so mtime is the only freshness signal — and
+/// this is a wall-clock comparison, which a clock jump could fool; the injected library
+/// writing on every refresh is the real proof of life.
+pub fn hint_age_ms(path: &Path) -> Option<u64> {
+    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+    let age = std::time::SystemTime::now().duration_since(mtime).ok()?;
+    Some(age.as_millis() as u64)
+}
+
 // ---------------------------------------------------------------- daemon task
 
 /// Periodic frame sampling, as a daemon task. Opt-in: `UPERF_SF_BINDER=1`.
-/// `UPERF_SF_BINDER_LAYER` pins a layer name; otherwise the top app's layer is
-/// re-resolved when the top app changes.
+///
+/// `UPERF_SF_BINDER_LAYER` pins a layer; otherwise the top app's layer is re-resolved
+/// when the top app changes. `UPERF_SF_BINDER_HINT_STALE_MS` (default 3000) is the age
+/// past which the injected hint stops counting as live. State is published to
+/// `<USER_PATH>/uperf_frames.state` (or `UPERF_FRAMES_STATE`) for `webui.sh`/the WebUI.
 pub struct FrameTask {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Best-effort atomic write of the frame-source state file. Reporting must never take
+/// the sampler down, so every failure is silent.
+fn write_state(path: &Path, lines: &str) {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".new");
+    let tmp = std::path::PathBuf::from(tmp);
+    if std::fs::write(&tmp, lines).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        return;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::write(path, lines);
+}
+
+fn env_ms(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(default)
 }
 
 impl FrameTask {
@@ -525,80 +588,132 @@ impl FrameTask {
         matches!(std::env::var("UPERF_SF_BINDER").ok().as_deref(), Some("1") | Some("true"))
     }
 
-    pub fn spawn<F, L>(top_app: F, log: L) -> Option<FrameTask>
+    pub fn spawn<F, L>(cfg_dir: Option<std::path::PathBuf>, top_app: F, log: L) -> Option<FrameTask>
     where
         F: Fn() -> Option<String> + Send + 'static,
         L: Fn(&str) + Send + 'static,
     {
-        let tick_ms = std::env::var("UPERF_SF_BINDER_TICK_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1000);
-        let window_ms = std::env::var("UPERF_SF_BINDER_WINDOW_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1000);
+        let tick_ms = env_ms("UPERF_SF_BINDER_TICK_MS", 1000);
+        let window_ms = env_ms("UPERF_SF_BINDER_WINDOW_MS", 1000);
+        let stale_ms = env_ms("UPERF_SF_BINDER_HINT_STALE_MS", 3000);
         let pinned = std::env::var("UPERF_SF_BINDER_LAYER").ok().filter(|s| !s.is_empty());
+
+        let hint_path = cfg_dir.as_ref().map(|d| d.join("sfanalysis.hint"));
+        let state_path = std::env::var("UPERF_FRAMES_STATE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| cfg_dir.as_ref().map(|d| d.join("uperf_frames.state")));
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let handle = std::thread::Builder::new()
             .name("uperf-sf-bind".into())
             .spawn(move || {
+                let publish = |source: FrameSource, age: Option<u64>, fps: Option<f64>, frames: usize, layer: Option<&str>, refresh: Option<u64>| {
+                    if let Some(p) = state_path.as_ref() {
+                        let mut out = String::with_capacity(256);
+                        out.push_str(&format!("source={}\n", source.as_str()));
+                        out.push_str(&format!(
+                            "hint_age_ms={}\n",
+                            age.map(|a| a.to_string()).unwrap_or_else(|| "-".into())
+                        ));
+                        out.push_str(&format!(
+                            "fps={}\n",
+                            fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "-".into())
+                        ));
+                        out.push_str(&format!("frames={frames}\n"));
+                        out.push_str(&format!(
+                            "refresh_ns={}\n",
+                            refresh.map(|r| r.to_string()).unwrap_or_else(|| "-".into())
+                        ));
+                        out.push_str(&format!("layer={}\n", layer.unwrap_or("-")));
+                        out.push_str(&format!("ts_ms={}\n", monotonic_ns() / 1_000_000));
+                        write_state(p, &out);
+                    }
+                };
+
                 let mut client = match SfClient::connect() {
                     Ok(c) => c,
                     Err(e) => {
                         log(&format!("Rust: sf-binder connect failed: {e}"));
+                        publish(FrameSource::Fps, None, None, 0, None, None);
                         return;
                     }
                 };
                 log("Rust: sf-binder connected (direct binder, no dumpsys)");
+
                 let mut layer: Option<String> = pinned.clone();
                 let mut layer_for: Option<String> = None;
+                let mut last_src: Option<FrameSource> = None;
                 let mut fails = 0u32;
+
                 while !stop_thread.load(Ordering::SeqCst) {
-                    let pkg = top_app();
-                    if layer.is_none() || (pinned.is_none() && pkg != layer_for) {
-                        if let Some(p) = pkg.as_deref() {
-                            match client.layer_list().and_then(|l| {
-                                pick_layer(&l, p).ok_or_else(|| format!("no layer for {p}"))
-                            }) {
-                                Ok(l) => {
-                                    log(&format!("Rust: sf-binder layer '{l}' for {p}"));
-                                    layer = Some(l);
-                                    layer_for = Some(p.to_string());
+                    let age = hint_path.as_deref().and_then(hint_age_ms);
+                    let src = choose_source(age, stale_ms);
+                    if last_src != Some(src) {
+                        log(&format!(
+                            "Rust: sf-binder frame source -> {} (hint_age_ms={:?})",
+                            src.as_str(),
+                            age
+                        ));
+                        last_src = Some(src);
+                    }
+
+                    match src {
+                        FrameSource::Hint => {
+                            // The injected leg is live; do not touch binder at all.
+                            publish(FrameSource::Hint, age, None, 0, None, None);
+                        }
+                        FrameSource::Fps => {
+                            let pkg = top_app();
+                            if layer.is_none() || (pinned.is_none() && pkg != layer_for) {
+                                if let Some(p) = pkg.as_deref() {
+                                    match client.layer_list().and_then(|l| {
+                                        pick_layer(&l, p).ok_or_else(|| format!("no layer for {p}"))
+                                    }) {
+                                        Ok(l) => {
+                                            log(&format!("Rust: sf-binder layer '{l}' for {p}"));
+                                            layer = Some(l);
+                                            layer_for = Some(p.to_string());
+                                        }
+                                        Err(e) => log(&format!("Rust: sf-binder layer resolve: {e}")),
+                                    }
                                 }
-                                Err(e) => log(&format!("Rust: sf-binder layer resolve: {e}")),
+                            }
+                            match layer.clone() {
+                                Some(l) => match client.latency(&l) {
+                                    Ok(text) => {
+                                        let (refresh, frames) = parse_latency(&text);
+                                        let fps = fps_in_window(&frames, monotonic_ns(), window_ms * 1_000_000);
+                                        log(&format!(
+                                            "Rust: sf-binder layer={l} refresh_ns={} frames={} fps={fps:.1}",
+                                            refresh.unwrap_or(0),
+                                            frames.len()
+                                        ));
+                                        publish(FrameSource::Fps, age, Some(fps), frames.len(), Some(&l), refresh);
+                                        fails = 0;
+                                    }
+                                    Err(e) => {
+                                        fails += 1;
+                                        log(&format!("Rust: sf-binder latency: {e}"));
+                                        publish(FrameSource::Fps, age, None, 0, Some(&l), None);
+                                        if fails >= 5 {
+                                            layer = pinned.clone();
+                                            layer_for = None;
+                                        }
+                                    }
+                                },
+                                None => publish(FrameSource::Fps, age, None, 0, None, None),
                             }
                         }
                     }
-                    if let Some(l) = layer.clone() {
-                        match client.latency(&l) {
-                            Ok(text) => {
-                                let (refresh, frames) = parse_latency(&text);
-                                let fps = fps_in_window(&frames, monotonic_ns(), window_ms * 1_000_000);
-                                let r = refresh.unwrap_or(0);
-                                log(&format!(
-                                    "Rust: sf-binder layer={l} refresh_ns={r} frames={} fps={fps:.1}",
-                                    frames.len()
-                                ));
-                                fails = 0;
-                            }
-                            Err(e) => {
-                                fails += 1;
-                                log(&format!("Rust: sf-binder latency: {e}"));
-                                if fails >= 5 {
-                                    layer = pinned.clone();
-                                    layer_for = None;
-                                }
-                            }
-                        }
-                    }
-                    // sleep in small steps so stop() is prompt
+
                     let mut slept = 0u64;
+                    let step = 50.min(tick_ms).max(1);
                     while slept < tick_ms && !stop_thread.load(Ordering::SeqCst) {
-                        std::thread::sleep(std::time::Duration::from_millis(50.min(tick_ms)));
-                        slept += 50.min(tick_ms);
+                        std::thread::sleep(std::time::Duration::from_millis(step));
+                        slept += step;
                     }
                 }
                 log("Rust: sf-binder stopped");
@@ -613,15 +728,6 @@ impl FrameTask {
             let _ = h.join();
         }
     }
-}
-
-/// Where a probe/daemon can find the frame source; kept for the log line.
-pub fn describe(cfg_dir: Option<&Path>) -> String {
-    format!(
-        "sf-binder enabled={} cfg_dir={}",
-        FrameTask::enabled(),
-        cfg_dir.map(|p| p.display().to_string()).unwrap_or_default()
-    )
 }
 
 #[cfg(test)]
@@ -708,5 +814,22 @@ mod tests {
         let a = monotonic_ns();
         assert!(a > 0);
         assert!(monotonic_ns() >= a);
+    }
+
+    /// The injected hint is primary while it is fresh; the binder leg takes over when
+    /// it is gone. `None` (no hint file) is the degraded case, never a reason to wait.
+    #[test]
+    fn the_hint_wins_only_while_it_is_fresh() {
+        assert_eq!(choose_source(Some(0), 3000), FrameSource::Hint);
+        assert_eq!(choose_source(Some(3000), 3000), FrameSource::Hint);
+        assert_eq!(choose_source(Some(3001), 3000), FrameSource::Fps);
+        assert_eq!(choose_source(None, 3000), FrameSource::Fps);
+        assert_eq!(FrameSource::Hint.as_str(), "hint");
+        assert_eq!(FrameSource::Fps.as_str(), "fps");
+    }
+
+    #[test]
+    fn a_missing_hint_file_has_no_age() {
+        assert_eq!(hint_age_ms(Path::new("/nonexistent/sfanalysis.hint")), None);
     }
 }

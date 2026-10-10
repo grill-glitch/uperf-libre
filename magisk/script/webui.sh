@@ -128,6 +128,15 @@ print_status() {
     echo "watchdog.sf_state=$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^sf_state=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
     echo "watchdog.sf_injects=$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^sf_injects=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
     echo "watchdog.sf_fails=$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^sf_fails=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
+    # ⑤ the daemon's own frame source (opt-in `UPERF_SF_BINDER=1`): `source=hint` while
+    # the injected library's hint is fresh, `source=fps` when the direct-binder leg had
+    # to take over (that leg is not even polled while the hint is live).
+    local frames="$USER_PATH/uperf_frames.state"
+    echo "frame.source=$([ -f "$frames" ] && sed -n 's/^source=//p' "$frames" 2>/dev/null | head -n 1)"
+    echo "frame.fps=$([ -f "$frames" ] && sed -n 's/^fps=//p' "$frames" 2>/dev/null | head -n 1)"
+    echo "frame.hint_age_ms=$([ -f "$frames" ] && sed -n 's/^hint_age_ms=//p' "$frames" 2>/dev/null | head -n 1)"
+    echo "frame.refresh_ns=$([ -f "$frames" ] && sed -n 's/^refresh_ns=//p' "$frames" 2>/dev/null | head -n 1)"
+    echo "frame.layer=$([ -f "$frames" ] && sed -n 's/^layer=//p' "$frames" 2>/dev/null | head -n 1)"
 
     local log="$USER_PATH/uperf_log.txt"
     echo "log.path=$log"

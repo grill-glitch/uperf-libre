@@ -125,6 +125,16 @@ export function render(data, config, error) {
         rows.push([getString('label_frame_injected'), data['watchdog.sf_injects'] || '0']);
         rows.push([getString('label_frame_failed'), data['watchdog.sf_fails'] || '0']);
     }
+    // ⑤ the daemon's own frame leg (opt-in `UPERF_SF_BINDER=1`): `hint` while the
+    // injected hint is fresh, `fps` when the direct-binder leg had to take over.
+    const leg = String(data['frame.source'] || '').trim();
+    if (leg) {
+        rows.push([getString('label_frame_leg'), leg]);
+        const fps = String(data['frame.fps'] || '').trim();
+        if (fps && fps !== '-') {
+            rows.push([getString('label_frame_fps'), fps]);
+        }
+    }
     addRow(supervision, 'verified_user', rows, getString('section_supervision'));
 
     const device = document.getElementById('device-card');

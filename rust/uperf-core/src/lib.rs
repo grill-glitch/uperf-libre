@@ -330,11 +330,15 @@ pub(crate) extern "C" fn uperf_rs_start(
     if crate::sf_binder::FrameTask::enabled() {
         let orch = ORCHESTRATOR.get().cloned();
         let state = move || orch.as_ref().and_then(|o| o.lock().top_app().map(str::to_string));
+        let cfg_dir = {
+            let cfg_str = cfg.to_string_lossy().to_string();
+            std::path::Path::new(&cfg_str).parent().map(|p| p.to_path_buf())
+        };
         let mut guard = sf_binder_slot().lock();
         if let Some(mut prev) = guard.take() {
             prev.stop();
         }
-        match crate::sf_binder::FrameTask::spawn(state, |m: &str| log_msg(m)) {
+        match crate::sf_binder::FrameTask::spawn(cfg_dir, state, |m: &str| log_msg(m)) {
             Some(t) => {
                 log_msg("Rust: sf-binder frame source started");
                 *guard = Some(t);
