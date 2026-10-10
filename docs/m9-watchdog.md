@@ -123,6 +123,24 @@ cannot be trusted. The `backstop` knob covers the one case a healthy cache canno
 see — a *second* pair appearing out of nowhere (a start that raced the lock) — and
 the sweep it forces also re-checks `exe` for every candidate.
 
+### The frame source is a second thing that can disappear (M8, opt-in)
+
+The daemon is not the only thing this module needs alive: the SfAnalysis library inside
+`surfaceflinger` can be gone for reasons nobody chose — `surfaceflinger` is restarted,
+the device reboots, a mapping is lost. Off unless `UPERF_SF_INJECT=1`, the same loop
+supervises it, with the shape borrowed from fas-rs's analyzer lifecycle: an identity
+(`pid:start_ticks`), a re-attach when the identity changes, a counter, a **verification
+that the injection actually took** (the mapping is re-read after the injector returns
+zero — an injector that returns success while the mapping never appears is a failure, the
+same reason fas-rs re-reads its own frequency writes), and a give-up that says why. The
+budget counts *failures*, so a target that legitimately restarts often does not lose its
+frame source for the rest of the boot.
+
+State lands in the same file (`sf=`, `sf_state=`, `sf_injects=`, `sf_fails=`,
+`sf_max_injects=`) with `sf_state` distinguishing `injected` (a mapping we put there) from
+`healthy` (it was already there) — the two are different facts, and `healthy` would hide
+which one it is.
+
 ## 3. The two state files
 
 Each has exactly one writer, so nothing interleaves.
@@ -332,6 +350,12 @@ restarted:
 | `UPERF_WATCHDOG_MAX_RESTARTS` | 3 | restart budget **per boot** |
 | `UPERF_WATCHDOG_TEARDOWN_TICKS` | 5 | seconds to wait for a SIGTERM to land |
 | `UPERF_WATCHDOG_VERIFY_WAIT` | 3 | seconds to wait after a restart before judging it |
+| `UPERF_SF_INJECT` | unset | opt-in: also supervise the injected lib in `surfaceflinger` (M8). Unset = one string test per sample and nothing else |
+| `UPERF_SF_TARGET` | `/system/bin/surfaceflinger` | what to keep the lib inside. Identity is `pid:start_ticks`, so a restarted target is noticed |
+| `UPERF_SF_LIB` | `<module>/bin/libsfanalysis_rs.so` | what its `/proc/<pid>/maps` must carry |
+| `UPERF_SF_INJECTOR` | `/data/local/tmp/injector` | where the injector is. **The module does not ship one** (it is a ptrace tool from the test setup); a missing one disables this loop with one log line |
+| `UPERF_SF_MAX_INJECTS` | 3 | **failed** attempts before giving up (successes never spend the budget, so a target that restarts often still gets its frame source back) |
+| `UPERF_SF_RETRY_SAMPLES` | 4 | samples to wait after an attempt before trying the same identity again |
 | `UPERF_WATCHDOG_BACKSTOP` | 20 | samples between *forced* `/proc` sweeps — the only way a second pair that appears while the first is healthy gets seen (the host harness sets it to 1 to test that) |
 
 Test seams (defaults = the device layout): `UPERF_WATCHDOG_{PROC_ROOT,

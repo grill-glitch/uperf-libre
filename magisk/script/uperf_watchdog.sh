@@ -94,6 +94,34 @@ WD_VERIFY_WAIT="${UPERF_WATCHDOG_VERIFY_WAIT:-3}"
 # lock). 20 samples = 5 min at the shipped interval; the host harness sets it to 1 to
 # test that path on purpose.
 WD_BACKSTOP="${UPERF_WATCHDOG_BACKSTOP:-20}"
+
+# ------------------------------------------------ SF injection supervision (M8, opt-in)
+#
+# The borrow from fas-rs's analyzer lifecycle: a frame source that can *disappear*
+# (surfaceflinger is restarted, the device reboots, the mapping is lost) needs something
+# that notices and re-attaches — with a counter and a give-up that says why. Without it
+# the module runs happily with no frame source and nothing outside can tell.
+#
+# Off unless `UPERF_SF_INJECT=1`, so the default sample costs one string test: the
+# product-side decision is that a real injection into surfaceflinger stays opt-in. The
+# injector is NOT shipped — it is a ptrace tool from the test setup — so
+# `UPERF_SF_INJECTOR` says where it is, and a missing one disables this loop with one log
+# line instead of failing silently every sample.
+SF_ENABLE="${UPERF_SF_INJECT:-0}"
+SF_TARGET="${UPERF_SF_TARGET:-/system/bin/surfaceflinger}"
+SF_LIB="${UPERF_SF_LIB:-$BIN_PATH/libsfanalysis_rs.so}"
+SF_INJECTOR="${UPERF_SF_INJECTOR:-/data/local/tmp/injector}"
+SF_MAX_INJECTS="${UPERF_SF_MAX_INJECTS:-3}"
+SF_RETRY_SAMPLES="${UPERF_SF_RETRY_SAMPLES:-4}"
+SF_ID=""
+SF_INJECTS=0
+SF_FAILS=0
+SF_STATE="off"
+SF_SINCE=999
+SF_DISABLED=0
+SF_GAVE_UP_LOGGED=0
+SF_INJECTED_ID=""
+SF_SEEN=0
 WD_CACHE=""
 WD_SCANS=0
 WD_SINCE_SCAN=0
@@ -310,6 +338,131 @@ wd_lock_release() {
     return 0
 }
 
+# ------------------------------------------------- SF injection supervision
+#
+# The target's identity is `pid:start_ticks`, the same rule the daemon pair uses: a
+# restarted surfaceflinger is a different process, and that is exactly the event this
+# exists to notice. `wd_sf_is_injected` / `wd_sf_do_inject` are functions, not inline
+# calls, so the harness can replace them (its stub file is sourced last, like the one
+# that replaces `uperf_start`).
+
+SF_COMM="${SF_TARGET##*/}"
+
+wd_sf_pid() {
+    local p pid comm
+    for p in "$PROC_ROOT"/[0-9]*; do
+        comm=""
+        { IFS= read -r comm <"$p/comm"; } 2>/dev/null
+        [ "$comm" = "$SF_COMM" ] || continue
+        pid="${p##*/}"
+        wd_stat_fields "$pid" || continue
+        echo "$pid:$WD_START_TICKS"
+        return 0
+    done
+    return 1
+}
+
+wd_sf_is_injected() {
+    grep -q "$(basename "$SF_LIB")" "$PROC_ROOT/$1/maps" 2>/dev/null
+}
+
+wd_sf_do_inject() {
+    "$SF_INJECTOR" "$SF_TARGET" "$SF_LIB" >/dev/null 2>&1
+}
+
+wd_sf_state() {
+    SF_STATE="$1"
+}
+
+wd_sf_check() {
+    local id pid
+    [ "$SF_ENABLE" = "1" ] || return 0
+    [ "$SF_DISABLED" = "1" ] && return 0
+
+    id="$(wd_sf_pid)"
+    if [ -z "$id" ]; then
+        [ "$SF_STATE" != "absent" ] && wd_log "sf: $SF_TARGET is not running"
+        # The identity is kept: the target coming back with a new pid is a *restart*
+        # (worth saying) and only a target that was never seen is a first sight.
+        wd_sf_state "absent"
+        return 0
+    fi
+    pid="${id%%:*}"
+
+    if wd_sf_is_injected "$pid"; then
+        if [ "$SF_ID" != "$id" ]; then
+            wd_log "sf: pid=$pid already carries $(basename "$SF_LIB") (no injection needed)"
+        fi
+        SF_ID="$id"
+        SF_SINCE=0
+        # A mapping *we* put there is a different fact from one that was already there,
+        # and `healthy` would hide which one it is.
+        if [ "$SF_INJECTED_ID" = "$id" ]; then
+            wd_sf_state "injected"
+        else
+            wd_sf_state "healthy"
+        fi
+        return 0
+    fi
+
+    # Not injected. Three cases that look the same from here and are not: first sight, a
+    # restarted surfaceflinger, and a process that lost the mapping. All three end in the
+    # same action, but only the restart is worth a log line of its own.
+    SF_SINCE=$((SF_SINCE + 1))
+    if [ "$SF_INJECTS" -gt 0 ] && [ "$SF_ID" = "$id" ] && [ "$SF_SINCE" -lt "$SF_RETRY_SAMPLES" ]; then
+        wd_sf_state "waiting"
+        return 0
+    fi
+    # The budget counts *failures*, not attempts: a device whose surfaceflinger restarts
+    # often must still get its frame source back on the fifth restart, while an injector
+    # that keeps failing (or a mapping that never appears) has to stop being retried.
+    if [ "$SF_FAILS" -ge "$SF_MAX_INJECTS" ]; then
+        if [ "$SF_GAVE_UP_LOGGED" != "1" ]; then
+            wd_log "sf: gave up after $SF_FAILS failed injection attempt(s) of $SF_INJECTS — no frame source (UPERF_SF_MAX_INJECTS)"
+            SF_GAVE_UP_LOGGED=1
+        fi
+        wd_sf_state "gave-up"
+        return 0
+    fi
+    if [ ! -x "$SF_INJECTOR" ]; then
+        SF_DISABLED=1
+        wd_sf_state "disabled"
+        wd_log "sf: no usable injector at $SF_INJECTOR — SF supervision disabled (the module does not ship one)"
+        return 0
+    fi
+
+    if [ "$SF_SEEN" = "1" ] && [ "$SF_ID" != "$id" ]; then
+        wd_log "sf: $SF_TARGET restarted ($SF_ID -> $id), re-injecting"
+    fi
+    SF_SEEN=1
+    SF_INJECTS=$((SF_INJECTS + 1))
+    SF_SINCE=0
+    wd_log "sf: inject attempt $SF_INJECTS/$SF_MAX_INJECTS into pid=$pid"
+    if wd_sf_do_inject "$pid"; then
+        # fas-rs verifies its own writes back (`verify_freq`, every 3 s) rather than
+        # trusting the call: an injector that returns 0 while the mapping never appears is
+        # a failure, not a success.
+        wd_sleep 2
+        if wd_sf_is_injected "$pid"; then
+            SF_ID="$id"
+            SF_INJECTED_ID="$id"
+            wd_sf_state "injected"
+            wd_log "sf: injection took — maps carry $(basename "$SF_LIB")"
+        else
+            SF_FAILS=$((SF_FAILS + 1))
+            SF_ID="$id"
+            wd_sf_state "failed"
+            wd_log "sf: injector returned success but the mapping is absent — counting a failure"
+        fi
+    else
+        SF_FAILS=$((SF_FAILS + 1))
+        SF_ID="$id"
+        wd_sf_state "failed"
+        wd_log "sf: injector failed on pid=$pid"
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------- status file
 
 wd_state_body() {
@@ -328,6 +481,11 @@ wd_state_body() {
     echo "exe=$DAEMON_EXE"
     echo "updated_uptime_ms=$(wd_now_ms)"
     echo "sweeps=$WD_SCANS"
+    echo "sf=$SF_ID"
+    echo "sf_state=$SF_STATE"
+    echo "sf_injects=$SF_INJECTS"
+    echo "sf_fails=$SF_FAILS"
+    echo "sf_max_injects=$SF_MAX_INJECTS"
     echo "since_sweep=$WD_SINCE_SCAN"
     echo "backstop=$WD_BACKSTOP"
 }
@@ -519,6 +677,10 @@ main() {
             wd_shutdown "module files are gone (uninstalled)"
         fi
 
+        # One SF check per sample, and every branch below sleeps, so this stays a
+        # per-sample cadence (off by default: one string test).
+        wd_sf_check
+
         # Cache-first: the sweep below is the whole cost of a sample on a real device
         # (~0.19 s for 1289 pids, measured), and the answer it gives is unchanged while
         # the processes it found are still the same processes.
@@ -575,5 +737,14 @@ main() {
         fi
     done
 }
+
+# The test stub was sourced at the top, before almost every function existed. Sourcing it
+# once more here - after every definition and just before the loop starts - is what makes
+# "a test can replace any function" true rather than only the ones defined above it.
+# (Nothing in a stub should have side effects for this to stay safe; they are pure
+# definitions by construction.)
+if [ -n "${UPERF_WATCHDOG_STUB:-}" ] && [ -f "$UPERF_WATCHDOG_STUB" ]; then
+    . "$UPERF_WATCHDOG_STUB"
+fi
 
 main "$@"
