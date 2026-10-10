@@ -32,6 +32,7 @@ pub mod shutdown;
 pub mod watch_task;
 pub mod hint;
 pub mod orchestrator;
+pub mod recorder;
 pub mod sysfs;
 pub mod sysfs_ledger;
 pub mod topic_dispatch;
@@ -379,6 +380,35 @@ pub(crate) extern "C" fn uperf_rs_start(
         }
     }
 
+    // ⑧ recording channel (opt-in `UPERF_RECORD=1`): per-app sessions under
+    // `<USER_PATH>/history/`, kept only past the ≥3 min rule, DEFLATE-compressed,
+    // deduped by pkg+epoch.
+    if crate::recorder::RecorderTask::enabled() {
+        let cfg_dir = {
+            let cfg_str = cfg.to_string_lossy().to_string();
+            std::path::Path::new(&cfg_str).parent().map(|p| p.to_path_buf())
+        };
+        let orch = ORCHESTRATOR.get().cloned();
+        let state = move || match orch.as_ref() {
+            Some(o) => {
+                let g = o.lock();
+                (
+                    g.top_app().map(str::to_string),
+                    g.current_scene().to_string(),
+                )
+            }
+            None => (None, "idle".to_string()),
+        };
+        let mut guard = recorder_slot().lock();
+        if let Some(mut prev) = guard.take() {
+            prev.stop();
+        }
+        match crate::recorder::RecorderTask::spawn(cfg_dir, state, |m: &str| log_msg(m)) {
+            Some(t) => *guard = Some(t),
+            None => log_msg("Rust: recorder task could not start"),
+        }
+    }
+
     // Start the file watcher: cur_powermode.txt / perapp_powermode.txt preset
     // switching and the single-byte sfanalysis.hint feed.
     if let Some(c) = cfg_for_governor.as_ref() {
@@ -457,6 +487,12 @@ pub(crate) extern "C" fn uperf_rs_stop() {
             t.stop();
         }
     }
+    {
+        let mut guard = recorder_slot().lock();
+        if let Some(mut t) = guard.take() {
+            t.stop();
+        }
+    }
     // Stop the dfps timer thread. The scheduler itself stays in its OnceLock;
     // `uperf_rs_start` on a reload replaces the dispatcher's clone.
     if let Some(s) = DFPS_SCHED.get() {
@@ -491,6 +527,8 @@ static WATCH_TASK: OnceLock<PMutex<Option<watch_task::WatchTask>>> = OnceLock::n
 static SF_BINDER_TASK: OnceLock<PMutex<Option<sf_binder::FrameTask>>> = OnceLock::new();
 /// ⑦ control-plane socket (opt-in `UPERF_CTL_SOCKET`).
 static CTL_TASK: OnceLock<PMutex<Option<ctl_socket::CtlTask>>> = OnceLock::new();
+/// ⑧ recording channel (opt-in `UPERF_RECORD=1`).
+static RECORDER_TASK: OnceLock<PMutex<Option<recorder::RecorderTask>>> = OnceLock::new();
 /// dfps-rs scheduler, mounted from grill-glitch/dfps-rewrite as a subtree at
 /// `rust/uperf-core/src/dfps_rs/`. Held so `uperf_rs_stop` can stop its timer
 /// thread; the dispatcher holds its own clone.
@@ -506,6 +544,10 @@ fn sf_binder_slot() -> &'static PMutex<Option<sf_binder::FrameTask>> {
 
 fn ctl_slot() -> &'static PMutex<Option<ctl_socket::CtlTask>> {
     CTL_TASK.get_or_init(|| PMutex::new(None))
+}
+
+fn recorder_slot() -> &'static PMutex<Option<recorder::RecorderTask>> {
+    RECORDER_TASK.get_or_init(|| PMutex::new(None))
 }
 
 fn sched_task_slot() -> &'static PMutex<Option<sched_task::SchedTask>> {

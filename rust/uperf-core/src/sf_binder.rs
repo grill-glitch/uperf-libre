@@ -483,6 +483,19 @@ pub fn frame_hint(frames_in_window: usize) -> Option<SfHint> {
     }
 }
 
+/// The last fps the frame leg measured, ×100 (0 = none / not running). Process-wide so
+/// the recorder (⑧) can read it without a channel between the two tasks.
+static LAST_FPS_X100: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Last measured fps, or 0.0 when the frame leg is not the active source.
+pub fn last_fps() -> f64 {
+    LAST_FPS_X100.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0
+}
+
+fn set_last_fps(fps: f64) {
+    LAST_FPS_X100.store((fps * 100.0) as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `CLOCK_MONOTONIC` in nanoseconds — the clock SF's timestamps are on.
 pub fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -694,6 +707,7 @@ impl FrameTask {
                         FrameSource::Hint => {
                             // The injected leg is live; do not touch binder at all.
                             last_derived = None;
+                            set_last_fps(0.0);
                             publish(FrameSource::Hint, age, None, 0, None, None);
                         }
                         FrameSource::Fps => {
@@ -723,6 +737,7 @@ impl FrameTask {
                                             refresh.unwrap_or(0),
                                             frames.len()
                                         ));
+                                        set_last_fps(fps);
                                         publish(FrameSource::Fps, age, Some(fps), frames.len(), Some(&l), refresh);
                                         if let Some(h) = frame_hint(in_win) {
                                             if last_derived != Some(h) {
