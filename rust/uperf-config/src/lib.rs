@@ -5,6 +5,13 @@
 //! cannot drift between the tool that claims parity and the code that runs on
 //! the device.
 
+// Proved by the M12 `unsafe` audit: this crate has no `unsafe` occurrence at all
+// — it is pure parsing/planning, and every syscall lives in `uperf-core`. The
+// directive keeps it that way (a later "just read /proc directly" cannot quietly
+// reintroduce a raw syscall into the layer both the host tool and the device
+// binary share).
+#![forbid(unsafe_code)]
+
 pub mod config;
 pub mod cpu;
 pub mod freq_target;

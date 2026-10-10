@@ -16,11 +16,18 @@
 //! against. Everything above the syscalls is pure and host-tested.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::io::{FromRawFd, RawFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{SocketAddr, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+// The platform-specific address constructors. Both paths exist and were verified by
+// compile probe on this repo's two real targets (`UNSAFE_AUDIT_REPORT.md` §R-1):
+// the host test target is Linux, the device is Android.
+#[cfg(target_os = "android")]
+use std::os::android::net::SocketAddrExt;
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
 
 /// Protocol version. A peer that answers with a different one is refused, not guessed at.
 pub const VERSION: u32 = 1;
@@ -157,51 +164,82 @@ pub fn token_path(cfg_dir: Option<&Path>) -> Option<PathBuf> {
 
 /// `@name` is an abstract socket (the Android `LocalSocket` idiom); anything else is a
 /// filesystem path. The distinction is in the address, so both are built here.
-fn sockaddr(addr: &str) -> Result<(libc::sockaddr_un, libc::socklen_t), String> {
-    let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    let path = sa.sun_path.len();
-    let len = if let Some(name) = addr.strip_prefix('@') {
-        let b = name.as_bytes();
-        if b.is_empty() || b.len() + 1 > path {
-            return Err(format!("abstract socket name too long: {addr:?}"));
+///
+/// The bytes are std's, not ours: `from_abstract_name` writes the leading NUL, the
+/// name, and an address length of `sizeof(sa_family_t) + 1 + len`; `from_pathname`
+/// writes the path plus the trailing NUL the kernel expects. The length and byte
+/// boundaries are the same ones the previous hand-built version used (name ≤ 107
+/// bytes, path ≤ 107 bytes), so no caller-visible limit moved.
+///
+/// The error strings are the previous ones verbatim. Two deliberate deviations from
+/// "just call std":
+///
+/// * an empty abstract name (`@` — reachable as `UPERF_CTL_SOCKET=@`) is still
+///   refused. std accepts it and builds the *anonymous* abstract address, which
+///   would turn a config mistake into an endless `ECONNREFUSED` retry loop instead
+///   of the previous one-line validation error;
+/// * a pathname containing an interior NUL is refused by std and reported with the
+///   "too long" message. That cannot be reached from `UPERF_CTL_SOCKET`, because an
+///   environment value cannot contain a NUL byte.
+fn sockaddr(addr: &str) -> Result<SocketAddr, String> {
+    match addr.strip_prefix('@') {
+        Some(name) if name.is_empty() => {
+            Err(format!("abstract socket name too long: {addr:?}"))
         }
-        sa.sun_path[0] = 0; // abstract: leading NUL, then the name
-        for (i, c) in b.iter().enumerate() {
-            sa.sun_path[i + 1] = *c as libc::c_char;
-        }
-        (std::mem::size_of::<libc::sa_family_t>() + 1 + b.len()) as libc::socklen_t
-    } else {
-        let b = addr.as_bytes();
-        if b.len() + 1 > path {
-            return Err(format!("socket path too long: {addr:?}"));
-        }
-        for (i, c) in b.iter().enumerate() {
-            sa.sun_path[i] = *c as libc::c_char;
-        }
-        (std::mem::size_of::<libc::sa_family_t>() + b.len() + 1) as libc::socklen_t
-    };
-    Ok((sa, len))
+        Some(name) => SocketAddr::from_abstract_name(name.as_bytes())
+            .map_err(|_| format!("abstract socket name too long: {addr:?}")),
+        None => SocketAddr::from_pathname(addr)
+            .map_err(|_| format!("socket path too long: {addr:?}")),
+    }
 }
 
 /// Connect out to the peer's socket.
+///
+/// std creates the socket (with `SOCK_CLOEXEC`) and connects it in one call, so the
+/// previous `socket(2)` / `connect(2)` branches are merged into one error. See
+/// [`is_socket_creation_errno`] for how the two are still told apart in the message.
 pub fn connect(addr: &str) -> Result<UnixStream, String> {
-    let (sa, len) = sockaddr(addr)?;
-    let fd: RawFd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(format!("socket: {}", std::io::Error::last_os_error()));
+    let sa = sockaddr(addr)?;
+    UnixStream::connect_addr(&sa).map_err(|e| {
+        if is_socket_creation_errno(e.raw_os_error()) {
+            format!("socket: {e}")
+        } else {
+            format!("connect {addr}: {e}")
+        }
+    })
+}
+
+/// Did this errno come from `socket(2)` rather than `connect(2)`?
+///
+/// `UnixStream::connect_addr` performs both syscalls and hands back one
+/// `io::Error`, where the previous implementation logged `socket: <e>` for the
+/// first and `connect <addr>: <e>` for the second. These are the errnos only
+/// `socket(2)` can produce: resource exhaustion (`EMFILE`, `ENFILE`, `ENOMEM`,
+/// `ENOBUFS`) and the address-family/type pair being refused
+/// (`EPROTONOSUPPORT`, `EAFNOSUPPORT`). `connect(2)` on an already-valid
+/// `AF_UNIX`/`SOCK_STREAM` fd cannot return any of them, so for every errno that
+/// can actually occur the original distinction is preserved exactly.
+///
+/// `EACCES` is deliberately **not** in the set: `connect(2)` does return it for a
+/// filesystem path, and the old code reported that as a `connect` failure.
+fn is_socket_creation_errno(errno: Option<i32>) -> bool {
+    match errno {
+        Some(e) => matches!(
+            e,
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOMEM
+                | libc::ENOBUFS
+                | libc::EPROTONOSUPPORT
+                | libc::EAFNOSUPPORT
+        ),
+        None => false,
     }
-    let rc = unsafe { libc::connect(fd, &sa as *const libc::sockaddr_un as *const libc::sockaddr, len) };
-    if rc != 0 {
-        let e = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(format!("connect {addr}: {e}"));
-    }
-    Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
 /// Our uid, as the peer will see it on its end of the socket.
 pub fn uid() -> u32 {
+    // SAFETY: `getuid` takes no arguments and cannot fail.
     unsafe { libc::getuid() }
 }
 
@@ -412,20 +450,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The address bytes are the observable contract with the peer: an abstract
+    /// address must hold the name *exactly* — leading NUL, no terminator, no prefix —
+    /// because the independent peer used on device (`tools/ctl-listen`) builds the
+    /// same layout by hand and the kernel compares bytes up to the address length.
+    ///
+    /// This replaces the old `sockaddr_un`-layout assertions, which pinned an
+    /// internal representation instead of the observable address.
     #[test]
-    fn abstract_and_path_addresses_are_both_accepted() {
+    fn abstract_addresses_keep_the_exact_name_bytes() {
         assert!(sockaddr("@uperf-ctl").is_ok());
         assert!(sockaddr("/data/local/tmp/x.sock").is_ok());
-        let (sa, len) = sockaddr("@abc").unwrap();
-        assert_eq!(sa.sun_path[0], 0, "abstract sockets start with a NUL");
-        assert_eq!(sa.sun_path[1] as u8, b'a');
-        // len counts the leading NUL
+
+        let sa = sockaddr("@abc").unwrap();
+        assert_eq!(sa.as_abstract_name(), Some(&b"abc"[..]), "name bytes changed");
+        assert!(sa.as_pathname().is_none(), "an abstract address is not a pathname");
+
+        let name = "uperf-e2e-0123456789";
+        let sa = sockaddr(&format!("@{name}")).unwrap();
+        assert_eq!(sa.as_abstract_name(), Some(name.as_bytes()), "name bytes changed");
+
+        let sa = sockaddr("/data/local/tmp/x.sock").unwrap();
+        assert_eq!(sa.as_pathname(), Some(Path::new("/data/local/tmp/x.sock")));
+        assert!(sa.as_abstract_name().is_none(), "a pathname is not abstract");
+    }
+
+    /// The length limits must not move with the refactor: the hand-built version
+    /// accepted a 107-byte abstract name (which is `SUN_LEN` with the leading NUL)
+    /// and refused 108, and the same for a pathname. Now that the boundary comes
+    /// from std it is pinned here rather than assumed.
+    #[test]
+    fn address_length_limits_are_unchanged() {
+        assert!(sockaddr(&format!("@{}", "x".repeat(107))).is_ok());
+        assert!(sockaddr(&format!("@{}", "x".repeat(108))).is_err());
+        let path_ok = format!("/{}", "y".repeat(106));
+        assert_eq!(path_ok.len(), 107);
+        assert!(sockaddr(&path_ok).is_ok());
+        let path_bad = format!("/{}", "y".repeat(107));
+        assert_eq!(path_bad.len(), 108);
+        assert!(sockaddr(&path_bad).is_err());
+        assert!(sockaddr("@").is_err(), "an empty abstract name is refused");
+        // ...and it is refused with the message the previous implementation used, not
+        // with a "connect failed" line from the anonymous abstract address std builds
+        // for an empty name.
         assert_eq!(
-            len as usize,
-            std::mem::size_of::<libc::sa_family_t>() + 1 + 3
+            sockaddr("@").unwrap_err(),
+            "abstract socket name too long: \"@\""
         );
-        let long = format!("@{}", "x".repeat(300));
-        assert!(sockaddr(&long).is_err(), "an over-long name must be refused");
+    }
+
+    /// The `socket(2)`-vs-`connect(2)` distinction in the log line is preserved for
+    /// every errno that can actually occur: a missing endpoint is a `connect`.
+    #[test]
+    fn a_missing_endpoint_reports_a_connect_failure() {
+        let dir = std::env::temp_dir().join(format!("uperf_ctl_miss_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("nobody-listening");
+        let addr = sock.to_str().unwrap().to_string();
+
+        let e = connect(&addr).unwrap_err();
+        assert!(e.starts_with(&format!("connect {addr}: ")), "got {e:?}");
+
+        let e = connect("@uperf-nobody-listening-at-all").unwrap_err();
+        assert!(e.starts_with("connect @uperf-nobody-listening-at-all: "), "got {e:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real connect over an **abstract** address, checking the two properties the
+    /// removed `unsafe` used to provide by hand: `SOCK_CLOEXEC` on the fd (or it
+    /// leaks into every child the daemon spawns) and a link that carries bytes both
+    /// ways. The byte-level agreement with the independent hand-built peer
+    /// (`tools/ctl-listen`) is what the alioth e2e run demonstrates — see §R-1 of
+    /// `UNSAFE_AUDIT_REPORT.md`; this is the host-side half.
+    #[test]
+    fn abstract_connect_works_and_the_fd_is_cloexec() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixListener;
+
+        let addr = format!("@uperf-cloexec-{}", std::process::id());
+        let listener = UnixListener::bind_addr(&sockaddr(&addr).unwrap()).unwrap();
+        let mut stream = connect(&addr).expect("connect to the abstract listener");
+        let (mut peer, _) = listener.accept().expect("accept");
+
+        let fd = stream.as_raw_fd();
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
+        let flags = info
+            .lines()
+            .find_map(|l| l.strip_prefix("flags:"))
+            .expect("fdinfo has a flags line")
+            .trim();
+        let flags = u32::from_str_radix(flags, 8).expect("fdinfo flags are octal");
+        assert_eq!(flags & 0o2000000, 0o2000000, "O_CLOEXEC missing (flags={flags:o})");
+
+        stream.write_all(b"PING\n").unwrap();
+        stream.flush().unwrap();
+        let mut line = String::new();
+        BufReader::new(peer.try_clone().unwrap()).read_line(&mut line).unwrap();
+        assert_eq!(line, "PING\n");
+
+        peer.write_all(b"PONG\n").unwrap();
+        peer.flush().unwrap();
+        let mut back = String::new();
+        BufReader::new(stream.try_clone().unwrap()).read_line(&mut back).unwrap();
+        assert_eq!(back, "PONG\n");
     }
 
     /// The handshake against a listener we own, so the framing is proven end to end on

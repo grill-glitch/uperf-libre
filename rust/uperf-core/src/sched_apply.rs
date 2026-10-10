@@ -20,18 +20,25 @@ pub fn set_affinity(tid: i32, cpus: &[usize]) -> io::Result<()> {
     if cpus.is_empty() {
         return Ok(());
     }
-    // SAFETY: `cpu_set_t` is a plain bitset; we zero it, set bits inside its
-    // bounds (CPU_SETSIZE is checked below), and pass its real size.
+    // `cpu_set_t` is a fixed-size bitset of CPU_SETSIZE bits: an id at or above
+    // that bound would make CPU_SET write past the end of the local. Validate the
+    // whole list *before* the unsafe block, so the block's precondition is that the
+    // loop below is in range (and the error path allocates outside it).
+    for c in cpus {
+        if *c >= libc::CPU_SETSIZE as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cpu id {c} exceeds CPU_SETSIZE"),
+            ));
+        }
+    }
+    // SAFETY: `cpu_set_t` is a plain bitset whose size `CPU_ZERO`/`CPU_SET` assume;
+    // zeroing it is the documented initialiser, every id written is < CPU_SETSIZE
+    // (checked above), and the syscall is told the set's real size.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
         for c in cpus {
-            if *c >= libc::CPU_SETSIZE as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("cpu id {c} exceeds CPU_SETSIZE"),
-                ));
-            }
             libc::CPU_SET(*c, &mut set);
         }
         if libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {

@@ -254,6 +254,7 @@ fn history_dir(dir: &Path) -> PathBuf {
 
 fn mono_ms() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid writable out-parameter; a failure is reported as 0.
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
         return 0;
     }

@@ -29,6 +29,13 @@
 //!   UPERF_SFANALYSIS_INTERVAL_SECS=N  re-apply period (default 60)
 
 #![allow(non_snake_case, non_camel_case_types)]
+// This crate is the FFI/loader-facing half of the injection library: it walks
+// `dl_iterate_phdr`, rewrites relocation slots and calls libc through `dlsym`.
+// The `unsafe` therefore cannot be removed — but it must stay minimal, remain
+// inside an explicit block even inside an `unsafe fn`, and never become
+// decorative (audit: `UNSAFE_AUDIT_REPORT.md`).
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(unused_unsafe)]
 
 pub mod got;
 pub mod hook;

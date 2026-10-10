@@ -8,6 +8,8 @@
 //! Run on the host — no Android dependency. Used for parity checks against the
 //! upstream binary's `attr` trace and against the real device.
 
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};

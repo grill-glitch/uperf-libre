@@ -85,6 +85,13 @@ pub extern "C" fn note(a: usize, b: usize, ret: i32, kind: u32) {
                 // write_consumed; uintptr_t write_buffer; size_t read_size;
                 // size_t read_consumed; uintptr_t read_buffer; }
                 if b != 0 {
+                    // SAFETY: `b` is the ioctl's third argument, so for a
+                    // BINDER_WRITE_READ it is the `struct binder_write_read *` the
+                    // caller (surfaceflinger) passed. The kernel read it through
+                    // the same pointer during the call that just returned, and
+                    // `write_size` is its first field, so it is readable here. It
+                    // is read-only, unaligned-safe, and nothing is retained past
+                    // this statement.
                     let write_size = unsafe { core::ptr::read_unaligned(b as *const usize) };
                     if write_size > 0 {
                         SFH_BINDER_WRITES.fetch_add(1, Ordering::Relaxed);
@@ -140,8 +147,16 @@ fn advance_state(prev: u64, now: u64, cause: u32) {
 }
 
 /// Snapshot for tests / device verification.
+///
+/// # Safety
+///
+/// `out` must be non-null and point to at least `n` writable `u64`s (the caller
+/// owns the buffer — on device it is the harness' `u64[10]`). The function writes
+/// `min(n, 10)` slots and never reads through `out`; a null `out` is refused
+/// rather than dereferenced, so the only way to be unsound here is to pass a
+/// pointer that is not backed by `n` writable `u64`s.
 #[no_mangle]
-pub extern "C" fn sfh_stats(out: *mut u64, n: usize) -> usize {
+pub unsafe extern "C" fn sfh_stats(out: *mut u64, n: usize) -> usize {
     if out.is_null() {
         return 0;
     }
@@ -159,6 +174,9 @@ pub extern "C" fn sfh_stats(out: *mut u64, n: usize) -> usize {
     ];
     let m = n.min(vals.len());
     for (i, v) in vals.iter().take(m).enumerate() {
+        // SAFETY: `i < m <= n` and the caller guarantees `out` holds `n` writable
+        // u64s; `write_unaligned` needs no alignment because the write is a plain
+        // 8-byte store the C side reads back the same way.
         unsafe { core::ptr::write_unaligned(out.add(i), *v) };
     }
     m
@@ -249,7 +267,7 @@ mod tests {
         note(0xc030_6201, 0, 0, KIND_IOCTL);
         note(0, 0, 0, KIND_EPOLL_WAIT);
         let mut out = [0u64; 10];
-        let n = sfh_stats(out.as_mut_ptr(), out.len());
+        let n = unsafe { sfh_stats(out.as_mut_ptr(), out.len()) };
         assert_eq!(n, 10);
         assert_eq!(out[0], 1); // ioctl
         assert_eq!(out[1], 1); // epoll_wait
@@ -260,7 +278,7 @@ mod tests {
     fn stats_tolerates_small_buffer() {
         reset_for_test();
         let mut out = [0u64; 3];
-        assert_eq!(sfh_stats(out.as_mut_ptr(), out.len()), 3);
+        assert_eq!(unsafe { sfh_stats(out.as_mut_ptr(), out.len()) }, 3);
     }
 
     #[test]

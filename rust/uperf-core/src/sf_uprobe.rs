@@ -224,6 +224,11 @@ impl ThreadEvent {
             flags: 1, // start disabled; enabled for the window
             ..Default::default()
         };
+        // SAFETY: `attr` is a live, correctly-sized `perf_event_attr` whose
+        // `config1` points at `cpath` (alive for the duration of the call), which is
+        // the uprobe path string the kernel copies during this call; the three
+        // integer arguments follow the raw `perf_event_open` syscall ABI. The result
+        // is a new fd or a negative errno, handled below.
         let fd = retry_int(|| unsafe {
             libc::syscall(
                 libc::SYS_perf_event_open,
@@ -237,15 +242,21 @@ impl ThreadEvent {
         if fd < 0 {
             return Err(format!("perf_event_open(tid={tid}): {}", std::io::Error::last_os_error()));
         }
+        // SAFETY: `fd` is a fresh, non-negative fd returned by the syscall above
+        // that nothing else owns; `File` takes over and closes it exactly once.
         Ok(ThreadEvent { file: unsafe { std::fs::File::from_raw_fd(fd as i32) } })
     }
 
     fn ctl(&self, req: u64) {
+        // SAFETY: a `PERF_EVENT_IOC_*` ioctl takes the event by fd and an integer
+        // argument (unused here), so `0` is the correct third argument.
         retry_int(|| unsafe { libc::ioctl(self.file.as_raw_fd(), req as _, 0) as i64 });
     }
 
     fn count(&self) -> u64 {
         let mut c: u64 = 0;
+        // SAFETY: a counting perf event's `read` fills exactly one `u64` from the
+        // live local `c`, and the length passed is that type's size.
         let n = retry_int(|| unsafe {
             libc::read(self.file.as_raw_fd(), &mut c as *mut u64 as *mut c_void, 8) as i64
         });
