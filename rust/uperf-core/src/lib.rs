@@ -23,6 +23,7 @@ pub mod ffi;
 pub mod inotify;
 pub mod sched_apply;
 pub mod sched_task;
+pub mod status;
 pub mod startup_lines;
 pub mod shutdown;
 pub mod watch_task;
@@ -123,6 +124,31 @@ pub(crate) extern "C" fn uperf_rs_start(
         if let Some(dir) = std::path::Path::new(&cfg_str).parent() {
             std::env::set_var("UPERF_STATE_FILE", dir.join("orig_governor.txt"));
         }
+    }
+
+    // Machine-readable status (`uperf.state`, M9) next to that record. The module's
+    // watchdog establishes liveness from /proc itself — both our processes are
+    // renamed to `uperf`, so the process table cannot tell them apart — and only
+    // *reads* this file; it exists so `state` / `takeover` / `armed` are observable
+    // without parsing the log, and so a stale `state=running` with no live process
+    // is the documented signature of a kill (which no in-process path survives).
+    if std::env::var("UPERF_STATUS_FILE").is_err() {
+        let cfg_str = cfg.to_string_lossy().to_string();
+        if let Some(dir) = std::path::Path::new(&cfg_str).parent() {
+            std::env::set_var("UPERF_STATUS_FILE", dir.join("uperf.state"));
+            std::env::set_var("UPERF_STATUS_CONFIG", &cfg_str);
+        }
+    }
+    if let Some(target) = crate::status::target() {
+        crate::status::write(
+            &target.path,
+            &crate::status::Snapshot {
+                state: "running",
+                takeover: cpu_task::CpuTask::takeover_wanted(),
+                armed: &[],
+                config: &target.config,
+            },
+        );
     }
     let (loaded_cfg, mode) = load_config_and_mode(&cfg.to_string_lossy());
 
@@ -347,6 +373,21 @@ pub(crate) extern "C" fn uperf_rs_stop() {
     // `uperf_rs_start` on a reload replaces the dispatcher's clone.
     if let Some(s) = DFPS_SCHED.get() {
         s.stop();
+    }
+    // Report the clean stop. Every governor is restored by now (the cpu task's own
+    // disarm, or the stop-path fallback in `CpuTask::stop`), so from here on a
+    // status file still saying `state=running` means the daemon was killed rather
+    // than stopped — which is exactly what the module's watchdog keys off.
+    if let Some(target) = crate::status::target() {
+        crate::status::write(
+            &target.path,
+            &crate::status::Snapshot {
+                state: "stopped",
+                takeover: cpu_task::CpuTask::takeover_wanted(),
+                armed: &[],
+                config: &target.config,
+            },
+        );
     }
     log_msg("uperf_rs_stop: dispatcher joined");
 }

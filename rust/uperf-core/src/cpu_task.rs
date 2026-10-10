@@ -47,6 +47,9 @@ pub struct UserspaceWriter {
     armed: Vec<(String, String)>,
     /// Optional file where the originals are recorded for the stop script.
     state_file: Option<std::path::PathBuf>,
+    /// Optional machine-readable status file (`uperf.state`, M9) and the config it
+    /// describes. Written on arm/disarm only, never per tick.
+    status: Option<crate::status::Target>,
 }
 
 impl UserspaceWriter {
@@ -55,6 +58,37 @@ impl UserspaceWriter {
     /// config's directory; `None` disables the record.
     pub fn state_file(&mut self, path: Option<std::path::PathBuf>) {
         self.state_file = path;
+    }
+
+    /// Where to report the armed state, and the config it belongs to.
+    pub fn status(&mut self, target: Option<crate::status::Target>) {
+        self.status = target;
+    }
+
+    /// Report the takeover state. Best effort — see [`crate::status::write`].
+    fn write_status(&self, state: &str) {
+        let Some(target) = self.status.as_ref() else {
+            return;
+        };
+        let policies: Vec<String> = self
+            .armed
+            .iter()
+            .map(|(dir, _)| {
+                dir.rsplit('/')
+                    .next()
+                    .unwrap_or(dir.as_str())
+                    .to_string()
+            })
+            .collect();
+        crate::status::write(
+            &target.path,
+            &crate::status::Snapshot {
+                state,
+                takeover: true,
+                armed: &policies,
+                config: &target.config,
+            },
+        );
     }
 
     /// Switch every userspace cluster to the `userspace` governor, remembering
@@ -80,19 +114,24 @@ impl UserspaceWriter {
     /// Write `<policy-name> <original-governor>` lines. Only entries whose original
     /// is known and is not `userspace` are recorded — recording `userspace` as an
     /// "original" is how a device ends up stuck.
+    ///
+    /// The machine-readable status file is written here too, but *not* gated on the
+    /// governor record: the two have different readers and either may be disabled.
     fn record_state(&self) {
-        let Some(path) = self.state_file.as_ref() else { return };
-        let mut out = String::new();
-        for (dir, prev) in &self.armed {
-            if prev.is_empty() || prev == "userspace" {
-                continue;
+        if let Some(path) = self.state_file.as_ref() {
+            let mut out = String::new();
+            for (dir, prev) in &self.armed {
+                if prev.is_empty() || prev == "userspace" {
+                    continue;
+                }
+                let name = dir.rsplit('/').next().unwrap_or(dir);
+                out.push_str(&format!("{name} {prev}\n"));
             }
-            let name = dir.rsplit('/').next().unwrap_or(dir);
-            out.push_str(&format!("{name} {prev}\n"));
+            if !out.is_empty() {
+                let _ = std::fs::write(path, out);
+            }
         }
-        if !out.is_empty() {
-            let _ = std::fs::write(path, out);
-        }
+        self.write_status("running");
     }
 
     /// Write one cycle's targets. Returns the number of frequencies applied.
@@ -119,6 +158,11 @@ impl UserspaceWriter {
             let gov = apply_root(&format!("{dir}/scaling_governor"), &root);
             let _ = std::fs::write(&gov, prev);
         }
+        // `armed` is empty now, so the status reports `armed=0`: the daemon may
+        // still be running (a clean stop writes `state=stopped` as well), but the
+        // takeover is over. A reader that sees `state=running armed=0` is looking
+        // at a run started without `UPERF_CPU_GOVERNOR=1`.
+        self.write_status("stopped");
     }
 
     pub fn is_armed(&self) -> bool {
@@ -199,6 +243,7 @@ impl CpuTask {
         mut gov: Governor,
         targets: Vec<FreqTarget>,
         state_file: Option<std::path::PathBuf>,
+        status: Option<crate::status::Target>,
         mut read_stat: F,
     ) -> Self
     where
@@ -213,6 +258,7 @@ impl CpuTask {
             .spawn(move || {
                 let mut writer = writer_child.lock().expect("writer lock");
                 writer.state_file(state_file);
+                writer.status(status);
                 writer.arm(&targets);
                 if writer.is_armed() {
                     log_line(&format!(
@@ -331,11 +377,17 @@ impl CpuTask {
         let gov = governor_from_config(cfg, mode, scene, &opps)?;
         let targets = freq_targets(cfg);
         let n_cpu = gov.clusters.iter().map(|c| c.cores.len()).sum::<usize>().max(1);
-        Some(Self::spawn_with(gov, targets, state_file_for(cfg), move || {
-            std::fs::read_to_string("/proc/stat")
-                .map(|t| parse_stat(&t, n_cpu))
-                .unwrap_or_default()
-        }))
+        Some(Self::spawn_with(
+            gov,
+            targets,
+            state_file_for(cfg),
+            crate::status::target(),
+            move || {
+                std::fs::read_to_string("/proc/stat")
+                    .map(|t| parse_stat(&t, n_cpu))
+                    .unwrap_or_default()
+            },
+        ))
     }
 
     pub fn stop(&mut self) {
@@ -412,6 +464,18 @@ extern "C" fn uperf_bridge_write_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `UPERF_FAKE_ROOT` is process-wide, and these tests run in parallel: two of
+    /// them pointing it at different fake roots is a race, and the loser's writes
+    /// land in the other test's tree (observed: `original governor must be
+    /// restored` failing with `userspace`). Serialise every test that touches it.
+    static FAKE_ROOT_LOCK: Mutex<()> = Mutex::new(());
+
+    fn fake_root_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A poisoned lock only means another test failed; the guard is still valid.
+        FAKE_ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn missing_policy_dir_yields_no_opps() {
@@ -420,6 +484,7 @@ mod tests {
 
     #[test]
     fn userspace_writer_arms_applies_and_restores() {
+        let _guard = fake_root_guard();
         let tmp = std::env::temp_dir().join(format!("uperf_fake_{}", std::process::id()));
         let dir = tmp.join("sys/devices/system/cpu/cpufreq/policy0");
         std::fs::create_dir_all(&dir).unwrap();
@@ -452,6 +517,44 @@ mod tests {
     }
 
     #[test]
+    fn userspace_writer_reports_status_on_arm_and_disarm() {
+        let _guard = fake_root_guard();
+        let tmp = std::env::temp_dir().join(format!("uperf_status_arm_{}", std::process::id()));
+        let dir = tmp.join("sys/devices/system/cpu/cpufreq/policy4");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("scaling_governor"), "schedutil\n").unwrap();
+        let status_path = tmp.join("uperf.state");
+
+        std::env::set_var("UPERF_FAKE_ROOT", tmp.to_str().unwrap());
+        let targets = vec![FreqTarget::Userspace {
+            policy_dir: "/sys/devices/system/cpu/cpufreq/policy4".into(),
+        }];
+        let mut w = UserspaceWriter::default();
+        w.status(Some(crate::status::Target {
+            path: status_path.clone(),
+            config: "/sdcard/Android/yc/uperf/uperf.json".into(),
+        }));
+        w.arm(&targets);
+
+        let armed = std::fs::read_to_string(&status_path).unwrap();
+        assert!(armed.contains("state=running\n"), "{armed}");
+        assert!(armed.contains("armed=1\n"), "{armed}");
+        assert!(
+            armed.contains("policies=policy4\n"),
+            "the policy name, not the whole path: {armed}"
+        );
+
+        w.disarm();
+        let disarmed = std::fs::read_to_string(&status_path).unwrap();
+        assert!(disarmed.contains("state=stopped\n"), "{disarmed}");
+        assert!(disarmed.contains("armed=0\n"), "{disarmed}");
+        assert!(disarmed.contains("policies=\n"), "{disarmed}");
+
+        std::env::remove_var("UPERF_FAKE_ROOT");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn governor_task_runs_and_stops() {
         let mut cfg_json = serde_json::json!({
             "meta": {"name":"t","author":"t"},
@@ -474,7 +577,7 @@ mod tests {
         // a `Userspace` target would switch the *host's* CPU governor.
         let _ = freq_targets(&cfg);
         let targets = vec![FreqTarget::None];
-        let mut task = CpuTask::spawn_with(gov, targets, None, || {
+        let mut task = CpuTask::spawn_with(gov, targets, None, None, || {
             // escalating load so the governor has to move
             let mut j = uperf_config::CpuJiffies::default();
             j.busy = vec![50, 50];

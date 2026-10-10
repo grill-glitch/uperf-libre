@@ -29,8 +29,21 @@ BASEDIR="$(dirname "$0")"
 # our own state: a policy is touched solely while it reads `userspace`.
 GOVERNOR_STATE="$USER_PATH/orig_governor.txt"
 
+# M9: external watchdog. `UPERF_CPUFREQ_ROOT` is the one definition of where the
+# policies live, shared by the watchdog and the host harness
+# (`scripts/test_watchdog_host.sh`) — same idea as `UPERF_FAKE_ROOT` on the Rust
+# side, so the policy is exercisable without a phone.
+WATCHDOG_SCRIPT="$SCRIPT_PATH/uperf_watchdog.sh"
+
+# Late-bound on purpose: `FLAG_PATH` comes from pathinfo.sh, but a caller (the
+# host harness) may redirect it after sourcing this file, and a lock path frozen
+# at source time would then point at the real device module directory.
+uperf_watchdog_lock_dir() {
+    echo "$FLAG_PATH/uperf_watchdog.lock"
+}
+
 uperf_policy_dirs() {
-    for d in /sys/devices/system/cpu/cpufreq/policy*; do
+    for d in "${UPERF_CPUFREQ_ROOT:-/sys/devices/system/cpu/cpufreq}"/policy*; do
         [ -d "$d" ] && [ -f "$d/scaling_governor" ] && echo "$d"
     done
 }
@@ -79,7 +92,63 @@ uperf_restore_governors() {
     return 0
 }
 
+# ---------------------------------------------------------------- M9 watchdog
+#
+# The external supervisor for the daemon. Why a *script* and not another thread:
+# the two exits that leave the CPU pinned in `userspace` (SIGKILL, and a Rust
+# panic under `panic = "abort"`) are exactly the ones no in-process path survives,
+# so the reaction has to come from outside the process. See
+# `magisk/script/uperf_watchdog.sh` and `docs/m9-watchdog.md`.
+
+uperf_watchdog_pid() {
+    local owner lock_dir
+    lock_dir="$(uperf_watchdog_lock_dir)"
+    [ -f "$lock_dir/owner" ] || return 0
+    owner="$(cat "$lock_dir/owner" 2>/dev/null)"
+    [ -n "$owner" ] || return 0
+    echo "${owner%%:*}"
+}
+
+# Stopped by `uperf_stop` and by the uninstaller, so an explicit stop is never
+# fought by a supervisor that is still convinced the daemon should be up.
+uperf_watchdog_stop() {
+    local pid lock_dir i
+    pid="$(uperf_watchdog_pid)"
+    [ -n "$pid" ] || return 0
+    kill -TERM "$pid" 2>/dev/null
+    i=0
+    while [ "$i" -lt 5 ]; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+        i=$((i + 1))
+    done
+    # A watchdog that did not exit in time still holds the lock; the caller is
+    # stopping the module, so drop it and let the process die on its own.
+    lock_dir="$(uperf_watchdog_lock_dir)"
+    rm -rf "$lock_dir" 2>/dev/null
+    return 0
+}
+
+uperf_watchdog_start() {
+    [ "${UPERF_WATCHDOG:-1}" = "0" ] && return 0
+    [ "$UPERF_WATCHDOG_SUPPRESS" = "1" ] && return 0
+    [ -f "$WATCHDOG_SCRIPT" ] || {
+        echo "uperf: watchdog script missing ($WATCHDOG_SCRIPT), skipping"
+        return 0
+    }
+    # `setsid` where available: the watchdog must outlive the shell that started it
+    # (at boot that is service.sh, over adb or the WebUI a short-lived pipe).
+    local runner="sh"
+    command -v setsid >/dev/null 2>&1 && runner="setsid sh"
+    # shellcheck disable=SC2086 # intentional word splitting of "$runner"
+    $runner "$WATCHDOG_SCRIPT" </dev/null >/dev/null 2>&1 &
+    return 0
+}
+
 uperf_stop() {
+    # Stop the watchdog first: it would otherwise treat this stop as a crash and
+    # restart the daemon we are trying to take down.
+    uperf_watchdog_stop
     killall uperf
     # give the daemon its chance to disarm gracefully, then make sure
     sleep 1
@@ -146,4 +215,8 @@ uperf_start() {
     # uperf shouldn't preempt foreground tasks
     rebuild_process_scan_cache
     change_task_cgroup "uperf" "background" "cpuset"
+
+    # M9: hand supervision to the watchdog. Started last, so it never observes the
+    # 2 s window above as a crash; a second instance exits on the owner lock.
+    uperf_watchdog_start
 }
