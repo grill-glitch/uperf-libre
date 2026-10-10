@@ -24,6 +24,7 @@ pub mod foreground;
 pub mod inotify;
 pub mod sched_apply;
 pub mod sched_task;
+pub mod sf_binder;
 pub mod status;
 pub mod startup_lines;
 pub mod shutdown;
@@ -323,6 +324,25 @@ pub(crate) extern "C" fn uperf_rs_start(
     // (dfps-rs is set up above, before the dispatcher, so events route into it
     // from the first message.)
 
+    // ⑤: the direct-binder SurfaceFlinger frame source (opt-in
+    // `UPERF_SF_BINDER=1`). The degraded leg for when the M8 injection library is
+    // not there: read SF's `--latency` over binder instead of spawning dumpsys.
+    if crate::sf_binder::FrameTask::enabled() {
+        let orch = ORCHESTRATOR.get().cloned();
+        let state = move || orch.as_ref().and_then(|o| o.lock().top_app().map(str::to_string));
+        let mut guard = sf_binder_slot().lock();
+        if let Some(mut prev) = guard.take() {
+            prev.stop();
+        }
+        match crate::sf_binder::FrameTask::spawn(state, |m: &str| log_msg(m)) {
+            Some(t) => {
+                log_msg("Rust: sf-binder frame source started");
+                *guard = Some(t);
+            }
+            None => log_msg("Rust: sf-binder frame source could not start"),
+        }
+    }
+
 
     // Start the file watcher: cur_powermode.txt / perapp_powermode.txt preset
     // switching and the single-byte sfanalysis.hint feed.
@@ -390,6 +410,12 @@ pub(crate) extern "C" fn uperf_rs_stop() {
             t.stop();
         }
     }
+    {
+        let mut guard = sf_binder_slot().lock();
+        if let Some(mut t) = guard.take() {
+            t.stop();
+        }
+    }
     // Stop the dfps timer thread. The scheduler itself stays in its OnceLock;
     // `uperf_rs_start` on a reload replaces the dispatcher's clone.
     if let Some(s) = DFPS_SCHED.get() {
@@ -420,6 +446,8 @@ static ORCHESTRATOR: OnceLock<Arc<PMutex<Orchestrator>>> = OnceLock::new();
 static CPU_TASK: OnceLock<PMutex<Option<cpu_task::CpuTask>>> = OnceLock::new();
 static SCHED_TASK: OnceLock<PMutex<Option<sched_task::SchedTask>>> = OnceLock::new();
 static WATCH_TASK: OnceLock<PMutex<Option<watch_task::WatchTask>>> = OnceLock::new();
+/// ⑤ direct-binder frame source (opt-in). Held so `uperf_rs_stop` stops its thread.
+static SF_BINDER_TASK: OnceLock<PMutex<Option<sf_binder::FrameTask>>> = OnceLock::new();
 /// dfps-rs scheduler, mounted from grill-glitch/dfps-rewrite as a subtree at
 /// `rust/uperf-core/src/dfps_rs/`. Held so `uperf_rs_stop` can stop its timer
 /// thread; the dispatcher holds its own clone.
@@ -427,6 +455,10 @@ static DFPS_SCHED: OnceLock<crate::dfps_rs::DfpsScheduler> = OnceLock::new();
 
 fn watch_task_slot() -> &'static PMutex<Option<watch_task::WatchTask>> {
     WATCH_TASK.get_or_init(|| PMutex::new(None))
+}
+
+fn sf_binder_slot() -> &'static PMutex<Option<sf_binder::FrameTask>> {
+    SF_BINDER_TASK.get_or_init(|| PMutex::new(None))
 }
 
 fn sched_task_slot() -> &'static PMutex<Option<sched_task::SchedTask>> {
