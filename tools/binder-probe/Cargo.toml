@@ -1,0 +1,17 @@
+[package]
+name = "binder-probe"
+version = "0.0.1"
+edition = "2021"
+# Standalone on purpose: NOT a member of rust/ (the workspace members are listed
+# explicitly). Keeps `cargo test`/`build.sh` untouched while this is a device probe.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "binder-probe"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
