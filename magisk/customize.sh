@@ -69,7 +69,24 @@ for candidate in "$MODPATH/bin/patchelf" "/system/bin/patchelf" "$(command -v pa
     fi
 done
 
-if [ -n "$PATCHELF" ] && [ -f "$MODPATH/bin/libsfanalysis_rs.so" ]; then
+# The injection is opt-in (`UPERF_SF_INJECT=1`) on purpose. Two reasons, both measured
+# on alioth: (a) no patchelf is vendored, so the default is a no-op that used to be
+# announced as a half-message; (b) a patched surfaceflinger whose NEEDED library cannot
+# load takes the UI down with it, and on this device SELinux still blocks the injection
+# (AGENT.md §12.1) — so the safe default is to leave /system/bin/surfaceflinger alone
+# and ship the library unused.
+if [ -z "$PATCHELF" ]; then
+    echo "- M8: surfaceflinger NOT injected (no patchelf in bin/, /system/bin or PATH)"
+    echo "      bin/libsfanalysis_rs.so is installed but nothing loads it"
+elif [ ! -f "$MODPATH/bin/libsfanalysis_rs.so" ]; then
+    echo "- M8: surfaceflinger NOT injected (bin/libsfanalysis_rs.so is missing)"
+elif [ "$UPERF_SF_INJECT" != "1" ]; then
+    echo "- M8: surfaceflinger injection skipped (opt-in: UPERF_SF_INJECT=1)"
+    echo "      it needs a SEPolicy that lets surfaceflinger load our library"
+    echo "      (AGENT.md §12.1, docs/spec/sfanalysis.md)"
+fi
+
+if [ -n "$PATCHELF" ] && [ -f "$MODPATH/bin/libsfanalysis_rs.so" ] && [ "$UPERF_SF_INJECT" = "1" ]; then
     SF_SRC="/system/bin/surfaceflinger"
     SF_OUT="$MODPATH/system/bin/surfaceflinger"
     mkdir -p "$MODPATH/system/bin" 2>/dev/null
