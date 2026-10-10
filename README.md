@@ -218,7 +218,14 @@ tail <USER_PATH>/uperf_watchdog.log    # every decision the watchdog made
 
 A stale `state=running` in `uperf.state` with no live daemon is the signature of a
 kill; a clean stop writes `state=stopped`. `UPERF_WATCHDOG=0` disables the
-watchdog (useful while bisecting a crash loop). The KernelSU WebUI's home tab shows
+watchdog (useful while bisecting a crash loop). The dead-man path restores both halves
+of what a killed daemon may have left behind: the governor takeover, and the sysfs knobs
+recorded in the daemon's write ledger (`<USER_PATH>/sysfs_orig.txt` →
+`uperf_restore_sysfs`) — same contract as the governors, "no recorded original, no
+invented value", the ledger cleared only when nothing is still owed. (The
+`modules.sysfs` knob table ships disabled — `"enable": false` — and its real writes only
+happen under `UPERF_FAKE_ROOT`, so this path writes nothing on a device today; the ledger
+exists for the day it is switched on.) The KernelSU WebUI's home tab shows
 all of it as a **Supervision** card (watchdog state/pid/restarts, the daemon's own
 claim, armed clusters, and a "was killed" verdict when the claim is stale).
 

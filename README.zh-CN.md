@@ -572,6 +572,8 @@ tail <USER_PATH>/uperf_watchdog.log    # 看门狗的每一次判定
 
 `uperf.state` 里残留 `state=running` 但没有存活进程，就是被杀的标志；正常停止会写 `state=stopped`。`UPERF_WATCHDOG=0` 可关闭看门狗（排查崩溃循环时有用）。
 
+看门狗的死手路径现在恢复**两样**东西：governor 接管（`uperf_restore_governors`）和守护进程改过的 sysfs knob（写入账本 `<USER_PATH>/sysfs_orig.txt` → `uperf_restore_sysfs`）。契约与 governor 一致：**读不到原值的条目只报告、绝不臆造**，且只在两清（无 unknown、无失败）时才清账本。注意 `modules.sysfs` 的 knob 表在出厂配置里是 `enable: false`（代码里的真写也只在 `UPERF_FAKE_ROOT` 下发生），所以这条路径今天在真机上不产生写入——账本是为它被启用时准备的。
+
 如果设备在手边没有看门狗的情况下卡在 `userspace`（手工删了模块、或关掉了看门狗），恢复：
 
 ```sh
