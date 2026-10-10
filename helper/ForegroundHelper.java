@@ -102,22 +102,48 @@ public class ForegroundHelper {
         return null;
     }
 
-    /** Package of a RootTaskInfo/TaskInfo-ish object: topActivity first, then baseActivity. */
+    /**
+     * Package of a RootTaskInfo / RunningTaskInfo / TaskInfo.
+     *
+     * On this build these carry `ComponentName topActivity / baseActivity / origActivity /
+     * realActivity` as **public fields** — verified on-device with FgProbe2 (`getField` finds
+     * them, `getMethod` throws NoSuchMethodException). The original getter-only lookup
+     * therefore returned null for every task, which is exactly why the first device run
+     * registered fine yet wrote `-`. Read the fields first, then fall back to getters for a
+     * build that exposes them.
+     */
     static String packageOf(Object info) {
         if (info == null) return null;
-        for (String getter : new String[]{"topActivity", "baseActivity", "origActivity"}) {
+        for (String name : new String[]{"topActivity", "baseActivity", "origActivity", "realActivity"}) {
+            Object comp = null;
             try {
-                Object comp = info.getClass().getMethod(getter).invoke(info);
-                if (comp == null) continue;
-                for (String name : new String[]{"getPackageName"}) {
-                    try {
-                        Object p = comp.getClass().getMethod(name).invoke(comp);
-                        if (p instanceof String && !((String) p).isEmpty()) return (String) p;
-                    } catch (Throwable ignored) {
-                    }
-                }
+                comp = info.getClass().getField(name).get(info);
             } catch (Throwable ignored) {
             }
+            if (comp == null) {
+                try {
+                    comp = info.getClass().getMethod(name).invoke(info);
+                } catch (Throwable ignored) {
+                }
+            }
+            String p = pkgOfComponent(comp);
+            if (p != null) return p;
+        }
+        return null;
+    }
+
+    /** Package of a ComponentName (or any CharSequence naming one, e.g. `pkg/.Act`). */
+    static String pkgOfComponent(Object comp) {
+        if (comp == null) return null;
+        try {
+            Object p = comp.getClass().getMethod("getPackageName").invoke(comp);
+            if (p instanceof String && !((String) p).isEmpty()) return (String) p;
+        } catch (Throwable ignored) {
+        }
+        if (comp instanceof CharSequence) {
+            String s = comp.toString();
+            int slash = s.indexOf('/');
+            if (slash > 0) return s.substring(0, slash);
         }
         return null;
     }

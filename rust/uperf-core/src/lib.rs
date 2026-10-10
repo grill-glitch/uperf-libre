@@ -20,6 +20,7 @@
 pub mod cpu_task;
 pub mod dfps_rs;
 pub mod ffi;
+pub mod foreground;
 pub mod inotify;
 pub mod sched_apply;
 pub mod sched_task;
@@ -216,6 +217,25 @@ pub(crate) extern "C" fn uperf_rs_start(
     };
 
     {
+        // Queue item ④: the top-app source. The helper's file lives beside the
+        // config (the module's USER_PATH); when it is fresh it drives
+        // `topapp.pkgName`, and the vendored C++ monitor stays the fallback.
+        let cfg_dir = {
+            let cfg_str = cfg.to_string_lossy().to_string();
+            std::path::Path::new(&cfg_str)
+                .parent()
+                .map(|p| p.to_path_buf())
+        };
+        let foreground = crate::foreground::from_env(cfg_dir.as_deref());
+        match foreground.as_ref() {
+            Some(f) => log_msg(&format!(
+                "Rust: foreground helper file source = {} (max_age {} ms)",
+                f.path().display(),
+                f.max_age_ms()
+            )),
+            None => log_msg("Rust: foreground helper file source disabled; C++ topapp monitor only"),
+        }
+
         let mut guard = dispatcher_slot().lock();
         if let Some(mut prev) = guard.take() {
             prev.join_timeout(std::time::Duration::from_secs(2));
@@ -226,7 +246,7 @@ pub(crate) extern "C" fn uperf_rs_start(
         };
         let orch = Arc::new(PMutex::new(orch));
         let _ = ORCHESTRATOR.set(orch.clone());
-        *guard = Some(topic_dispatch::spawn(orch, dfps.clone()));
+        *guard = Some(topic_dispatch::spawn(orch, dfps.clone(), foreground));
     }
 
     let bridge = match BRIDGE.get() {

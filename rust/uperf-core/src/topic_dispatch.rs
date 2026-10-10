@@ -155,9 +155,16 @@ fn decode_pid_list(payload: &[u8]) -> Option<Vec<i32>> {
 /// `dfps` carries the optional dfps-rs scheduler: when present, the five
 /// refresh-rate topics are routed into it in addition to the orchestrator
 /// (upstream `DynamicFps::AddReactor`, `dynamic_fps.cpp:202-209`).
+///
+/// `foreground` is the optional top-app file source (queue item ④): every tick it
+/// is re-read and, when it names a new (fresh) package, injected as a
+/// `topapp.pkgName` event through the same path as a C++-published one. When it is
+/// absent or stale the loop simply carries the C++ events, so the vendored monitor
+/// stays the fallback.
 pub(crate) fn spawn(
     orch: std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
     dfps: Option<crate::dfps_rs::DfpsScheduler>,
+    foreground: Option<crate::foreground::ForegroundFile>,
 ) -> Dispatcher {
     let (tx, rx): (Sender<Event>, Receiver<Event>) = std::sync::mpsc::channel();
     // Install a clone so the FFI entry point can also send events.
@@ -165,7 +172,7 @@ pub(crate) fn spawn(
     DISPATCH_TX.get_or_init(|| tx_for_ffi);
     let thread = thread::Builder::new()
         .name("uperf-rs".into())
-        .spawn(move || run(rx, orch, dfps))
+        .spawn(move || run(rx, orch, dfps, foreground))
         .expect("spawn uperf-rs dispatcher");
     Dispatcher {
         _keep_alive: tx,
@@ -205,27 +212,60 @@ fn run(
     rx: Receiver<Event>,
     orch: std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
     dfps: Option<crate::dfps_rs::DfpsScheduler>,
+    mut foreground: Option<crate::foreground::ForegroundFile>,
 ) {
     // M4: writes go under a fake root so device validation never touches the
     // real sysfs. Set `UPERF_FAKE_ROOT` to enable file emission (e.g.
     // /data/local/tmp/uperf_fake); otherwise we only log the planned sequence.
     let fake_root = std::env::var("UPERF_FAKE_ROOT").ok();
-    while let Ok(ev) = rx.recv() {
-        write_event(&ev);
-
-        {
-            let mut g = orch.lock();
-            g.on_event(&ev);
+    // Wake periodically to re-read the foreground file (④). The tick is bounded
+    // even when that source is disabled so a dropped sender is noticed promptly
+    // (the join path waits at most two seconds).
+    let tick = if foreground.is_some() {
+        crate::foreground::tick_from_env()
+    } else {
+        Duration::from_millis(1000)
+    };
+    loop {
+        match rx.recv_timeout(tick) {
+            Ok(ev) => handle(&ev, &orch, dfps.as_ref(), fake_root.as_deref()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The top-app file, if any. A stale/absent file yields nothing and
+                // the C++ monitor's own `topapp.pkgName` events carry on.
+                if let Some(f) = foreground.as_mut() {
+                    if let Some(pkg) = f.poll() {
+                        handle(&Event::Topapp(pkg), &orch, dfps.as_ref(), fake_root.as_deref());
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        apply_pending(&orch, fake_root.as_deref());
+    }
+}
 
-        // Refresh-rate topics fan out to dfps-rs as a second subscriber
-        // (T03: same process, no IPC). Ordering after the orchestrator is
-        // deliberate — the orchestrator owns sysfs/CPU knobs, dfps owns the
-        // refresh rate, and nothing is shared between them.
-        if let Some(d) = dfps.as_ref() {
-            route_dfps(&ev, d);
-        }
+/// One event, through every subscriber. Both the FFI entry point and the
+/// foreground tick feed this, so a file-sourced top-app is handled byte-for-byte
+/// like a C++-published one.
+fn handle(
+    ev: &Event,
+    orch: &std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
+    dfps: Option<&crate::dfps_rs::DfpsScheduler>,
+    fake_root: Option<&str>,
+) {
+    write_event(ev);
+
+    {
+        let mut g = orch.lock();
+        g.on_event(ev);
+    }
+    apply_pending(orch, fake_root);
+
+    // Refresh-rate topics fan out to dfps-rs as a second subscriber
+    // (T03: same process, no IPC). Ordering after the orchestrator is
+    // deliberate — the orchestrator owns sysfs/CPU knobs, dfps owns the
+    // refresh rate, and nothing is shared between them.
+    if let Some(d) = dfps {
+        route_dfps(ev, d);
     }
 }
 
@@ -370,4 +410,83 @@ fn _cstr_assert(c: *const c_char) -> Option<&'static str> {
     }
     // SAFETY: for diagnostics only.
     unsafe { CStr::from_ptr(c) }.to_str().ok()
+}
+
+#[cfg(test)]
+mod foreground_tick_tests {
+    //! Queue item ④: a fresh line in the foreground file must reach the
+    //! orchestrator exactly like a C++-published `topapp.pkgName`, and a stale
+    //! one must reach it not at all (the vendored monitor stays the fallback).
+
+    use super::*;
+    use crate::hint::HintDurations;
+    use crate::orchestrator::Orchestrator;
+    use std::sync::Arc;
+
+    fn unique_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "uperf_td_{}_{}_{}.txt",
+            tag,
+            std::process::id(),
+            crate::foreground::monotonic_ms()
+        ))
+    }
+
+    fn spawn_with(
+        fg: Option<crate::foreground::ForegroundFile>,
+    ) -> (Arc<parking_lot::Mutex<Orchestrator>>, Dispatcher) {
+        let orch = Arc::new(parking_lot::Mutex::new(Orchestrator::new(
+            HintDurations::default(),
+            "balance",
+        )));
+        let d = spawn(orch.clone(), None, fg);
+        (orch, d)
+    }
+
+    fn top_of(orch: &Arc<parking_lot::Mutex<Orchestrator>>) -> Option<String> {
+        orch.lock().top_app().map(str::to_string)
+    }
+
+    #[test]
+    fn a_fresh_foreground_file_becomes_the_top_app() {
+        let path = unique_path("fresh");
+        std::fs::write(
+            &path,
+            format!("com.example.top {}\n", crate::foreground::monotonic_ms()),
+        )
+        .unwrap();
+        let fg = crate::foreground::ForegroundFile::new(
+            &path,
+            crate::foreground::DEFAULT_MAX_AGE_MS,
+        );
+        let (orch, mut d) = spawn_with(Some(fg));
+
+        // The tick is 500 ms; give the first tick a generous margin.
+        let mut got = None;
+        for _ in 0..60 {
+            std::thread::sleep(Duration::from_millis(50));
+            got = top_of(&orch);
+            if got.is_some() {
+                break;
+            }
+        }
+        d.join_timeout(Duration::from_secs(2));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got.as_deref(), Some("com.example.top"));
+    }
+
+    #[test]
+    fn a_stale_foreground_file_reports_nothing() {
+        let path = unique_path("stale");
+        // A timestamp far in the past: the helper stopped writing.
+        std::fs::write(&path, "com.example.gone 1\n").unwrap();
+        let fg = crate::foreground::ForegroundFile::new(&path, 500);
+        let (orch, mut d) = spawn_with(Some(fg));
+
+        std::thread::sleep(Duration::from_millis(1200));
+        let got = top_of(&orch);
+        d.join_timeout(Duration::from_secs(2));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, None, "a stale file must never invent a top app");
+    }
 }
