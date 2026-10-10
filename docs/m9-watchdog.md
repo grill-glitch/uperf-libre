@@ -101,6 +101,24 @@ It does **not** touch frequency targets, cgroup placement, or the config, and it
 does not replace the in-process paths — it is the third line, after them and after
 the script-side restore.
 
+### Liveness is cache-first
+
+A sample answers "is the daemon pair still the same pair?" from a cache of
+`pid:start_ticks:ppid` records while every cached pid is still the same process —
+two `read`s of `/proc/<pid>/stat`, no forks, no sweep. Identity is **pid plus start
+time**, the same rule the owner lock uses; `exe` is deliberately not re-read on the
+cached path, because `exe` decides *membership* of the set (that this pid is ours at
+all) and membership is re-decided at every sweep.
+
+The sweep comes back on its own the moment the cache stops checking out, which is
+exactly when the interesting things happen: the daemon killed (the pids vanish), a
+worker that went away, a supervisor that re-forked, a pid whose start time moved
+(i.e. a different process wearing a recycled pid). The `recover` path always sweeps
+first and ignores the cache: the cache is what went bad, so what it holds is what
+cannot be trusted. The `backstop` knob covers the one case a healthy cache cannot
+see — a *second* pair appearing out of nowhere (a start that raced the lock) — and
+the sweep it forces also re-checks `exe` for every candidate.
+
 ## 3. The two state files
 
 Each has exactly one writer, so nothing interleaves.
@@ -129,7 +147,9 @@ nothing to report is still alive; a log line every 15 s would drown the log). Fi
 (`starting`/`running`/`recovering`/`restarted`/`restart-failed`/`restored`/
 `gave-up`/`stopped`), `restarts`, `interval_s`, `max_restarts`, the last
 sup/worker/armed snapshot, `exe`, `pid`/`boot_id`/`start_ticks` and
-`updated_uptime_ms`. A stop after a give-up keeps the history in `detail`
+`updated_uptime_ms` — plus the cost counters `sweeps` (full `/proc` sweeps since
+start), `since_sweep` and `backstop`, which are what makes "this sample was free"
+checkable from outside instead of asserted. A stop after a give-up keeps the history in `detail`
 (`stopped by the module (last state: gave-up)`), because "stopped" alone would
 hide why the platform governor is in charge.
 
@@ -206,9 +226,16 @@ after; the installed module's daemon is only observed (`UPERF_WATCHDOG_DRY_RUN=1
   classified as a lone supervisor → the watchdog SIGTERMs it → **the daemon's own
   handler disarms it** (`cpu governor disarmed`), with the policies back before the
   watchdog's restore would have run.
-* **Cost at the shipped 15 s cadence: 56-67 ticks = 560-670 ms over 60 s =
-  0.93-1.12 % of one core** across three runs; one scan ≈ 0.13-0.19 s (1289
-  processes).
+* **Cost at the shipped 15 s cadence, before the cache: 56-67 ticks = 560-670 ms
+  over 60 s = 0.93-1.12 % of one core** across three runs; one sweep ≈ 0.13-0.19 s
+  (1289 processes) — i.e. essentially all of the cost was the sweep.
+* **After the cache-first change (2026-10-10): 30 ticks = 300 ms over 60 s = 0.5 %
+  of one core**, with `sweeps=1` / `since_sweep=6` in the state file over a 90 s
+  run, i.e. one sweep in six samples instead of six. A sweep is now paid only when
+  the cached identity stops checking out (a pid gone, a start time moved) or every
+  `backstop` samples. What is left is the per-sample work that is *not* the sweep:
+  the 1 s sleep slices (one `sleep` fork per slice), the `armed` reads, and the
+  state-file write. Measured, not estimated.
 
 The raw log is kept at [`docs/m9-device-run-alioth.txt`](./m9-device-run-alioth.txt)
 (the harness also writes a `.completed` marker on the device, so a truncated log
@@ -301,6 +328,7 @@ restarted:
 | `UPERF_WATCHDOG_MAX_RESTARTS` | 3 | restart budget **per boot** |
 | `UPERF_WATCHDOG_TEARDOWN_TICKS` | 5 | seconds to wait for a SIGTERM to land |
 | `UPERF_WATCHDOG_VERIFY_WAIT` | 3 | seconds to wait after a restart before judging it |
+| `UPERF_WATCHDOG_BACKSTOP` | 20 | samples between *forced* `/proc` sweeps — the only way a second pair that appears while the first is healthy gets seen (the host harness sets it to 1 to test that) |
 
 Test seams (defaults = the device layout): `UPERF_WATCHDOG_{PROC_ROOT,
 CPUFREQ_ROOT,EXE,USER_PATH,FLAG_PATH,LOG,STATE,STUB}` and

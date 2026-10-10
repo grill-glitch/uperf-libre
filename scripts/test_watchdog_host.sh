@@ -137,6 +137,7 @@ new_case() { # new_case <name> [policy...]
     # case 3's "bring a daemon up" leaked into every later case).
     WD_VERIFY=1
     WD_STATE_PATH=""
+    WD_BACKSTOP=20
     WD_DRY_RUN=0
     STUB_BRINGUP=0
     W="$WORK/$name"
@@ -193,6 +194,7 @@ watchdog_run() { # watchdog_run <seconds> -> prints the pid of timeout(1)
         UPERF_WATCHDOG_GRACE="${WD_GRACE:-1}" \
         UPERF_WATCHDOG_MAX_RESTARTS="${WD_MAX_RESTARTS:-2}" \
         UPERF_WATCHDOG_TEARDOWN_TICKS="${WD_TEARDOWN:-2}" \
+        UPERF_WATCHDOG_BACKSTOP="${WD_BACKSTOP:-20}" \
         UPERF_WATCHDOG_VERIFY_WAIT="${WD_VERIFY:-1}" \
         UPERF_WATCHDOG_DRY_RUN="${WD_DRY_RUN:-0}" \
         UPERF_WATCHDOG_STUB="$W/stub.sh" \
@@ -401,6 +403,42 @@ done
 eq "$still" "0" "every supervisor/worker pair was retired"
 eq "$(governor_of dup policy0)" "schedutil" "the takeover was undone"
 check_contains "$WORK/dup/stub.log" "called" "a single daemon was restarted"
+
+# ------------------------------- case 11: the steady state does not sweep every sample
+
+echo "== case 11: a healthy pair is answered from the cache, not by a sweep per sample"
+new_case steady policy0
+start_fake_daemon "$WORK/steady/pids/a.pids"
+printf 'userspace' >"$WORK/steady/cpufreq/policy0/scaling_governor"
+WD_INTERVAL=1
+WD_PID="$(watchdog_run 7)"
+sleep 6
+# Read before stopping: the stop path rewrites the file as `state=stopped` (which is
+# the point of the file, and would make this assertion test the wrong thing).
+cp "$WORK/steady/wd.state" "$WORK/steady/wd.state.at_run"
+stop_watchdog "$WD_PID"
+eq "$(sed -n 's/^state=//p' "$WORK/steady/wd.state.at_run")" "running" "the pair is still reported healthy"
+eq "$(sed -n 's/^sweeps=//p' "$WORK/steady/wd.state.at_run")" "1" "the whole run cost exactly one /proc sweep"
+check_contains "$WORK/steady/wd.state.at_run" "^since_sweep=[1-9][0-9]*$" "samples since the sweep are counted"
+check_contains "$WORK/steady/wd.state.at_run" "^backstop=20$" "the shipped backstop is what ran"
+check_contains "$WORK/steady/wd.log" "healthy:" "the healthy transition was still logged"
+kill -KILL "$(pid_super "$WORK/steady/pids/a.pids")" "$(pid_worker "$WORK/steady/pids/a.pids")" 2>/dev/null
+
+# ------------------------------------------------------- case 9: a killed daemon is seen
+
+echo "== case 11b: the cache never hides a kill (the sweep is forced when a pid is gone)"
+new_case killed policy0
+start_fake_daemon "$WORK/killed/pids/a.pids"
+printf 'userspace' >"$WORK/killed/cpufreq/policy0/scaling_governor"
+WD_INTERVAL=1
+WD_PID="$(watchdog_run 12)"
+sleep 2
+kill -KILL "$(pid_super "$WORK/killed/pids/a.pids")" "$(pid_worker "$WORK/killed/pids/a.pids")" 2>/dev/null
+sleep 8
+stop_watchdog "$WD_PID"
+eq "$(governor_of killed policy0)" "schedutil" "the kill was noticed from the cache and the takeover undone"
+check_contains "$WORK/killed/wd.log" "unhealthy sample" "an unhealthy sample was logged"
+check_contains "$WORK/killed/wd.log" "restore:" "the real restore ran"
 
 # ------------------------------------------------------------- case 9: dry run
 
