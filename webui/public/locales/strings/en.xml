@@ -24,6 +24,8 @@
     <string name="label_soc">SoC</string>
     <string name="label_android">Android</string>
     <string name="label_kernel">Kernel</string>
+    <string name="label_abi">ABI</string>
+    <string name="value_unsupported">unsupported</string>
     <string name="label_selinux">SELinux</string>
     <string name="label_author">Author</string>
     <string name="label_description">Description</string>

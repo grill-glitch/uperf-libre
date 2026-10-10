@@ -27,6 +27,8 @@
 BASEDIR="$(cd "$(dirname "$0")" && pwd)"
 . "$BASEDIR/pathinfo.sh"
 . "$BASEDIR/libcommon.sh"
+# ⑩: the module is arm64-only; `module_abi` / `abi_supported` come from here.
+. "$BASEDIR/libsysinfo.sh"
 
 # libuperf.sh brings in `uperf_stop` / `uperf_start` and the governor bookkeeping.
 # It resolves its own directory through `$0`, which is this script's path here, so it
@@ -157,6 +159,9 @@ print_info() {
     echo "android.sdk=$(getprop ro.build.version.sdk)"
     echo "kernel.release=$(uname -r)"
     echo "selinux=$(getenforce 2>/dev/null)"
+    # ⑩: what the module's binaries need vs what this device is.
+    echo "device.abi=$(module_abi)"
+    echo "module.arch_supported=$(abi_supported)"
     echo "module.dir=$MODULE_PATH"
     echo "module.id=$(grep -m1 '^id=' "$MODULE_PATH/module.prop" 2>/dev/null | cut -d= -f2-)"
     echo "module.name=$(grep -m1 '^name=' "$MODULE_PATH/module.prop" 2>/dev/null | cut -d= -f2-)"

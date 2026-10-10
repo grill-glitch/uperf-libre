@@ -45,12 +45,54 @@ get_socname() {
     echo "$(cat "/sys/devices/soc0/machine"| tr '[A-Z]' '[a-z]')"
 }
 
+# ⑩ 32-bit coverage. Exactly three things here are arch-locked: bin/uperf (the daemon),
+# bin/busybox/busybox (statically linked, arm64) and bin/libsfanalysis_rs.so (loaded into
+# surfaceflinger). Everything else is shell or dex and arch-neutral. On a device whose
+# primary ABI is not arm64-v8a none of the three can exec -- and the injection target
+# would itself be 32-bit -- so the install is refused up front instead of appearing to
+# succeed and failing silently at boot.
+#
+# `UPERF_FAKE_ABI` is a testing seam for exercising the refusal path on a 64-bit device,
+# in the same spirit as `UPERF_FAKE_ROOT`.
+module_abi() {
+    if [ -n "$UPERF_FAKE_ABI" ]; then
+        echo "$UPERF_FAKE_ABI"
+    else
+        getprop ro.product.cpu.abi
+    fi
+}
+
 is_aarch64() {
-    if [ "$(getprop ro.product.cpu.abi)" == "arm64-v8a" ]; then
+    if [ "$(module_abi)" == "arm64-v8a" ]; then
         echo "true"
     else
         echo "false"
     fi
+}
+
+# 1 when this module's binaries can run here, 0 otherwise.
+abi_supported() {
+    if [ "$(module_abi)" == "arm64-v8a" ]; then
+        echo 1
+    else
+        echo 0
+    fi
+}
+
+# Print the reason and return non-zero when the ABI is unsupported. Callers abort on it.
+require_aarch64() {
+    if [ "$(abi_supported)" == "1" ]; then
+        return 0
+    fi
+    echo "! unsupported ABI: $(module_abi)"
+    echo "  uperf-libre ships arm64-v8a binaries only:"
+    echo "    bin/uperf               the daemon"
+    echo "    bin/busybox/busybox     statically linked, arm64"
+    echo "    bin/libsfanalysis_rs.so loaded into surfaceflinger"
+    echo "  None of them can exec on a 32-bit-only device, and the injection target"
+    echo "  would be 32-bit too, so the install is refused rather than left to fail"
+    echo "  silently at boot. No 32-bit build is shipped (docs/m11-10-32bit.md)."
+    return 1
 }
 
 is_eas() {

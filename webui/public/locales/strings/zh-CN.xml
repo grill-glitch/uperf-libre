@@ -24,6 +24,8 @@
     <string name="label_soc">SoC</string>
     <string name="label_android">Android</string>
     <string name="label_kernel">内核</string>
+    <string name="label_abi">指令集</string>
+    <string name="value_unsupported">不支持</string>
     <string name="label_selinux">SELinux</string>
     <string name="label_author">作者</string>
     <string name="label_description">说明</string>
