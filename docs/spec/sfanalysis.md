@@ -236,6 +236,21 @@ calls: ioctl=-1 ioctl2=-1 epoll=-1
 exit=0
 ```
 
+### 可复用的注入配方（2026-10-10 复核，Enforcing，不需要任何策略改动）
+
+```sh
+# 1. 库必须落在 SF 域读得到的、且带 system_file 标签的路径
+cp libsfanalysis_rs.so /data/misc/surfaceflinger/ && chmod 755 ...
+chown system:system ... && chcon u:object_r:system_file:s0 ...   # 模块 bin/ 里的库本身已是 system_file
+# 2. 用 injector 注入运行中的 SF —— 参数是**完整 cmdline**，不是 comm
+/data/local/tmp/injector /system/bin/surfaceflinger /data/misc/surfaceflinger/libsfanalysis_rs.so
+```
+结果：`dlopen called … Injection ended succesfully`，SF 里出现三处映射（含 `r-xp`，**Enforcing 下没有被 execmem/execmod 拒绝**）与 `xh_refresh_loop` / `sfh_stats_loop` 两个线程，SF 存活、pid 不变。诊断日志见 `sfh.log`（需要 `/data/misc/surfaceflinger/sfh.debug` 标记）。
+
+不需要的策略改动：库由模块管理器打上 `system_file` 标签后，SF 域即可 `map/execute` 它；GOT 改写只需要 `mprotect(PROT_WRITE)`，与 `execmem/execmod` 无关。两条**走不通/更重**的路线记在 AGENT.md §2（`debug.ld.*` 被 `ro.debuggable=0` 关掉；SF 的 `.dynamic`/`.dynstr` 没有原地空间）。
+
+⚠️ 本轮实测期间设备出现两次内核 panic（dcache 损坏，见 AGENT.md §2 的 trace）：**与本注入无关**（SF 无 tombstone、panic 线程是模块自己的 watcher、call trace 全在 VFS 路径），但在没有根因结论前，M8 的产品侧注入继续保持 **opt-in**（`UPERF_SF_INJECT=1`）。
+
 ### SF 侧注入实测（2026-10-09，见 m8-sfanalysis-reverse.md §8）
 
 用 `ssanalysis` 模块自带的 `injector`（ptrace + 远程 dlopen）把库注入**运行中的**

@@ -72,4 +72,20 @@
     <string name="dfps_prompt_active">{pkg} 的活动 Hz（原 {active}）</string>
     <string name="toast_rule_ok">{pkg} 的规则已更新</string>
     <string name="toast_rule_fail">更新规则失败：{err}</string>
-    </resources>
+        <string name="section_supervision">守护</string>
+    <string name="label_watchdog_state">看门狗</string>
+    <string name="label_watchdog_pid">看门狗 PID</string>
+    <string name="label_watchdog_restarts">本次开机重启次数</string>
+    <string name="label_daemon_claim">守护进程自报</string>
+    <string name="label_armed_clusters">已接管集群</string>
+    <string name="daemon_claim_killed">已被杀（状态文件是陈旧的）</string>
+    <string name="state_running">运行中</string>
+    <string name="state_starting">启动中</string>
+    <string name="state_recovering">恢复中</string>
+    <string name="state_restarting">重启中</string>
+    <string name="state_restarted">已重启</string>
+    <string name="state_restart_failed">重启失败</string>
+    <string name="state_restored">已恢复</string>
+    <string name="state_gave_up">已放弃</string>
+    <string name="state_stopped">已停止</string>
+</resources>

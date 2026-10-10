@@ -45,6 +45,7 @@ const ICONS = {
     all_inclusive: 'dfps: the universal "*" rule row',
     bedtime: 'dfps: the offscreen "-" rule row',
     apps: 'dfps: a per-app rule row',
+    verified_user: 'home: supervision card',
 };
 
 // --- 1. every listed icon must exist in the package -------------------------

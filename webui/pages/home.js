@@ -36,6 +36,17 @@ function formatUptime(seconds) {
     return `${m}m`;
 }
 
+/**
+ * Human label for a state value the scripts emit (`running`, `gave-up`, `restarting`
+ * …). Unknown values are shown as-is: inventing a label would hide a state the scripts
+ * grew that this page does not know about yet.
+ */
+function stateLabel(state) {
+    const key = `state_${String(state).replace(/-/g, '_')}`;
+    const text = getString(key);
+    return text === key ? state : text;
+}
+
 function basename(path) {
     return String(path || '').split('/').filter(Boolean).pop() || '';
 }
@@ -86,6 +97,26 @@ export function render(data, config, error) {
             ? `${getString('label_sha')}: ${String(data['config.sha256'] || '').slice(0, 16)}`
             : '',
     ].filter(Boolean).join(' · ');
+
+    // Supervision: what the daemon claims (`uperf.state`) and what the watchdog says
+    // (`uperf_watchdog.state`). The two together are what make a kill visible — a
+    // stale `daemon.state=running` with no process is the documented signature of one,
+    // and `watchdog.state=gave-up` means the restart budget was spent and the platform
+    // governor is in charge on purpose (docs/m9-watchdog.md).
+    const supervision = document.getElementById('supervision-card');
+    supervision.textContent = '';
+    const wdState = String(data['watchdog.state'] || '').trim();
+    const claim = String(data['daemon.state'] || '').trim();
+    const killed = claim === 'running' && !running;
+    addRow(supervision, 'verified_user', [
+        [getString('label_watchdog_state'), wdState ? stateLabel(wdState) : getString('state_unknown')],
+        [getString('label_watchdog_pid'), data['watchdog.pid']],
+        [getString('label_watchdog_restarts'), data['watchdog.restarts']],
+        [getString('label_daemon_claim'), killed
+            ? getString('daemon_claim_killed')
+            : (claim ? stateLabel(claim) : '')],
+        [getString('label_armed_clusters'), data['daemon.armed']],
+    ], getString('section_supervision'));
 
     const device = document.getElementById('device-card');
     device.textContent = '';
