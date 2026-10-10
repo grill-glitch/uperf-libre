@@ -424,6 +424,57 @@ check_contains "$WORK/steady/wd.state.at_run" "^backstop=20$" "the shipped backs
 check_contains "$WORK/steady/wd.log" "healthy:" "the healthy transition was still logged"
 kill -KILL "$(pid_super "$WORK/steady/pids/a.pids")" "$(pid_worker "$WORK/steady/pids/a.pids")" 2>/dev/null
 
+# ------------------------------ case 12: the daemon's sysfs write ledger
+
+echo "== case 12: sysfs knobs are put back; an unrecorded one is only reported"
+new_case sysfs
+ROOT="$WORK/sysfs/root"
+mkdir -p "$ROOT/sys/module/msm_performance/parameters" "$ROOT/sys/kernel"
+KNOB="$ROOT/sys/module/msm_performance/parameters/cpu_max_freq"
+printf '1612800\n' >"$KNOB"                    # what the daemon's write left behind
+printf '0-3\n' >"$ROOT/sys/kernel/already_ok"  # recorded, and already correct
+printf '999\n' >"$ROOT/sys/kernel/left_alone"  # the ledger never mentions this one
+mkdir -p "$ROOT/sys/kernel/not_writable"       # a directory: the restore must fail here
+LEDGER="$WORK/sysfs/sysfs_orig.txt"
+{
+    echo '# a comment line the loader must skip'
+    echo '/sys/module/msm_performance/parameters/cpu_max_freq 2419200'
+    echo '/sys/kernel/already_ok 0-3'
+    echo '/sys/ro/path'
+    echo '/sys/kernel/not_writable 7'
+    echo 'garbage with no path'
+} >"$LEDGER"
+
+restore() {
+    # `libuperf.sh` sources `./pathinfo.sh` relative to `$0`, so it has to be sourced
+    # from its own directory (a `sh -c` would make `$0` = `sh` and the relative source
+    # would resolve against the caller's cwd).
+    env UPERF_SYSFS_ORIG="$LEDGER" UPERF_SYSFS_ROOT="$ROOT" \
+        sh -c "cd \"$(dirname "$WATCHDOG")\" && . ./libuperf.sh && uperf_restore_sysfs" \
+        >"$WORK/sysfs/out.$1.log" 2>&1
+    return $?
+}
+restore 1
+OUT="$WORK/sysfs/out.1.log"
+check_contains "$OUT" "^uperf: restored 1 sysfs knob" "the changed knob was restored"
+check_contains "$OUT" "already at their original value" "an already-correct knob is only counted"
+check_contains "$OUT" "no recorded original for /sys/ro/path" "a path with no recorded original is reported"
+check_contains "$OUT" "could not restore /sys/kernel/not_writable" "a refused write is reported"
+check_contains "$OUT" "ignoring unreadable line in .*: garbage with no path" "a line that is not an absolute path is ignored and reported, not written to"
+check_contains "$OUT" "1 unreadable ledger line" "the ignored line is counted"
+eq "$(cat "$KNOB")" "2419200" "the recorded knob is back to its original value"
+eq "$(cat "$ROOT/sys/kernel/already_ok")" "0-3" "the untouched knob is byte-identical still"
+eq "$(cat "$ROOT/sys/kernel/left_alone")" "999" "a path the ledger never names is not touched"
+[ -f "$LEDGER" ] && ok "the ledger is kept while an entry is still owed" || bad "the ledger was cleared with an entry still owed"
+
+# Clear the two stragglers: then nothing is owed and the ledger must go.
+rm -rf "$ROOT/sys/kernel/not_writable"
+printf '7\n' >"$ROOT/sys/kernel/not_writable"
+sed -i '/^\/sys\/ro\/path$/d;/^garbage/d' "$LEDGER"
+restore 2
+check_missing "$WORK/sysfs/out.2.log" "kept at" "nothing is left owed"
+[ -f "$LEDGER" ] && bad "the ledger survived a clean restore" || ok "the ledger is cleared once nothing is owed"
+
 # ------------------------------------------------------- case 9: a killed daemon is seen
 
 echo "== case 11b: the cache never hides a kill (the sweep is forced when a pid is gone)"

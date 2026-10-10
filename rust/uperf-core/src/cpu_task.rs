@@ -329,7 +329,13 @@ impl CpuTask {
                         let root = fake_root();
                         match root.as_deref() {
                             Some(root) => {
-                                let mut sink = crate::orchestrator::UnderRootSink::new(root);
+                                let mut sink =
+                                    match crate::sysfs_ledger::SysfsLedger::for_status() {
+                                        Some(l) => {
+                                            crate::orchestrator::UnderRootSink::with_ledger(root, l)
+                                        }
+                                        None => crate::orchestrator::UnderRootSink::new(root),
+                                    };
                                 for w in &writes {
                                     sink.write(w);
                                 }

@@ -44,10 +44,17 @@ impl Sink for CollectingSink {
 }
 
 /// Rewrite every path under a fake root, then write to the real fs.
+///
+/// With a [`SysfsLedger`] attached, the value each path held *before* our first write
+/// to it is recorded (and flushed) first — record-then-write, so a write that lands
+/// but whose recorder dies still has its original on disk. The ledger's key is the
+/// unmapped `w.path`, so the file is the same whichever root the writes go to and the
+/// shell-side restore can prefix it identically.
 pub struct UnderRootSink {
     pub root: PathBuf,
     pub written: Vec<SysfsWrite>,
     pub failed: Vec<(String, String)>,
+    pub ledger: Option<crate::sysfs_ledger::SysfsLedger>,
 }
 impl UnderRootSink {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -55,8 +62,18 @@ impl UnderRootSink {
             root: root.into(),
             written: Vec::new(),
             failed: Vec::new(),
+            ledger: None,
         }
     }
+
+    /// Same, but record originals as it goes.
+    pub fn with_ledger(root: impl Into<PathBuf>, ledger: crate::sysfs_ledger::SysfsLedger) -> Self {
+        Self {
+            ledger: Some(ledger),
+            ..Self::new(root)
+        }
+    }
+
     fn mapped(&self, path: &str) -> PathBuf {
         self.root.join(path.trim_start_matches('/'))
     }
@@ -67,6 +84,7 @@ impl Sink for UnderRootSink {
         if let Some(parent) = target.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        crate::sysfs_ledger::record_before_write(&mut self.ledger, &w.path, &target);
         match std::fs::write(&target, format!("{}\n", w.value)) {
             Ok(()) => self.written.push(w.clone()),
             Err(e) => self.failed.push((w.path.clone(), e.to_string())),
@@ -387,6 +405,31 @@ mod tests {
             .find(|w| w.path == "/dev/cpuset/top-app/cpus")
             .expect("cpusetTa missing in switch scene");
         assert_eq!(ta.value, "0-3", "switch scene should override initials 0-7");
+    }
+
+    #[test]
+    fn under_root_sink_records_the_original_once() {
+        let dir = std::env::temp_dir().join(format!("uperf_sink_ledger_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sys/module/x")).unwrap();
+        let node = dir.join("sys/module/x/param");
+        std::fs::write(&node, "before\n").unwrap();
+        let ledger = crate::sysfs_ledger::SysfsLedger::load(dir.join("sysfs_orig.txt"));
+        let mut sink = UnderRootSink::with_ledger(&dir, ledger);
+        sink.write(&SysfsWrite {
+            path: "/sys/module/x/param".into(),
+            value: "after".into(),
+        });
+        assert_eq!(std::fs::read_to_string(&node).unwrap(), "after\n");
+        // A second write is not a second original.
+        sink.write(&SysfsWrite {
+            path: "/sys/module/x/param".into(),
+            value: "later".into(),
+        });
+        let written = std::fs::read_to_string(dir.join("sysfs_orig.txt")).unwrap();
+        assert!(written.contains("/sys/module/x/param before"), "got: {written}");
+        assert_eq!(written.matches("/sys/module/x/param").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
