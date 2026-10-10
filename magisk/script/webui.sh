@@ -219,6 +219,44 @@ print_log() {
     tail -n "$n" "$log"
 }
 
+# Copy a slice of the log somewhere the user can pick it up (a file manager, a share
+# sheet, `adb pull`). This exists because the WebUI's log box is a WebView `<pre>`: on a
+# phone there is no way to select and copy 2000 monospace lines out of it, and "export"
+# is the only action that actually gets the text off the device.
+#
+# Destination is inside the module's own user dir (`/sdcard/...`, FUSE, writable as root
+# without touching any new policy) and under an `export/` subdir so it is obvious what is
+# disposable. The write is verified by reading the file back — a `tail` that silently
+# failed (full filesystem, FUSE hiccup) must not report success.
+export_log() {
+    local n="${1:-2000}"
+    case "$n" in *[!0-9]*) n=2000 ;; esac
+    [ "$n" -gt 20000 ] && n=20000
+    local log="$USER_PATH/uperf_log.txt"
+    local dir="$USER_PATH/export"
+    local stamp dst
+    stamp="$(date +%Y%m%d-%H%M%S 2>/dev/null)"
+    [ -n "$stamp" ] || stamp="export"
+    dst="$dir/uperf_log_${stamp}.txt"
+
+    if [ ! -f "$log" ]; then
+        echo "export.ok=0"
+        echo "export.error=no log at $log"
+        return 1
+    fi
+    mkdir -p "$dir" 2>/dev/null
+    tail -n "$n" "$log" > "$dst" 2>/dev/null
+    if [ ! -s "$dst" ]; then
+        echo "export.ok=0"
+        echo "export.error=could not write $dst"
+        return 1
+    fi
+    echo "export.path=$dst"
+    echo "export.lines=$(wc -l < "$dst" 2>/dev/null | tr -d ' ')"
+    echo "export.bytes=$(wc -c < "$dst" 2>/dev/null | tr -d ' ')"
+    echo "export.ok=1"
+}
+
 do_restart() {
     echo "restart.before=$(uperf_pid_count)"
     # The daemon setsid()s itself, so it survives this shell exiting — that is why
@@ -240,9 +278,10 @@ case "$1" in
         ;;
     set-preset) set_preset "$2" ;;
     log) print_log "$2" ;;
+    export) export_log "$2" ;;
     restart) do_restart ;;
     *)
-        echo "Usage: webui.sh {status|info|all|set-preset <name>|log [n]|restart}" >&2
+        echo "Usage: webui.sh {status|info|all|set-preset <name>|log [n]|export [n]|restart}" >&2
         exit 2
         ;;
 esac
