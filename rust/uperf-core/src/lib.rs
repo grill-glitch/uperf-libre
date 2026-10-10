@@ -16,6 +16,11 @@
 //!   * `data == NULL && len == 0` ⇒ the topic carries no payload (`cgroup.*.update`).
 
 #![deny(unsafe_op_in_unsafe_fn)]
+// Every `unsafe` in this crate is load-bearing: a libc/`extern "C"` call, a raw
+// pointer into a buffer the platform layer owns, or the binder mmap. None of them
+// is decorative, so a block that stops needing `unsafe` must fail the build
+// rather than linger (audit: `UNSAFE_AUDIT_REPORT.md`).
+#![deny(unused_unsafe)]
 
 pub mod cpu_task;
 pub mod ctl_socket;
@@ -82,10 +87,16 @@ pub(crate) unsafe extern "C" fn uperf_rs_on_event(
 
 /// Initialize the bridge handle. C++ must call this exactly once at boot, before
 /// any other entry point. Subsequent calls are a no-op.
+///
+/// # Safety
+///
+/// `bridge` must be non-null and point to a `Bridge` that stays valid for the whole
+/// process (the C++ side installs a `static` one). The `assert!` below is a
+/// diagnostic for a broken caller, not a substitute for this contract.
 #[no_mangle]
-pub(crate) extern "C" fn uperf_rs_init(bridge: *const Bridge) {
+pub(crate) unsafe extern "C" fn uperf_rs_init(bridge: *const Bridge) {
     assert!(!bridge.is_null(), "bridge pointer must be non-null");
-    // SAFETY: bridge is process-lifetime per C++ contract.
+    // SAFETY: contract — `bridge` points to a live, process-lifetime `Bridge`.
     let b = unsafe { (*bridge).clone() };
     let _ = BRIDGE.set(b);
 }
@@ -113,13 +124,17 @@ fn reset_sigchld_for_command() {
     }
 }
 
+/// # Safety
+///
+/// Both paths must be NUL-terminated UTF-8 that stays valid for the call (C++
+/// passes `std::string::c_str()` values from `app_main`); they are only read here.
 #[no_mangle]
-pub(crate) extern "C" fn uperf_rs_start(
+pub(crate) unsafe extern "C" fn uperf_rs_start(
     config_path: *const libc::c_char,
     log_path: *const libc::c_char,
 ) -> libc::c_int {
     reset_sigchld_for_command();
-    // SAFETY: NUL-terminated per contract.
+    // SAFETY: contract — both pointers are NUL-terminated for the duration of the call.
     let cfg = unsafe { CStr::from_ptr(config_path) };
     let log = unsafe { CStr::from_ptr(log_path) };
 

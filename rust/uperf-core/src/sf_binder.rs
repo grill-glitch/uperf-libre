@@ -115,9 +115,28 @@ struct FlatBinderObject {
     cookie: u64,
 }
 
+/// Reinterpret a `#[repr(C)]` plain-old-data struct as its bytes.
+///
+/// Used only with `BinderTransactionData` and `FlatBinderObject`: both are
+/// `#[repr(C)]` structs of 32/64-bit integers whose field layout leaves no interior
+/// padding (so all `size_of::<T>()` bytes are initialised) and both derive
+/// `Default`. That is the whole precondition, and it is pinned by the
+/// `size_of` assertions below — this is a private helper with two fixed types, not
+/// a general `bytemuck`-style cast.
 fn as_bytes<T: Sized>(t: &T) -> &[u8] {
+    // SAFETY: `t` is a live shared reference, so its address is valid for
+    // `size_of::<T>()` readable bytes, and the returned slice borrows from `t`
+    // (same lifetime), so it cannot outlive the value it views.
     unsafe { std::slice::from_raw_parts((t as *const T) as *const u8, std::mem::size_of::<T>()) }
 }
+
+// The invariants `as_bytes`, `parse` and `get_service` rest on. If a field is ever
+// added or reordered, the byte view would silently no longer match what the kernel
+// writes into the command stream (and what `parse` advances past) — fail here
+// instead.
+const _: () = assert!(std::mem::size_of::<BinderTransactionData>() == TXN_SIZE);
+const _: () = assert!(std::mem::size_of::<FlatBinderObject>() == 24);
+const _: () = assert!(std::mem::size_of::<BinderWriteRead>() == 48);
 fn push_u32(v: &mut Vec<u8>, x: u32) {
     v.extend_from_slice(&x.to_ne_bytes());
 }
@@ -147,6 +166,8 @@ struct Binder {
 
 impl Drop for Binder {
     fn drop(&mut self) {
+        // SAFETY: both handles were created by this struct (`open`/`mmap`) and are
+        // owned here; nothing else holds or uses them after `drop`.
         unsafe {
             libc::munmap(self.map as *mut c_void, self.map_len);
             libc::close(self.fd);
@@ -157,14 +178,20 @@ impl Drop for Binder {
 impl Binder {
     fn open(path: &str) -> Result<Binder, String> {
         let cpath = std::ffi::CString::new(path).map_err(|_| "bad path".to_string())?;
+        // SAFETY: `cpath` is a NUL-terminated path that outlives the call; the
+        // result is a fresh fd we own (negative is handled below).
         let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(format!("open {path}: {}", std::io::Error::last_os_error()));
         }
         let size = 256 * 1024;
+        // SAFETY: a read-only private mapping of the binder fd, which is what the
+        // protocol requires (binder data is read through the mapping); MAP_FAILED is
+        // checked and the fd closed on failure.
         let map = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_PRIVATE, fd, 0) };
         if map == libc::MAP_FAILED {
             let e = std::io::Error::last_os_error();
+            // SAFETY: `fd` was opened above and is not stored anywhere yet.
             unsafe { libc::close(fd) };
             return Err(format!("mmap: {e}"));
         }
@@ -179,6 +206,10 @@ impl Binder {
             read_buffer: if read { self.rd.as_mut_ptr() as u64 } else { 0 },
             ..Default::default()
         };
+        // SAFETY: `bwr` is a live, correctly-sized `binder_write_read` whose
+        // `write_buffer`/`read_buffer` point into the caller's `write` slice and
+        // `self.rd` (both alive for the call) with matching sizes; the kernel reads
+        // and writes exactly those ranges. `self.fd` is a live binder fd.
         let rc = unsafe { libc::ioctl(self.fd, BINDER_WRITE_READ as _, &mut bwr as *mut _) };
         if rc < 0 {
             return Err(format!("{}", std::io::Error::last_os_error()));
@@ -224,10 +255,20 @@ impl Binder {
                 if off + TXN_SIZE > buf.len() {
                     return Err("short transaction in read buffer".into());
                 }
+                // SAFETY: `off + TXN_SIZE <= buf.len()` was just checked, and
+                // `read_unaligned` does not require alignment (the kernel packs the
+                // command stream at 4-byte granularity).
                 let t: BinderTransactionData =
                     unsafe { std::ptr::read_unaligned(buf[off..].as_ptr() as *const BinderTransactionData) };
                 off += TXN_SIZE;
                 if t.data_size > 0 && t.data_buffer != 0 {
+                    // SAFETY: `data_buffer` was written by the kernel as an address
+                    // inside this process' binder mapping (`Binder::open` maps 256 KiB
+                    // read-only, and the kernel never reports a transaction buffer
+                    // outside it) with `data_size` valid bytes; non-null is checked
+                    // just above. The copy is taken immediately, so the slice does not
+                    // outlive the kernel's ownership of the buffer (which is released
+                    // by BC_FREE_BUFFER below).
                     let data = unsafe {
                         std::slice::from_raw_parts(t.data_buffer as *const u8, t.data_size as usize).to_vec()
                     };
@@ -235,10 +276,18 @@ impl Binder {
                     // it or every later transaction to it is "invalid handle".
                     if t.offsets_size > 0 && t.data_offsets != 0 {
                         let nn = (t.offsets_size / 8) as usize;
+                        // SAFETY: same kernel contract as `data_buffer` — the offsets
+                        // array lives in the same mapped buffer, is `offsets_size` bytes
+                        // (a multiple of 8), and the kernel filled it during the ioctl
+                        // that just returned.
                         let offs = unsafe { std::slice::from_raw_parts(t.data_offsets as *const u64, nn) };
                         for &o in offs {
                             let o = o as usize;
                             if o + 24 <= data.len() {
+                                // SAFETY: the offset's object was copied into `data`
+                                // above, and `o + 24 <= data.len()` keeps this read
+                                // inside it; `FlatBinderObject` is 24 bytes (asserted
+                                // above).
                                 let obj: FlatBinderObject = unsafe {
                                     std::ptr::read_unaligned(data[o..].as_ptr() as *const FlatBinderObject)
                                 };
@@ -302,6 +351,9 @@ impl Binder {
         if reply.len() < 28 {
             return Err(format!("short reply ({} bytes)", reply.len()));
         }
+        // SAFETY: `reply` is at least 28 bytes (checked above), the object is 24
+        // bytes (asserted), and `read_unaligned` skips the alignment requirement; the
+        // read stays inside `reply`.
         let obj: FlatBinderObject =
             unsafe { std::ptr::read_unaligned(reply[4..].as_ptr() as *const FlatBinderObject) };
         if obj.kind != BINDER_TYPE_HANDLE {
@@ -314,6 +366,7 @@ impl Binder {
     /// Write-only (SF sends no reply), pipe read concurrently, ended by an idle timeout.
     fn dump(&mut self, handle: u32, args: &[&str]) -> Result<String, String> {
         let mut fds = [0i32; 2];
+        // SAFETY: `fds` is a live 2-element array, which is what `pipe(2)` writes.
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(format!("pipe: {}", std::io::Error::last_os_error()));
         }
@@ -323,8 +376,11 @@ impl Binder {
             let mut buf = [0u8; 65536];
             loop {
                 let mut pfd = libc::pollfd { fd: rfd, events: libc::POLLIN, revents: 0 };
+                // SAFETY: one valid `pollfd`, count 1.
                 let pr = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 1000) };
                 if pr > 0 && (pfd.revents & libc::POLLIN) != 0 {
+                    // SAFETY: `buf` is a live 65536-byte array and the length passed
+                    // is its own; `poll` above said this fd is readable.
                     let n = unsafe { libc::read(rfd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
                     if n <= 0 {
                         break;
@@ -334,6 +390,8 @@ impl Binder {
                     break; // 1 s of silence (or EOF) ends the dump
                 }
             }
+            // SAFETY: this thread owns the read end after the split above; the write
+            // end is closed by the sender, so the reader never needs it.
             unsafe { libc::close(rfd) };
             out
         });
@@ -363,6 +421,8 @@ impl Binder {
         };
         wb.extend_from_slice(as_bytes(&txn));
         let sent = self.bwr(&wb, false);
+        // SAFETY: the write end is owned by this thread (the reader owns the read
+        // end); closing it makes the reader see EOF after the peer's last write.
         unsafe { libc::close(wfd) };
         let out = reader.join().map_err(|_| "reader panicked".to_string())?;
         sent?;
@@ -380,6 +440,9 @@ impl SfClient {
     pub fn connect() -> Result<SfClient, String> {
         let mut binder = Binder::open("/dev/binder")?;
         let mut ver: i32 = 0;
+        // SAFETY: `ver` is a live i32 the kernel writes BINDER_VERSION into; the fd
+        // is a live binder fd. The version is not used — it is read to match the
+        // probe's syscall shape.
         unsafe { libc::ioctl(binder.fd, BINDER_VERSION as _, &mut ver as *mut i32) };
         // The legacy registration answers `dump`; SurfaceFlingerAIDL does not.
         let sf_handle = binder.get_service("SurfaceFlinger")?;
@@ -499,6 +562,8 @@ fn set_last_fps(fps: f64) {
 /// `CLOCK_MONOTONIC` in nanoseconds — the clock SF's timestamps are on.
 pub fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid writable out-parameter on the stack; a failure is
+    // reported as 0 rather than assumed away.
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
         return 0;
     }

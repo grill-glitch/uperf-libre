@@ -166,6 +166,8 @@ mod tests {
     #[test]
     fn a_write_refusal_outranks_a_successful_open() {
         use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments and cannot fail; the value is only
+        // compared against 0 to decide which branch of the test to run.
         if unsafe { libc::geteuid() } != 0 {
             // Without CAP_DAC_OVERRIDE the open itself fails, which is also a correct
             // "not writeable" verdict; either way the probe must say no.

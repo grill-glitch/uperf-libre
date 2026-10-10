@@ -38,6 +38,8 @@ impl Inotify {
     pub fn new() -> io::Result<Self> {
         // CLOEXEC: never leak the fd into the processes the applier spawns.
         // NONBLOCK: combined with poll(2) so a stop flag can interrupt the wait.
+        // SAFETY: `inotify_init1` takes only flag bits and returns a new fd (owned
+        // by this struct from here on) or -1.
         let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -76,6 +78,8 @@ impl Inotify {
                 // plus continuous storage writes. Content changes to the files we
                 // actually care about are covered by their own watches.
                 let dmask = libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_DELETE;
+                // SAFETY: `dc` is a NUL-terminated directory path that outlives the
+                // call and `self.fd` is the live inotify fd owned by this struct.
                 let dwd = unsafe { libc::inotify_add_watch(self.fd, dc.as_ptr(), dmask) };
                 if dwd >= 0 {
                     self.paths.insert(dwd, dir.to_path_buf());
@@ -93,6 +97,9 @@ impl Inotify {
             | libc::IN_MOVE_SELF;
         let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        // SAFETY: `c` is a NUL-terminated path alive for the call; `self.fd` is the
+        // live inotify fd. A missing file (ENOENT) is a normal outcome here and is
+        // handled below, not treated as a failure.
         let wd = unsafe { libc::inotify_add_watch(self.fd, c.as_ptr(), mask) };
         if wd < 0 {
             let e = io::Error::last_os_error();

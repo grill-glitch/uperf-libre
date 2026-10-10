@@ -4,6 +4,9 @@
 //! on-device `uperf-core`). This crate only adds the CLI-facing `plan` emitter
 //! and the `warn` reporter.
 
+// Proved by the M12 `unsafe` audit: no `unsafe` occurrence in this crate.
+#![forbid(unsafe_code)]
+
 pub mod plan;
 pub mod warn;
 

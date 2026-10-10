@@ -158,23 +158,16 @@ pub fn branch_target(insn: u32, at: usize) -> Option<usize> {
 pub unsafe fn read_insns(addr: usize, n: usize) -> Vec<u32> {
     let mut v = Vec::with_capacity(n);
     for i in 0..n {
-        v.push(core::ptr::read_unaligned((addr as *const u32).add(i)));
+        // SAFETY: contract — `addr` is readable for `n * 4` bytes; `add` stays
+        // inside that range, and `read_unaligned` needs no alignment.
+        v.push(unsafe { core::ptr::read_unaligned((addr as *const u32).add(i)) });
     }
     v
-}
-
-/// Read `n` 32-bit words from `addr` (data, not necessarily code).
-///
-/// # Safety
-/// `addr` must point at readable memory.
-pub unsafe fn read_words(addr: usize, n: usize) -> Vec<u32> {
-    read_insns(addr, n)
 }
 
 extern "C" {
     fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
     fn __errno() -> *mut i32;
-    fn sysconf(name: i32) -> i64;
     #[cfg(target_arch = "aarch64")]
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
     #[cfg(target_arch = "aarch64")]
@@ -185,11 +178,15 @@ const RTLD_DEFAULT: *mut c_void = core::ptr::null_mut();
 const _SC_PAGESIZE: i32 = 39;
 
 pub fn page_size() -> usize {
+    // SAFETY: `sysconf` with a valid name takes no pointers and reports the page
+    // size; a non-positive answer is handled below.
     let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if p <= 0 { 4096 } else { p as usize }
 }
 
 fn errno() -> i32 {
+    // SAFETY: bionic's `__errno()` returns a pointer to this thread's errno slot,
+    // which is always writable and never null.
     unsafe { *__errno() }
 }
 
@@ -320,14 +317,18 @@ mod arch {
 
     /// Try one anonymous mapping shape; report whether it succeeded.
     unsafe fn probe(len: usize, prot: i32) -> (bool, i32) {
-        let p = mmap(
-            core::ptr::null_mut(),
-            len,
-            prot,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1,
-            0,
-        );
+        // SAFETY: an anonymous private mapping of `len` bytes with no fd; the only
+        // failure mode is an errno, which is reported, not assumed away.
+        let p = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                len,
+                prot,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
         if p as isize == -1 {
             (false, errno())
         } else {
@@ -340,6 +341,35 @@ mod arch {
     /// `execmod` for mprotecting a file-backed code page), so the live path is
     /// GOT rewriting in `got.rs`. Kept because the code and its trampoline
     /// layout are the reference for what an inline patch would have to do.
+    ///
+    /// # Unreachable, and not in the shipped library
+    ///
+    /// Established by the R-2 audit (`UNSAFE_AUDIT_REPORT.md` §R-2 / §11); re-verify
+    /// with the commands recorded there before relying on it.
+    ///
+    /// * **No caller anywhere in the workspace** — not a call, not a function
+    ///   pointer, not a table entry, not an example, test, or build script. `mod arch`
+    ///   is private and nothing in this file is `#[no_mangle]`/`#[export_name]`, so
+    ///   the linker has no reason to keep it either.
+    /// * `#[allow(dead_code)]` only silences the lint — **the function is still
+    ///   compiled** for `aarch64`. What removes it is LTO + `--gc-sections` at link
+    ///   time, measured three ways on the release cdylib: no `install_inline` /
+    ///   `probe` / `flush_code` symbol in the *unstripped* build, none of this
+    ///   function's three `dbg_log` literals in any artifact (including the
+    ///   checked-in one), and deleting the whole function yields a **byte-identical**
+    ///   `libsfanalysis_rs.so` (same SHA-256, same size).
+    ///
+    /// So this function cannot affect production behaviour — but that is a property of
+    /// the *build*, not a guarantee about the code: if it is ever called again, it
+    /// becomes the one place in this crate that asks for a writable **and**
+    /// executable mapping (`pub fn` here → never exported, so a future caller inside
+    /// the crate is all it takes). The one-shot probe below is what established which
+    /// shapes this device actually allows: of the three anonymous shapes the RW and
+    /// RX ones succeed and the **RWX** one is refused (`execmem`), and the separate
+    /// `mprotect`-a-file-backed-code-page step further down is refused by `execmod`
+    /// (the `libc_relro_page` probe shows only that a *data* page can be made RW,
+    /// which is all the live GOT path in `got.rs` needs). Believe a successful
+    /// `mmap`/`mprotect` here only after checking it on the actual target.
     #[allow(dead_code)]
     pub fn install_inline(name: &str) -> Result<Hook, HookError> {
         let entry = resolve_entry(name)?;
@@ -422,17 +452,23 @@ mod arch {
             let mut p = start & !(LINE - 1);
             let end = start + len;
             while p < end {
-                core::arch::asm!(
-                    "dc cvau, {0}",
-                    "dsb ish",
-                    "ic ivau, {0}",
-                    "dsb ish",
-                    in(reg) p,
-                    options(nostack, preserves_flags)
-                );
+                // SAFETY: cache maintenance by VA on an address inside a mapping we
+                // own; `dc cvau`/`ic ivau` take an address in a register and have no
+                // memory operand, so they cannot fault on their own.
+                unsafe {
+                    core::arch::asm!(
+                        "dc cvau, {0}",
+                        "dsb ish",
+                        "ic ivau, {0}",
+                        "dsb ish",
+                        in(reg) p,
+                        options(nostack, preserves_flags)
+                    )
+                };
                 p += LINE;
             }
-            core::arch::asm!("isb", options(nostack, preserves_flags));
+            // SAFETY: instruction synchronisation barrier, no operands.
+            unsafe { core::arch::asm!("isb", options(nostack, preserves_flags)) };
         }
 
         unsafe { flush_code(tramp, 32) };
@@ -545,7 +581,8 @@ mod arch {
 }
 
 // The live entry point is the file-scope `install` above (GOT rewriting).
-// `arch::install_inline` is retained only as reference.
+// `arch::install_inline` is retained only as reference: it is compiled but not
+// linked into the shipped library (see its own doc comment for the R-2 evidence).
 
 #[cfg(test)]
 mod tests {
