@@ -12,6 +12,9 @@ libc = "0.2"
 once_cell = "1"
 parking_lot = "0.12"
 thiserror = "1"
+# ⑧ recording channel: raw DEFLATE for the session store. `rust_backend` is pure Rust,
+# so it cross-compiles to aarch64 with no C toolchain involvement.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 uperf-config = { path = "../uperf-config" }
 
