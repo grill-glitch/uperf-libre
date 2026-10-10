@@ -125,6 +125,10 @@ unlock_limit() {
 
 print_banner
 
+# ⑩: refuse an unsupported ABI before touching anything. Non-zero here aborts the
+# install (customize.sh: `[ "$?" != "0" ] && abort`).
+require_aarch64 || abort "! uperf-libre: this device is $(module_abi); see the reason above."
+
 install_uperf
 # unlock_limit
 fix_module_prop

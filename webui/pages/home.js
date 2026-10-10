@@ -145,6 +145,13 @@ export function render(data, config, error) {
         [getString('label_android'), [data['android.release'], data['android.sdk'] ? `API ${data['android.sdk']}` : ''].filter(Boolean).join(' · ')],
         [getString('label_kernel'), data['kernel.release']],
         [getString('label_selinux'), data['selinux']],
+        // ⑩: the module ships arm64-only binaries, so say it rather than let a user
+        // wonder why nothing runs.
+        [getString('label_abi'), data['device.abi']
+            ? (data['module.arch_supported'] === '1'
+                ? data['device.abi']
+                : `${data['device.abi']} (${getString('value_unsupported')})`)
+            : ''],
     ]);
 
     const module = document.getElementById('module-card');
