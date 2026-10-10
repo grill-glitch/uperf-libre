@@ -23,10 +23,18 @@
 lock_val() {
     for p in $2; do
         if [ -f "$p" ]; then
-            chown root:root "$p"
-            chmod 0666 "$p"
-            echo "$1" >"$p"
-            chmod 0444 "$p"
+            # `chown`/`chmod` are best-effort. On `/proc/sys` nodes the ksu domain cannot
+            # change ownership (EACCES) while the write itself works, and on
+            # `qcom-cpufreq-hw` the driver rejects the write regardless of the mode — so
+            # the noise read as a failure when it was neither. What matters is the value,
+            # and a failed write now says so once. The 0444 at the end still marks the
+            # node as ours.
+            chown root:root "$p" 2>/dev/null
+            chmod 0666 "$p" 2>/dev/null
+            if ! echo "$1" >"$p" 2>/dev/null; then
+                echo "uperf: '$p' rejected $1 (kernel-locked; leaving the current value)"
+            fi
+            chmod 0444 "$p" 2>/dev/null
         fi
     done
 }

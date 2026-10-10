@@ -42,6 +42,15 @@ eq() {
     if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1', want '$2')"; fi
 }
 state_of() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1; }
+wait_for() { # wait_for <file> <key> <value> <seconds>
+    local i=0
+    while [ "$i" -lt "$4" ]; do
+        [ "$(state_of "$1" "$2")" = "$3" ] && return 0
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
 alive() { kill -0 "$1" 2>/dev/null; }
 has_line() {
     if grep -q "$2" "$1" 2>/dev/null; then ok "$3"; else bad "$3"; fi
@@ -112,6 +121,10 @@ if [ -n "$WD_PID" ]; then
     set -- ${line##*) }
     eq "${20}" "$WD_START" "the lock's start_ticks match the live process"
 fi
+
+# The watchdog writes `starting` and only `running` after its first healthy sample, so
+# a run that begins seconds after a restart must not be judged mid-bring-up.
+wait_for "$U/uperf_watchdog.state" state running 20
 
 # This is the property `setsid` exists for: it outlived the shell service.sh ran it
 # from, and it is *sampling* — a stale file from the previous boot would have the old

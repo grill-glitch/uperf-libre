@@ -462,7 +462,9 @@ check_contains "$WORK/logcap/small.out" "size=50" "and is left byte-exact"
 # ------------------------------------------------------- case 6: syntax + wiring
 
 echo "== case 6: scripts parse and the module wiring is present"
-for s in "$WATCHDOG" "$BASE/magisk/script/libuperf.sh" "$BASE/magisk/uninstall.sh" "$BASE/magisk/script/webui.sh"; do
+for s in "$WATCHDOG" "$BASE/magisk/script/libuperf.sh" "$BASE/magisk/script/libcommon.sh" \
+    "$BASE/magisk/script/webui.sh" "$BASE/magisk/customize.sh" \
+    "$BASE/magisk/uninstall.sh" "$BASE/scripts/cpufreq-write-probe.sh"; do
     sh -n "$s" 2>/dev/null && c=0 || c=1
     check "sh -n $(basename "$s")" "$c"
 done
