@@ -122,6 +122,12 @@ print_status() {
     echo "watchdog.state=$wstate"
     echo "watchdog.restarts=$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^restarts=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
     echo "watchdog.pid=$wpid"
+    # The frame source (M8) is a second thing that can be gone: `sf_state=injected` means
+    # the mapping is ours, `healthy` that it was already there, `gave-up` that the failure
+    # budget is spent. Only meaningful with `UPERF_SF_INJECT=1`; `off` otherwise.
+    echo "watchdog.sf_state=$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^sf_state=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
+    echo "watchdog.sf_injects=$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^sf_injects=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
+    echo "watchdog.sf_fails=$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^sf_fails=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
 
     local log="$USER_PATH/uperf_log.txt"
     echo "log.path=$log"
