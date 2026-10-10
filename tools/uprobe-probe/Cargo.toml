@@ -1,0 +1,17 @@
+[package]
+name = "uprobe-probe"
+version = "0.0.1"
+edition = "2021"
+# Standalone on purpose: NOT a member of rust/ (the workspace members are listed
+# explicitly). It proves the per-PID counting primitive for the eBPF/uprobe frame leg.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "uprobe-count"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
