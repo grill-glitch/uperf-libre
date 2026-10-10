@@ -90,6 +90,8 @@
     <string name="state_stopped">stopped</string>
     <string name="label_frame_source">Frame source</string>
     <string name="label_frame_injected">Injections</string>
+    <string name="label_frame_leg">Frame leg</string>
+    <string name="label_frame_fps">Measured FPS</string>
     <string name="label_frame_failed">Failed injections</string>
     <string name="state_injected">injected (ours)</string>
     <string name="state_healthy">already present</string>

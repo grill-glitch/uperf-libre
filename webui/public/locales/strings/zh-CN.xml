@@ -90,6 +90,8 @@
     <string name="state_stopped">已停止</string>
     <string name="label_frame_source">帧源</string>
     <string name="label_frame_injected">注入次数</string>
+    <string name="label_frame_leg">帧源分支</string>
+    <string name="label_frame_fps">实测 FPS</string>
     <string name="label_frame_failed">注入失败</string>
     <string name="state_injected">已注入（我们放的）</string>
     <string name="state_healthy">本来就在</string>
