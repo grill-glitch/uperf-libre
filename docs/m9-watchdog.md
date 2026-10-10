@@ -79,7 +79,11 @@ Started by `uperf_start` (last, after the 2 s daemon bring-up), stopped by
    the same `uperf_restore_governors` the stop script uses — it only touches a
    policy while that policy reads `userspace`, and never invents a value. The
    live `scaling_governor` value, not a recorded one, is the authority on whether
-   a takeover is in effect.
+   a takeover is in effect. The same step now also runs `uperf_restore_sysfs`
+   over the daemon's write ledger (`<USER_PATH>/sysfs_orig.txt`, AGENT §11 M11):
+   the dead-man path covers both halves of what a killed daemon may have left
+   behind, under one contract — a path with no recorded original is reported,
+   never invented — with the two logged as `restore:` and `restore-sysfs:`.
 4. **Restart**, at most `UPERF_WATCHDOG_MAX_RESTARTS` times per boot (default 3),
    via the normal `uperf_start` (config self-heal, cgroup placement, log
    rotation) with `UPERF_WATCHDOG_SUPPRESS=1` so no nested watchdog is spawned.
