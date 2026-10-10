@@ -40,6 +40,14 @@ on_remove() {
     # Stop the daemon and undo the userspace-governor takeover before the module
     # (and its binary) disappears. Without this a running daemon keeps the
     # policies pinned, and after the module is gone nothing can restore them.
+    #
+    # The M9 watchdog goes first and by pid: it is a plain shell, so `killall uperf`
+    # cannot see it, and one still running after the module files are gone would
+    # keep trying to restart a daemon whose binary no longer exists.
+    if [ -f "$MODDIR/flag/uperf_watchdog.lock/owner" ]; then
+        kill -TERM "$(cut -d: -f1 "$MODDIR/flag/uperf_watchdog.lock/owner" 2>/dev/null)" 2>/dev/null
+        rm -rf "$MODDIR/flag/uperf_watchdog.lock"
+    fi
     . $MODDIR/script/libuperf.sh 2>/dev/null || . $MODDIR/libuperf.sh 2>/dev/null
     uperf_stop 2>/dev/null || killall uperf 2>/dev/null
     uperf_restore_governors 2>/dev/null

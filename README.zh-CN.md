@@ -50,6 +50,7 @@ uperf-libre 是同样的对外表面，重写实现：
 - **能耗模型驱动的 OPP 选择**。每个 cluster 的 power / cost 曲线在三个 cluster × 25 个 OPP 上与上游 printout 的拟合误差 <0.0015；然后在共享 PL1/PL2 池下做最优 OPP 选择。
 - **Devfreq 与 LLCC boost** —— 对 DDR-bandwidth、L3-latency、CPU-LLCC-bandwidth、UFS devfreq 调速器的 `min_freq` / `max_freq` 写入。
 - **cgroup、cpuset、devfreq 节点去重写入** —— 相同值重复写入会被跳过，从而把守护进程自身的 wakeup 开销压到最低。
+- **外置看门狗 + 死手开关（M9）** —— `uperf_start` 会拉起一个 shell 守护：它用 `/proc/<pid>/exe` 识别 daemon（dfps 会把 supervisor 和 worker 的进程名都改写成 `uperf`，因此进程名与 pid 文件都不可信），并针对进程内无法自救的两种退出动手：`SIGKILL`，以及 `panic = "abort"` 下的 Rust panic。它会先 SIGTERM 收尾、恢复 daemon 记录过的 governor、在一个 per-boot 预算内重启 daemon；预算用尽后就让系统 governor 接管，而不是留下一个被钉死的频点。机器可读状态见 `<USER_PATH>/uperf.state`（daemon 写）与 `<USER_PATH>/uperf_watchdog.state`（看门狗写）；详见 [`docs/m9-watchdog.md`](./docs/m9-watchdog.md)。
 - **Cluster 亲和性 / 动态 stune 风格绑定** —— 前台 App 的 UI 线程迁到大核，idle 与后台工作被排除在大核外。
 
 ### Hint 状态机
@@ -540,7 +541,8 @@ Magisk 模块打包命令沿用上游约定；`build.sh pack` 产出一个 Kerne
 <解压目录>/bin/uperf /sdcard/Android/yc/uperf/uperf.json -o /sdcard/Android/yc/uperf/uperf_log.txt
 ```
 
-（`script/initsvc.sh` 是开机入口，做同样的事并额外完成平台修正。）
+（`script/initsvc.sh` 是开机入口，做同样的事并额外完成平台修正。M9 看门狗属于模块的
+`uperf_start`/`uperf_stop` 路径，手工启动的 daemon 没有监督者 —— 想要死手开关就用模块。）
 
 ### 验证
 
@@ -551,13 +553,26 @@ cat /sdcard/Android/yc/uperf/uperf_log.txt | tail
 echo powersave > /sdcard/Android/yc/uperf/cur_powermode   # 热重载
 ```
 
-优雅停止（唯一安全的路径；SIGKILL 会让 userspace 调速器停在最后一次 `scaling_setspeed` 的频点上）：
+优雅停止 —— 模块自己的路径：先停看门狗（否则它会把这次停止当成崩溃、把 daemon 再拉起来），再停 daemon，最后恢复：
 
 ```sh
 killall uperf
 ```
 
-如果设备因为崩溃卡在 `userspace`，恢复：
+硬杀不再让设备卡死。看门狗会发现在某个 policy 仍读作 `userspace` 时 daemon 已经不在，于是恢复记录过的原 governor，并在一个 per-boot 预算内重启 daemon；预算用尽就让系统 governor 接管并写明原因。用状态文件观察：
+
+```sh
+cat <USER_PATH>/uperf.state            # daemon 写的 state / takeover / armed / policies
+cat <USER_PATH>/uperf_watchdog.state   # 重启次数、最后一次动作及原因
+tail <USER_PATH>/uperf_watchdog.log    # 看门狗的每一次判定
+```
+
+同一份状态也通过 KernelSU WebUI / adb 的 `sh <module>/script/webui.sh status` 暴露：
+`daemon.state`、`daemon.armed`、`watchdog.state`、`watchdog.restarts`、`watchdog.pid`。
+
+`uperf.state` 里残留 `state=running` 但没有存活进程，就是被杀的标志；正常停止会写 `state=stopped`。`UPERF_WATCHDOG=0` 可关闭看门狗（排查崩溃循环时有用）。
+
+如果设备在手边没有看门狗的情况下卡在 `userspace`（手工删了模块、或关掉了看门狗），恢复：
 
 ```sh
 for d in /sys/devices/system/cpu/cpufreq/policy*; do
@@ -565,7 +580,7 @@ for d in /sys/devices/system/cpu/cpufreq/policy*; do
 done
 ```
 
-启动脚本在启动时把替换的 governor 记到 `<USER_PATH>/orig_governor.txt`，所以正常 `killall uperf` 会自动恢复 `schedutil`。
+启动脚本在启动时把替换的 governor 记到 `<USER_PATH>/orig_governor.txt`，且**从不臆造**值：没有记录的 policy 会被原样留下并如实报告。因此正常 `killall uperf`、以及看门狗的死手路径，都会自动恢复 `schedutil`。
 
 ## 平台覆盖
 
@@ -607,6 +622,7 @@ CPU 调频器通过将每个 `cpufreq` policy 的 `scaling_governor` 切到 `use
 ## 状态
 
 - **稳定**：上游基础参考（25 个 OPP 上与 printout 拟合误差 <0.0015）、能耗模型、PL1/PL2 池算术、scene → sysfs 写入流水线，以及基于 inotify 的 `cur_powermode.txt` / `perapp_powermode.txt` 热重载。
+- **守护（M9）**：主机侧已验证 —— `cargo test --release`（211 个测试）与 `sh scripts/test_watchdog_host.sh`（48 条断言、8 个用例，跑的是真实脚本）。看门狗的真机验证仍未完成：`/proc` 身份判据、`/sdcard` 上的 rename、以及真实 daemon 的收尾。见 [`docs/m9-watchdog.md`](./docs/m9-watchdog.md) §5。
 - **尽力而为**：延迟平滑（每采样最多一步，除非 predict 触发 —— 上游描述的是连续共享延迟预算，离散近似无法做到逐节拍匹配），以及 guideCap / limitEfficiency 的容量裁剪表（不可直接从闭源二进制观测）。
 - **真机验证**：alioth（crDroid Android 16 / KernelSU Next 3.3.0）与 polaris（LineageOS 22.2 working；Android 16 / 4.19 内核 —— axion 配置 + `KERNEL_CLANG_TRIPLE`）。
 

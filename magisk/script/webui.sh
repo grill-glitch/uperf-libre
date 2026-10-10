@@ -33,6 +33,12 @@ BASEDIR="$(cd "$(dirname "$0")" && pwd)"
 # is sourced explicitly to keep the two independent of the caller's cwd.
 . "$BASEDIR/libuperf.sh"
 
+# Host-test seams, defaulting to the device paths (`scripts/test_watchdog_host.sh`
+# exercises `status` without a phone). Placed before GOVERNOR_STATE/PRESET_FILE so
+# everything derived from them follows the override too.
+USER_PATH="${UPERF_WEBUI_USER_PATH:-$USER_PATH}"
+FLAG_PATH="${UPERF_WEBUI_FLAG_PATH:-$FLAG_PATH}"
+
 GOVERNOR_STATE="$USER_PATH/orig_governor.txt"
 PRESET_FILE="$USER_PATH/cur_powermode.txt"
 
@@ -99,6 +105,23 @@ print_status() {
     echo "governor.takeover=$armed"
     echo "governor.policies=$govs"
     echo "governor.recorded=$([ -f "$GOVERNOR_STATE" ] && tr '\n' ';' < "$GOVERNOR_STATE" || echo '')"
+
+    # M9: the two status files, plus the watchdog's own pid from the owner lock.
+    # `daemon.state=running` with `daemon.count=0` is the signature of a kill (the
+    # watchdog reacts to exactly that); `watchdog.state=gave-up` means the restart
+    # budget was spent and the platform governor is in charge on purpose.
+    local dstate wstate wpid=""
+    dstate="$([ -f "$USER_PATH/uperf.state" ] && sed -n 's/^state=//p' "$USER_PATH/uperf.state" 2>/dev/null | head -n 1)"
+    wstate="$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^state=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
+    case "$wstate" in
+    "" | stopped) ;;
+    *) wpid="$(uperf_watchdog_pid)" ;;
+    esac
+    echo "daemon.state=$dstate"
+    echo "daemon.armed=$([ -f "$USER_PATH/uperf.state" ] && sed -n 's/^armed=//p' "$USER_PATH/uperf.state" 2>/dev/null | head -n 1)"
+    echo "watchdog.state=$wstate"
+    echo "watchdog.restarts=$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^restarts=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
+    echo "watchdog.pid=$wpid"
 
     local log="$USER_PATH/uperf_log.txt"
     echo "log.path=$log"

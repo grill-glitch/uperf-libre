@@ -86,6 +86,17 @@ Below is what the daemon does on every tick; the per-feature details are in
 - **cgroup, cpuset, and devfreq knob writes** with dedup — repeated writes
   with identical values are skipped to keep the daemon's own wakeup overhead
   low.
+- **External watchdog + dead-man switch (M9)** — a shell supervisor started by
+  `uperf_start` identifies the daemon from `/proc/<pid>/exe` (dfps renames both
+  the supervisor and its worker to plain `uperf`, so names and pid files are
+  useless), and reacts to the two exits no in-process path survives: `SIGKILL`
+  and a Rust panic under `panic = "abort"`. It retires the leftovers with
+  SIGTERM, restores the governors the daemon had recorded, restarts the daemon
+  within a per-boot budget, and once that budget is spent leaves the platform
+  governor in charge instead of a pinned frequency. Machine-readable state in
+  `<USER_PATH>/uperf.state` (from the daemon) and
+  `<USER_PATH>/uperf_watchdog.state` (from the watchdog); see
+  [`docs/m9-watchdog.md`](./docs/m9-watchdog.md).
 - **Cluster affinity / dynamic-stune-style binding** — UI threads of the
   foreground app are moved to big cores; idle and background work is
   restricted from them.
@@ -172,7 +183,10 @@ changes anything. Start the daemon the same way the module does:
 <unpacked>/bin/uperf /sdcard/Android/yc/uperf/uperf.json -o /sdcard/Android/yc/uperf/uperf_log.txt
 ```
 
-(`script/initsvc.sh` is the boot-time entry and does the same plus the platform fixups.)
+(`script/initsvc.sh` is the boot-time entry and does the same plus the platform
+fixups. The M9 watchdog is part of the module's `uperf_start`/`uperf_stop` path, so
+a hand-launched daemon has no supervisor — use the module if you want the
+dead-man switch.)
 
 ## Verify
 
@@ -183,14 +197,31 @@ cat /sdcard/Android/yc/uperf/uperf_log.txt | tail
 echo powersave > /sdcard/Android/yc/uperf/cur_powermode   # hot reload
 ```
 
-Graceful stop (the only safe path; SIGKILL leaves the userspace governor
-armed at the last `scaling_setspeed` value):
+Graceful stop — the module's own path. It stops the watchdog first (so a
+supervisor cannot mistake the stop for a crash and restart the daemon), then the
+daemon, then restores:
 
 ```sh
 killall uperf
 ```
 
-If the device is ever left in `userspace` after a crash, restore with:
+A hard kill no longer strands the device. The watchdog notices that the daemon is
+gone while a policy still reads `userspace`, restores the recorded originals, and
+restarts the daemon within a per-boot budget; when the budget is spent it leaves
+the platform governor in charge and says so. Watch it from the status files:
+
+```sh
+cat <USER_PATH>/uperf.state            # state / takeover / armed / policies, written by the daemon
+cat <USER_PATH>/uperf_watchdog.state   # restart count, last action, and why
+tail <USER_PATH>/uperf_watchdog.log    # every decision the watchdog made
+```
+
+A stale `state=running` in `uperf.state` with no live daemon is the signature of a
+kill; a clean stop writes `state=stopped`. `UPERF_WATCHDOG=0` disables the
+watchdog (useful while bisecting a crash loop).
+
+If the device is ever left in `userspace` with no watchdog around (module removed
+by hand, watchdog disabled), restore with:
 
 ```sh
 for d in /sys/devices/system/cpu/cpufreq/policy*; do
@@ -199,8 +230,9 @@ done
 ```
 
 The stop script records what it replaced at arm time under
-`<USER_PATH>/orig_governor.txt`, so a `killall uperf` that succeeds will
-restore `schedutil` for you.
+`<USER_PATH>/orig_governor.txt` — and never invents a value: a policy with no
+recorded original is left alone and reported. A `killall uperf` that succeeds, or
+the watchdog's dead-man path, therefore restores `schedutil` for you.
 
 ## Hardware coverage
 
@@ -258,6 +290,11 @@ see [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md) and the
   reproducible to <0.0015 against the upstream printout), the
   PL1/PL2 pool arithmetic, the scene → sysfs writer pipeline, and the
   inotify-based hot reload of `cur_powermode.txt` / `perapp_powermode.txt`.
+- **Supervision (M9)**: host-verified — `cargo test --release` (211 tests) and
+  `sh scripts/test_watchdog_host.sh` (48 assertions, 8 cases against the real
+  script). Device verification of the watchdog is still pending: the `/proc`
+  identity argument, the `/sdcard` rename, and the teardown of a real daemon. See
+  [`docs/m9-watchdog.md`](./docs/m9-watchdog.md) §5.
 - **Best-effort**: latency smoothing (one OPP per sample unless the
   predict branch fires — upstream describes a continuous shared latency
   budget whose discrete approximation we do not claim to match tick-for-tick),
