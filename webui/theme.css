@@ -50,12 +50,19 @@
         --md-sys-color-primary-container: var(--primaryContainer, #4F378B);
         --md-sys-color-on-primary-container: var(--onPrimaryContainer, #EADDFF);
         --md-sys-color-secondary: var(--secondary, #CCC2DC);
+        /* on-secondary / on-tertiary / on-error were missing from this block, so they kept
+           their light-scheme values. `on-error` is the one that mattered: the dark scheme
+           pairs error #F2B8B5 with a *dark* on-error, and white on that pink is
+           unreadable. Values are the Material 3 dark baseline. */
+        --md-sys-color-on-secondary: var(--onSecondary, #332D41);
         --md-sys-color-secondary-container: var(--secondaryContainer, #4A4458);
         --md-sys-color-on-secondary-container: var(--on-secondaryContainer, #E8DEF8);
         --md-sys-color-tertiary: var(--tertiary, #EFB8C8);
         --md-sys-color-tertiary-container: var(--tertiaryContainer, #633B48);
         --md-sys-color-on-tertiary-container: var(--onTertiaryContainer, #FFD8E4);
+        --md-sys-color-on-tertiary: var(--onTertiary, #492532);
         --md-sys-color-error: var(--error, #F2B8B5);
+        --md-sys-color-on-error: var(--onError, #601410);
         --md-sys-color-error-container: var(--errorContainer, #8C1D18);
         --md-sys-color-on-error-container: var(--onErrorContainer, #F9DEDC);
         --md-sys-color-background: var(--background, #141218);

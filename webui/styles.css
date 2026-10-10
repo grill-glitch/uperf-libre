@@ -202,6 +202,12 @@ button.mini {
     color: var(--md-sys-color-on-surface-variant);
 }
 .icon-chip md-icon { width: 26px; height: 26px; }
+/* The chip owns the colour. `.glyph` sets `primary` on the icon itself, so inside a chip
+   whose background *is* `primary` the glyph was the same colour as the circle behind it
+   — an invisible icon with a perfectly correct box, which is why a size/path audit did
+   not catch it. `inherit` makes the chip's foreground (on-primary / on-error) win. */
+.icon-chip .glyph,
+.icon-chip md-icon { color: inherit; }
 .hero.ok .icon-chip { background: var(--md-sys-color-primary); color: var(--md-sys-color-on-primary); }
 .hero.down .icon-chip { background: var(--md-sys-color-error); color: var(--md-sys-color-on-error); }
 .hero-text { flex: 1 1 auto; min-width: 0; }
@@ -349,6 +355,9 @@ button.mini {
     border-color: var(--md-sys-color-primary);
     font-weight: 600;
 }
+/* Same reason as `.icon-chip`: the selected chip's foreground, not `.glyph`'s primary,
+   is what has contrast against `primary-container`. */
+.chip[aria-current="true"] .glyph { color: inherit; }
 .chip.busy, .preset.busy, .rule.busy { opacity: .45; pointer-events: none; }
 
 /* --------------------------------------------------------------- radio list */

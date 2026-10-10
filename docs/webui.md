@@ -167,7 +167,7 @@ commands issued:      sh …/webui.sh all | cat '…/uperf.json' | sh …/dfps.s
                       sh …/webui.sh log '100'
 ```
 
-The command strings the page issues are byte-identical to the adb-verified ones. Three
+The command strings the page issues are byte-identical to the adb-verified ones. Four
 defects were found by these runs and fixed:
 
 * `#supervision-card` had no id, so the new error-state hide loop threw on it.
@@ -177,18 +177,33 @@ defects were found by these runs and fixed:
   `width: 24px; padding: 2px 12px`, and under the page-wide `box-sizing: border-box` the
   horizontal padding consumed the whole 24px, so `svg { width: 100% }` resolved to 0 —
   leaving the active pill with nothing in it. This one is inherited from the reference
-  implementation's stylesheet (it is visible in the "before" screenshot too), and it was
-  only caught by measuring the rendered boxes rather than by looking at the page. The fix
-  is `box-sizing: content-box` on that element, which also restores the pill to its
-  intended 48x28 (Material 3's active-indicator shape) instead of a 24px circle.
+  implementation's stylesheet (it is visible in the "before" screenshot too). The fix is
+  `box-sizing: content-box` on that element, which also restores the pill to its intended
+  48x28 (Material 3's active-indicator shape) instead of a 24px circle.
+* **The hero status glyph was invisible** — same class of bug, different mechanism. The
+  icon measured a perfectly correct 26x26 with a non-empty path, but `.glyph` sets
+  `color: primary` on the icon itself, and the chip behind it is *also* `primary`:
+  computing `fill` against the nearest painted background gave `rgb(208,188,255)` on
+  `rgb(208,188,255)`. Fixed by letting the chip's foreground win
+  (`.icon-chip .glyph { color: inherit }`), which also fixes the selected chip's tick.
 
-Two audits now run as part of the loop and are worth repeating after any UI change:
+The two invisible-icons cases show why the audit has to be run **twice, on two different
+axes** — a box measurement catches the first and is blind to the second:
 
 * every `getElementById` target in `webui/*.js` and `webui/pages/*.js` exists in
   `index.html` — currently none missing;
 * every `md-icon` **on the visible page** has an `<svg>` with a non-empty `path` and a
   rendered box of at least 6x6 — currently none bad on all four tabs (a hidden page
-  measures 0x0 by definition, so each tab has to be made active before auditing it).
+  measures 0x0 by definition, so each tab has to be made active before auditing it);
+* and the glyph's computed `fill` has a contrast ratio of at least 1.6 against the first
+  non-transparent background above it — currently clean on all four tabs, both themes,
+  with the info dialog open, in the full-screen log, **and** in the no-bridge error state
+  (which paints the chip with `error`/`on-error` instead of `primary`/`on-primary`).
+
+That last one also turned up a hole in `theme.css`: its dark block never restated
+`on-secondary`, `on-tertiary` or `on-error`, so those kept their light-scheme values —
+white `on-error` on the dark scheme's `error` (#F2B8B5) is unreadable. The missing
+Material 3 dark baselines are now there (`on-error` is #601410).
 
 The icon set is generated, and `tools/gen-icons.mjs` fails the build in both directions:
 a listed icon the package does not have, and a name a call site uses that is not listed.
