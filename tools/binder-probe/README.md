@@ -1,9 +1,9 @@
-# binder-probe — ⑤ 直连 binder 的最小可达事务（真机验证）
+# binder-probe — ⑤ 直连 binder 帧源（真机验证）
 
-`tools/binder-probe` 是一个**独立**（非 `rust/` workspace 成员）的 aarch64 探针，
-用于把"daemon 内直连 SurfaceFlinger"这一步从零打通。它只做一件事：从 root 进程
-open `/dev/binder` → mmap → 向 servicemanager（handle 0）发 `getService` 事务 →
-读回一个 `flat_binder_object` handle。
+从零写一个 root binder 客户端，**不 spawn `dumpsys`、不依赖 Java/NDK binder**：open
+`/dev/binder` → mmap → servicemanager 取 `SurfaceFlinger` handle → 对 SF 发 `dump`
+事务，参数经 **pipe fd** 递进去，SF 把 dump 文本写进 pipe，另一个线程读回。这就是
+AppOpt `--latency` 降级腿的同构形态，只是去掉了 fork+exec。
 
 ## 构建 / 运行（alioth）
 
@@ -11,59 +11,56 @@ open `/dev/binder` → mmap → 向 servicemanager（handle 0）发 `getService`
 cd tools/binder-probe
 cargo build --release --target aarch64-linux-android
 adb push target/aarch64-linux-android/release/binder-probe /data/local/tmp/
-adb shell su -c '/data/local/tmp/binder-probe /dev/binder SurfaceFlingerAIDL'
+adb shell su -c '/data/local/tmp/binder-probe /dev/binder --latency'
 ```
 
-## 真机实测输出（2026-10-10，alioth / crDroid A16 / Enforcing）
+## 真机实测（2026-10-10，alioth / crDroid A16 / Enforcing）
 
 ```
---- variant A READ 256K PRIVATE ---
-  mmap ok
-  S0 empty: ok (read_consumed=0)
-  S2 one-way + read: ok (read_consumed=8)
---- variant C RW 1M-2p PRIVATE|NORESERVE ---
-  open/mmap: mmap(prot=0x3,...): Operation not permitted (os error 1)
---- getService(SurfaceFlingerAIDL) ---
-  reply 32 bytes: 00000000 852a6873 00000000 01000000 00000000 00000000 00000000 0c000000
+$ binder-probe /dev/binder --latency
+8333333
+
+$ dumpsys SurfaceFlinger --latency
+8333333
+
+$ binder-probe /dev/binder --latency 'com.android.launcher3/…QuickstepLauncher#260'
+8333333
+11623250883013	11623273240930	11623257433117
+11623260714888	11623281479576	11623261508586
+…                       ← 与 dumpsys SurfaceFlinger --latency <同一 layer> 逐行一致
 ```
 
-解析（见下）：`[u32 status=0][flat_binder_object kind=0x73682a85 (HANDLE) flags=0
-binder=1 cookie=0]...` ⇒ **拿到 handle=1，事务往返成功**。
+即：**帧源（`--latency` 的每帧时间戳表）已能从 daemon 侧经 binder 直取**，与 dumpsys
+同源同值，且省掉每次 fork+exec。
 
-## 踩出来的四个真事实（照抄即可，别再摸一遍）
+## 踩出来的坑（都真机实测过，别再摸一遍）
 
-1. **读缓冲必须是可写的堆缓冲，不是 mmap。** 内核把 `BR_*` 命令流写进
-   `read_buffer`；binder 的 mmap 是 `PROT_READ` 的（`PROT_WRITE` 直接 `EPERM`，
-   实测），所以拿 mmap 当读缓冲必然 `EFAULT`。libbinder 用的是
-   `read_buffer = mIn.data()`（Parcel 堆缓冲）。**事务 payload 仍落在 mmap 里**，
-   由 `data.ptr.buffer` 指向（只读可读）。
-2. **事务 data 必须带 AOSP `writeInterfaceToken` 的 vendor 头**：接收端按
-   `[i32 strictPolicy][i32 workSource][i32 kHeader][string16 descriptor][args]` 读。
-   `kHeader` 在 `/dev/binder` 是 `0x53595354`（"SYST"），`/dev/vndbinder` 是
-   `0x564e4452`（"VNDR"）。漏了它，服务端 logs `Expecting header 0x53595354 but
-   found <你的字节>. Mixing copies of libbinder?` 并丢弃事务。
-3. **同步调用是两次 ioctl。** 带 `read` 的那次写回 `BR_NOOP` +
-   `BR_TRANSACTION_COMPLETE` 就立刻返回（线程要回用户态）；必须再发一次**只读**的
-   `BINDER_WRITE_READ` 阻塞等 `BR_REPLY`——libbinder 的 `waitForResponse` 循环。
-4. **`BINDER_WRITE_READ` = `_IOWR('b',1,48)` = `0xc0306201`**（`binder_write_read`
-   是 6×8=48 字节，不是 56）。`BC_TRANSACTION`=`0x40406300`、`BR_REPLY`=`0x80407203`
-   与内核一致；`BINDER_VERSION` 返回协议 8。
+| # | 事实 |
+|---|---|
+| 1 | **读缓冲必须是可写的堆缓冲，不是 mmap**。内核把 `BR_*` 命令流写进 `read_buffer`；binder 的 mmap 是 `PROT_READ`（`PROT_WRITE` 实测 `EPERM`），拿它当读缓冲必 `EFAULT`。payload 仍落在 mmap，由 `data.ptr.buffer` 只读读（libbinder 也是 `read_buffer=mIn.data()`）。 |
+| 2 | **事务 data 必须带 AOSP `writeInterfaceToken` 的 vendor 头**：`[i32 strictPolicy][i32 workSource][i32 kHeader][string16 descriptor][args]`，`kHeader=0x53595354`（/dev/binder 的 "SYST"；vndbinder 是 `0x564e4452`）。漏了服务端丢弃并 log `Expecting header …`。 |
+| 3 | **同步调用是两次 ioctl**：写回 `BR_TRANSACTION_COMPLETE` 即返回，须再发只读 `BINDER_WRITE_READ` 阻塞等 `BR_REPLY`。 |
+| 4 | **回包里的 handle 必须 `BC_ACQUIRE`**，否则下一次用它就是 `got transaction to invalid handle`（内核只在 buffer 未释放前替你持引用）。 |
+| 5 | **`BINDER_TYPE_FD = B_PACK_CHARS('f','d','*',B_TYPE_LARGE) = 0x66642a85`**。写错类型时内核 `binder_validate_object` 返回 0，报 `invalid offset (…, min …, max …) or object` + `BR_FAILED_REPLY`；`BINDER_TYPE_HANDLE=0x73682a85`。 |
+| 6 | **`dump` 的 fd 必须在 parcel 最前、且不能带 interface token**。带 token 时服务端 `readFileDescriptor()` 把 token 首字节当对象读 → fd 无效 → 回包里是异常串（实测 AMS：`status=-2` + `Allocation…`，pipe 0 字节）。 |
+| 7 | **要对 legacy `SurfaceFlinger` 发 `dump`，不要对 `SurfaceFlingerAIDL`**。AIDL 那个的 `onTransact` 不回落 `BBinder::onTransact`，`dump` 事务石沉大海（空回包、pipe 0 字节）。`service call SurfaceFlinger 1` 对 root 被拒是另一回事（只挡普通方法码，不挡 `dump`）。 |
+| 8 | **`dump` 不回包**：SF 写完 pipe 就结束，不回 `BR_REPLY`。若按同步调用等回包会永久阻塞（strace 实证：reader 已收到文本、caller 仍卡在第二次 ioctl）。故 `dump` 走**只写发送** + pipe 的"静默 1 s 即结束"读法。 |
+| 9 | 读 pipe 必须**并发**：一个 >64 KiB 的 dump 会把 64 KiB 的 pipe 缓冲写满，若等 call 返回后才读就死锁（对照实测：`dumpsys activity` 回包 4 字节、pipe 548 KB）。 |
 
-## 复现的 ioctl 常量
+## 常量表
 
 | 名 | 值 |
 |---|---|
-| `BINDER_WRITE_READ` | `0xc0306201` |
+| `BINDER_WRITE_READ` | `0xc0306201`（`binder_write_read` 48 字节） |
 | `BINDER_VERSION` | `0xc0046209` |
-| `BC_TRANSACTION` | `0x40406300` |
-| `BC_FREE_BUFFER` | `0x40086303` |
-| `BR_REPLY` | `0x80407203` |
-| `BR_TRANSACTION_COMPLETE` | `0x00007206` |
-| `BR_NOOP` | `0x0000720c` |
+| `BC_TRANSACTION` / `BC_FREE_BUFFER` / `BC_ACQUIRE` | `0x40406300` / `0x40086303` / `0x40046305` |
+| `BR_REPLY` / `BR_TRANSACTION_COMPLETE` / `BR_NOOP` / `BR_FAILED_REPLY` | `0x80407203` / `0x00007206` / `0x0000720c` / `0x00007211` |
+| `BINDER_TYPE_HANDLE` / `BINDER_TYPE_FD` | `0x73682a85` / `0x66642a85` |
+| `DUMP_TRANSACTION` | `0x5f444d50`（`B_PACK_CHARS('_','D','M','P')`） |
+| `kHeader`（/dev/binder） | `0x53595354`（"SYST"） |
 
-## 下一步（同一队列项 ⑤）
+## 下一步（⑤ 剩余）
 
-把它扩成 SF 的 `dump` 事务：目标 handle 用本探针拿到的 `SurfaceFlingerAIDL`
-handle，`code` = `dump`，data 里塞一个 pipe fd 与 `--latency <layer>` 参数，读回文本
-后解析帧时间戳算 FPS。注意 SF 的 `dump()` 可能查 `android.permission.DUMP`——
-本探针已证明"能建连、能往返"，权限这一层留给下一步实测。
+`--latency` 表解析（首行 = 刷新周期 ns；其后每行 `desiredPresent / actualPresent /
+frameReady`）→ 滑窗 FPS；再与既有帧源（M8 注入写的 `sfanalysis.hint`）接优先级/降级，
+并落进 daemon（`rust/uperf-core/src/`）而不是探针。

@@ -77,10 +77,32 @@ AppOpt 的 FPS 采集优先级（README）：eBPF（Rust/aya uprobe 到目标 PI
 4. `BINDER_WRITE_READ` = `0xc0306201`（`binder_write_read` 是 48 字节）。常量表见
    README。
 
-## 5. 未做（⑤ 的剩余）
+## 5. 第二轮：SF `dump` 腿真机跑通（2026-10-10）
 
-把该客户端扩成 SF 的 `dump` 事务：目标 handle 用本探针取到的 `SurfaceFlingerAIDL`
-handle，`code` = `dump`，data 里带一个 pipe fd 与 `--latency <layer>` 参数，读回文本
-后解析帧时间戳算 FPS；再与既有帧源（M8 注入的 `sfanalysis.hint`）接优先级与降级。
-SF 的 `dump()` 对 root 是否查 `android.permission.DUMP` **尚未实测**——本探针只证明了
-"能建连、能往返"。仍不臆造。
+在 `tools/binder-probe/` 上把"经 binder 取 SF 帧源"打通并真机验证：
+
+```
+$ binder-probe /dev/binder --latency
+8333333                        # = dumpsys SurfaceFlinger --latency（120 Hz 周期 ns）
+$ binder-probe /dev/binder --latency 'com.android.launcher3/…QuickstepLauncher#260'
+8333333
+11623250883013	11623273240930	11623257433117
+11623260714888	11623281479576	11623261508586   # 与 dumpsys 同 layer 的表逐行一致
+```
+
+即 **帧源可以在 daemon 内直取**（省掉每次 fork+exec），这是 ⑤ 的传输层交付。
+
+关键配方（细节与 9 条坑见 `tools/binder-probe/README.md`）：
+
+* 目标 = **legacy** `SurfaceFlinger`（不是 `SurfaceFlingerAIDL`：AIDL 的 `onTransact`
+  不回落 `BBinder::onTransact`，`dump` 无响应）；
+* `code = DUMP_TRANSACTION = 0x5f444d50`（base `IBinder`，与方法码无关）；
+* parcel = `[fd 对象][String16[] args]`，**fd 最前、无 interface token**；
+* `fd` 用 `BINDER_TYPE_FD = 0x66642a85`，并带 offsets 数组；读回用**并发线程**；
+* `dump` **不回包**，故只写发送 + pipe 静默超时结束。
+
+## 6. 未做（⑤ 的剩余）
+
+`--latency` 文本表解析（首行 = 刷新周期；每行 `desiredPresent / actualPresent /
+frameReady`）→ 滑窗 FPS；再与既有帧源（M8 注入写的 `sfanalysis.hint`）接优先级与降级，
+并把这段 binder 客户端从探针搬进 daemon（`rust/uperf-core/src/`）。仍不臆造。

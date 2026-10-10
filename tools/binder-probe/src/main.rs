@@ -1,14 +1,31 @@
-//! ⑤ binder probe, round 2.
+//! binder-probe — ⑤ 直连 binder 帧源（真机验证的最小实现）。
 //!
-//! Round 1 established: open/mmap/BINDER_VERSION work, BINDER_WRITE_READ with a
-//! write-only BC_TRANSACTION delivers (servicemanager received it), and the
-//! *read* into the mmap'd area returns EFAULT. It also surfaced the AOSP
-//! `writeInterfaceToken` "vendor header": the receiver reads
-//!   [i32 strictPolicy][i32 workSource][i32 kHeader][string16 descriptor][args]
-//! and kHeader is 0x53595354 on /dev/binder (0x564e4452 on vndbinder).
+//! 从零实现一个 root binder 客户端，不 spawn `dumpsys`、不依赖 Java/NDK binder：
+//! open /dev/binder → mmap → servicemanager 取 SurfaceFlinger handle → 对 SF 发
+//! `dump` 事务（`DUMP_TRANSACTION`，base `IBinder` 的码，与任何 AIDL 方法码无关），
+//! 参数经一个 **pipe fd** 递进去，SF 把 dump 文本写进 pipe，我们在另一个线程读回。
+//! 这就是 AppOpt `--latency` 降级腿的同构形态，只是去掉了 fork+exec。
 //!
-//! This round: (a) sweep mmap prot/size/flags to fix the read EFAULT, and
-//! (b) prepend the header so servicemanager parses the parcel.
+//! 用法：`binder-probe /dev/binder [--latency] [layer]`
+//!
+//! 真机验证（alioth / crDroid A16 / Enforcing）：`binder-probe /dev/binder --latency`
+//! → pipe 收到 `8333333`（1e9/120，120 Hz 的刷新周期），与
+//! `dumpsys SurfaceFlinger --latency` 逐字相同。
+//!
+//! 踩出来的坑（都真机实测过，见 README）：
+//!   1. 读缓冲必须是**可写堆缓冲**，不是 mmap（mmap 是 PROT_READ，用它读必 EFAULT）。
+//!   2. 事务 data 必须带 `writeInterfaceToken` 的 vendor 头（`kHeader=0x53595354`）。
+//!   3. 同步调用是**两次 ioctl**（第二次只读阻塞等 BR_REPLY）。
+//!   4. 回包里的 handle 必须 **BC_ACQUIRE**，否则下一次用它就 "invalid handle"。
+//!   5. `BINDER_TYPE_FD = B_PACK_CHARS('f','d','*',B_TYPE_LARGE) = 0x66642a85`
+//!      —— 写错类型内核 `binder_validate_object` 返回 0，报
+//!      "invalid offset ... or object" + BR_FAILED_REPLY。
+//!   6. **`dump` 的 fd 必须在 parcel 最前、且不能带 interface token**（带 token 时
+//!      服务端 `readFileDescriptor` 读到 token 首字节 → fd 无效 → 异常）。
+//!   7. **要对 legacy `SurfaceFlinger` 发，不要对 `SurfaceFlingerAIDL`**：AIDL 那个
+//!      的 `onTransact` 不回落 `BBinder::onTransact`，`dump` 事务石沉大海（空回包、
+//!      pipe 0 字节）。`service call SurfaceFlinger 1` 对 root 被拒是**另一回事**
+//!      （那是 SF 自己的权限检查，只挡普通方法码，不挡 `dump`）。
 
 use std::ffi::c_void;
 
@@ -41,9 +58,9 @@ const fn iowr(ty: u32, nr: u32, size: u32) -> u64 {
 
 const BINDER_WRITE_READ: u64 = iowr(b'b' as u32, 1, 48);
 const BINDER_VERSION: u64 = iowr(b'b' as u32, 9, 4);
-
 const BC_TRANSACTION: u64 = iow(b'c' as u32, 0, 64);
 const BC_FREE_BUFFER: u64 = iow(b'c' as u32, 3, 8);
+const BC_ACQUIRE: u64 = iow(b'c' as u32, 5, 4);
 
 const BR_ERROR: u64 = ior(b'r' as u32, 0, 4);
 const BR_TRANSACTION: u64 = ior(b'r' as u32, 2, 64);
@@ -63,6 +80,9 @@ const BR_FAILED_REPLY: u64 = io(b'r' as u32, 17);
 const TXN_SIZE: usize = 64;
 const K_HEADER_BINDER: u32 = 0x5359_5354; // "SYST" — /dev/binder
 const K_HEADER_VNDBINDER: u32 = 0x564e_4452; // "VNDR" — /dev/vndbinder
+const BINDER_TYPE_HANDLE: u32 = 0x7368_2a85;
+const BINDER_TYPE_FD: u32 = 0x6664_2a85;
+const DUMP_TRANSACTION: u32 = 0x5f44_4d50; // B_PACK_CHARS('_','D','M','P')
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -103,9 +123,6 @@ struct FlatBinderObject {
 fn as_bytes<T: Sized>(t: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((t as *const T) as *const u8, std::mem::size_of::<T>()) }
 }
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join("")
-}
 fn push_u32(v: &mut Vec<u8>, x: u32) {
     v.extend_from_slice(&x.to_ne_bytes());
 }
@@ -120,27 +137,26 @@ fn push_string16(v: &mut Vec<u8>, s: &str) {
         v.push(0);
     }
 }
-
-/// The AOSP `writeInterfaceToken` preamble: strictPolicy, workSource, kHeader, descriptor.
+fn pad8(v: &mut Vec<u8>) {
+    while v.len() % 8 != 0 {
+        v.push(0);
+    }
+}
+/// AOSP `writeInterfaceToken`: [strict][workSource][kHeader][descriptor].
 fn push_interface_token(v: &mut Vec<u8>, header: u32, descriptor: &str) {
-    push_u32(v, 0); // strict mode policy
-    push_u32(v, 0); // work source uid (kUnsetWorkSource)
+    push_u32(v, 0);
+    push_u32(v, 0);
     push_u32(v, header);
     push_string16(v, descriptor);
 }
 
-// ---------------------------------------------------------------- io
+// ---------------------------------------------------------------- driver
 
 struct Driver {
     fd: i32,
     map: *mut u8,
     map_len: usize,
-    /// The command-stream buffer. This must be a **writable heap buffer**, not the
-    /// mmap: the kernel writes the BR_* command stream here, and a read-only binder
-    /// mapping cannot take that write (EFAULT, measured). Transaction payloads still
-    /// land in the mmap and are read from `data.ptr.buffer`. libbinder does the same
-    /// (`read_buffer = mIn.data()` — a Parcel buffer — while `mOut`/payloads use the
-    /// mapping).
+    /// Command-stream buffer: a writable **heap** buffer, never the mmap.
     rd: Vec<u8>,
 }
 
@@ -153,22 +169,23 @@ impl Drop for Driver {
     }
 }
 
-fn open_driver(path: &str, size: usize, prot: i32, flags: i32) -> Result<Driver, String> {
-    let cpath = std::ffi::CString::new(path).unwrap();
-    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(format!("open: {}", std::io::Error::last_os_error()));
-    }
-    let map = unsafe { libc::mmap(std::ptr::null_mut(), size, prot, flags, fd, 0) };
-    if map == libc::MAP_FAILED {
-        let e = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(format!("mmap(prot={prot:#x},size={size},flags={flags:#x}): {e}"));
-    }
-    Ok(Driver { fd, map: map as *mut u8, map_len: size, rd: vec![0u8; 64 * 1024] })
-}
-
 impl Driver {
+    fn open(path: &str) -> Result<Driver, String> {
+        let cpath = std::ffi::CString::new(path).unwrap();
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(format!("open {path}: {}", std::io::Error::last_os_error()));
+        }
+        let size = 256 * 1024;
+        let map = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_PRIVATE, fd, 0) };
+        if map == libc::MAP_FAILED {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(format!("mmap: {e}"));
+        }
+        Ok(Driver { fd, map: map as *mut u8, map_len: size, rd: vec![0u8; 64 * 1024] })
+    }
+
     fn bwr(&mut self, write: &[u8], read: bool) -> Result<u64, String> {
         let mut bwr = BinderWriteRead {
             write_size: write.len() as u64,
@@ -184,191 +201,223 @@ impl Driver {
         Ok(bwr.read_consumed)
     }
 
-    fn txn_write(&mut self, handle: u32, code: u32, oneway: bool, data: &[u8]) -> Vec<u8> {
+    fn transact(&mut self, handle: u32, code: u32, data: &[u8], offsets: &[u64]) -> Result<Vec<u8>, String> {
         let mut wb: Vec<u8> = Vec::new();
         push_u32(&mut wb, BC_TRANSACTION as u32);
         let txn = BinderTransactionData {
             handle,
             code,
-            flags: oneway as u32,
             data_size: data.len() as u64,
             data_buffer: data.as_ptr() as u64,
+            offsets_size: (offsets.len() * 8) as u64,
+            data_offsets: if offsets.is_empty() { 0 } else { offsets.as_ptr() as u64 },
             ..Default::default()
         };
         wb.extend_from_slice(as_bytes(&txn));
-        wb
+
+        let mut n = self.bwr(&wb, true)?;
+        for _ in 0..4 {
+            let buf: Vec<u8> = self.rd[..n as usize].to_vec();
+            if let Some(r) = self.parse(&buf)? {
+                return Ok(r);
+            }
+            n = self.bwr(&[], true)?;
+        }
+        Err("no reply after 4 reads".into())
+    }
+
+    fn parse(&mut self, buf: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let mut off = 0usize;
+        let mut reply: Option<Vec<u8>> = None;
+        while off + 4 <= buf.len() {
+            let code = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as u64;
+            off += 4;
+            if code == BR_NOOP || code == BR_TRANSACTION_COMPLETE || code == BR_SPAWN_LOOPER {
+                continue;
+            }
+            if code == BR_REPLY || code == BR_TRANSACTION {
+                let t: BinderTransactionData =
+                    unsafe { std::ptr::read_unaligned(buf[off..].as_ptr() as *const BinderTransactionData) };
+                off += TXN_SIZE;
+                if t.data_size > 0 && t.data_buffer != 0 {
+                    let data = unsafe {
+                        std::slice::from_raw_parts(t.data_buffer as *const u8, t.data_size as usize).to_vec()
+                    };
+                    // acquire handles before freeing the buffer, or they go invalid
+                    if t.offsets_size > 0 && t.data_offsets != 0 {
+                        let nn = (t.offsets_size / 8) as usize;
+                        let offs = unsafe { std::slice::from_raw_parts(t.data_offsets as *const u64, nn) };
+                        for &o in offs {
+                            let o = o as usize;
+                            if o + 24 <= data.len() {
+                                let obj: FlatBinderObject = unsafe {
+                                    std::ptr::read_unaligned(data[o..].as_ptr() as *const FlatBinderObject)
+                                };
+                                if obj.kind == BINDER_TYPE_HANDLE {
+                                    let mut ab: Vec<u8> = Vec::new();
+                                    push_u32(&mut ab, BC_ACQUIRE as u32);
+                                    ab.extend_from_slice(&(obj.binder as u32).to_ne_bytes());
+                                    let _ = self.bwr(&ab, false);
+                                }
+                            }
+                        }
+                    }
+                    if code == BR_REPLY {
+                        reply = Some(data);
+                    }
+                }
+                if t.data_buffer != 0 {
+                    let mut fw: Vec<u8> = Vec::new();
+                    push_u32(&mut fw, BC_FREE_BUFFER as u32);
+                    fw.extend_from_slice(&t.data_buffer.to_ne_bytes());
+                    let _ = self.bwr(&fw, false);
+                }
+                continue;
+            }
+            if code == BR_DEAD_REPLY {
+                return Err("BR_DEAD_REPLY".into());
+            }
+            if code == BR_FAILED_REPLY {
+                return Err("BR_FAILED_REPLY".into());
+            }
+            if code == BR_INCREFS || code == BR_ACQUIRE || code == BR_RELEASE || code == BR_DECREFS {
+                off += 16;
+                continue;
+            }
+            if code == BR_DEAD_BINDER || code == BR_CLEAR_DEATH_NOTIFICATION_DONE {
+                off += 8;
+                continue;
+            }
+            if code == BR_ERROR {
+                let e = if off + 4 <= buf.len() {
+                    u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap())
+                } else {
+                    0
+                };
+                return Err(format!("BR_ERROR {e}"));
+            }
+            return Err(format!("unexpected read code 0x{code:08x}"));
+        }
+        Ok(reply)
     }
 }
 
-fn read_txn(b: &[u8]) -> Result<(BinderTransactionData, Vec<u8>), String> {
-    if b.len() < TXN_SIZE {
-        return Err(format!("short transaction: {} bytes", b.len()));
+/// `getService(name)` -> the service's local binder handle (BC_ACQUIRE'd by `parse`).
+fn get_service(d: &mut Driver, header: u32, name: &str) -> Result<u32, String> {
+    let mut data = Vec::new();
+    push_interface_token(&mut data, header, "android.os.IServiceManager");
+    push_string16(&mut data, name);
+    let reply = d.transact(0, 1, &data, &[])?;
+    if reply.len() < 28 {
+        return Err(format!("short reply ({} bytes)", reply.len()));
     }
-    let t: BinderTransactionData =
-        unsafe { std::ptr::read_unaligned(b.as_ptr() as *const BinderTransactionData) };
-    let data = if t.data_size > 0 && t.data_buffer != 0 {
-        unsafe { std::slice::from_raw_parts(t.data_buffer as *const u8, t.data_size as usize) }.to_vec()
-    } else {
-        Vec::new()
-    };
-    Ok((t, data))
+    let obj: FlatBinderObject = unsafe { std::ptr::read_unaligned(reply[4..].as_ptr() as *const FlatBinderObject) };
+    if obj.kind != BINDER_TYPE_HANDLE {
+        return Err(format!("no handle for '{name}' (kind=0x{:08x})", obj.kind));
+    }
+    Ok(obj.binder as u32)
 }
 
-/// Parse one read-buffer's command stream. Some(reply) when BR_REPLY appears.
-fn parse_commands(d: &mut Driver, buf: &[u8]) -> Result<Option<Vec<u8>>, String> {
-    let mut off = 0usize;
-    let mut reply: Option<Vec<u8>> = None;
-    while off + 4 <= buf.len() {
-        let at = off;
-        let code = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as u64;
-        off += 4;
-        if code == BR_NOOP || code == BR_TRANSACTION_COMPLETE || code == BR_SPAWN_LOOPER {
-            continue;
-        }
-        if code == BR_REPLY || code == BR_TRANSACTION {
-            let (t, data) = read_txn(&buf[off..])?;
-            off += TXN_SIZE;
-            if t.data_buffer != 0 {
-                let mut fw: Vec<u8> = Vec::new();
-                push_u32(&mut fw, BC_FREE_BUFFER as u32);
-                fw.extend_from_slice(&t.data_buffer.to_ne_bytes());
-                let _ = d.bwr(&fw, false);
-            }
-            if code == BR_REPLY {
-                reply = Some(data);
-            }
-            continue;
-        }
-        if code == BR_DEAD_REPLY {
-            return Err("BR_DEAD_REPLY".into());
-        }
-        if code == BR_FAILED_REPLY {
-            return Err("BR_FAILED_REPLY".into());
-        }
-        if code == BR_INCREFS || code == BR_ACQUIRE || code == BR_RELEASE || code == BR_DECREFS {
-            off += 16;
-            continue;
-        }
-        if code == BR_DEAD_BINDER || code == BR_CLEAR_DEATH_NOTIFICATION_DONE {
-            off += 8;
-            continue;
-        }
-        if code == BR_ERROR {
-            let e = if off + 4 <= buf.len() {
-                u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap())
+/// `dump` on the handle: parcel = [fd object][String16[] args], **no interface token**.
+/// The text arrives on a pipe, read on a helper thread (a >64 KiB dump would otherwise
+/// deadlock on the pipe buffer).
+fn dump(d: &mut Driver, header: u32, handle: u32, args: &[&str]) -> Result<String, String> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(format!("pipe: {}", std::io::Error::last_os_error()));
+    }
+    let (rfd, wfd) = (fds[0], fds[1]);
+    // SF keeps its dup of the write end and, measured, sends NO reply to `dump`
+    // (strace: the reader sees the text while the caller is still blocked in the
+    // second ioctl). So this is a write-only send, and the reader ends on a pipe
+    // idle timeout. Reading runs on its own thread, so a dump larger than the 64 KiB
+    // pipe buffer cannot deadlock.
+    let reader = std::thread::spawn(move || {
+        let mut out: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            let mut pfd = libc::pollfd { fd: rfd, events: libc::POLLIN, revents: 0 };
+            let pr = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 1000) };
+            if pr > 0 && (pfd.revents & libc::POLLIN) != 0 {
+                let n = unsafe { libc::read(rfd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n as usize]);
             } else {
-                0
-            };
-            return Err(format!("BR_ERROR {e}"));
+                // 1 s of silence (or EOF) ends the dump
+                break;
+            }
         }
-        return Err(format!("unexpected read code 0x{code:08x} at offset {at}"));
-    }
-    Ok(reply)
-}
+        unsafe { libc::close(rfd) };
+        out
+    });
 
-/// A synchronous transaction is two ioctls: the write returns BR_TRANSACTION_COMPLETE
-/// at once (the thread must return to userspace), then a read-only ioctl blocks until
-/// the reply arrives — libbinder's `waitForResponse` loop does exactly this.
-fn transact(d: &mut Driver, handle: u32, code: u32, data: &[u8]) -> Result<Vec<u8>, String> {
-    let wb = d.txn_write(handle, code, false, data);
-    let mut n = d.bwr(&wb, true)?;
-    for _ in 0..4 {
-        // the command stream is in the heap buffer; any payload pointer in it points
-        // into the mmap, which is readable
-        let buf: Vec<u8> = d.rd[..n as usize].to_vec();
-        if let Some(r) = parse_commands(d, &buf)? {
-            return Ok(r);
-        }
-        n = d.bwr(&[], true)?;
+    let mut data = Vec::new();
+    pad8(&mut data);
+    let offsets = vec![data.len() as u64];
+    let obj = FlatBinderObject { kind: BINDER_TYPE_FD, flags: 0, binder: wfd as u64, cookie: 0 };
+    data.extend_from_slice(as_bytes(&obj));
+    push_u32(&mut data, args.len() as u32);
+    for a in args {
+        push_string16(&mut data, a);
     }
-    Err("no reply after 4 reads".into())
+    let _ = header;
+
+    let mut wb: Vec<u8> = Vec::new();
+    push_u32(&mut wb, BC_TRANSACTION as u32);
+    let txn = BinderTransactionData {
+        handle,
+        code: DUMP_TRANSACTION,
+        data_size: data.len() as u64,
+        data_buffer: data.as_ptr() as u64,
+        offsets_size: (offsets.len() * 8) as u64,
+        data_offsets: offsets.as_ptr() as u64,
+        ..Default::default()
+    };
+    wb.extend_from_slice(as_bytes(&txn));
+    d.bwr(&wb, false)?;
+    unsafe { libc::close(wfd) };
+    let out = reader.join().map_err(|_| "reader panicked".to_string())?;
+    Ok(String::from_utf8_lossy(&out).to_string())
 }
 
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| "/dev/binder".to_string());
-    let header = if path.contains("vndbinder") {
-        K_HEADER_VNDBINDER
-    } else {
-        K_HEADER_BINDER
+    let header = if path.contains("vndbinder") { K_HEADER_VNDBINDER } else { K_HEADER_BINDER };
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let args: Vec<&str> = if args.is_empty() { vec!["--latency"] } else { args.iter().map(|s| s.as_str()).collect() };
+
+    let mut d = match Driver::open(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
     };
-    let name = std::env::args().nth(2).unwrap_or_else(|| "SurfaceFlingerAIDL".to_string());
+    let mut ver: i32 = 0;
+    unsafe { libc::ioctl(d.fd, BINDER_VERSION as _, &mut ver as *mut i32) };
+    println!("// opened {path}, BINDER_VERSION={ver}, header=0x{header:08x}, args={args:?}");
 
-    let page = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } as usize;
-    let variants: &[(&str, usize, i32, i32)] = &[
-        ("A READ 256K PRIVATE", 256 * 1024, libc::PROT_READ, libc::MAP_PRIVATE),
-        (
-            "B READ 1M-2p PRIVATE|NORESERVE",
-            (1024 * 1024) - 2 * page,
-            libc::PROT_READ,
-            libc::MAP_PRIVATE | libc::MAP_NORESERVE,
-        ),
-        (
-            "C RW 1M-2p PRIVATE|NORESERVE",
-            (1024 * 1024) - 2 * page,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_NORESERVE,
-        ),
-    ];
-
-    let mut working: Option<usize> = None;
-    for (i, (label, size, prot, flags)) in variants.iter().enumerate() {
-        println!("--- variant {label} ---");
-        let mut d = match open_driver(&path, *size, *prot, *flags) {
-            Ok(d) => d,
-            Err(e) => {
-                println!("  open/mmap: {e}");
-                continue;
-            }
-        };
-        println!("  mmap ok at {:p}", d.map);
-        match d.bwr(&[], false) {
-            Ok(n) => println!("  S0 empty: ok (read_consumed={n})"),
-            Err(e) => println!("  S0 empty: {e}"),
+    // The LEGACY registration answers `dump`; SurfaceFlingerAIDL does not.
+    let handle = match get_service(&mut d, header, "SurfaceFlinger") {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("getService(SurfaceFlinger): {e}");
+            std::process::exit(2);
         }
-        let payload = {
-            let mut p = Vec::new();
-            push_interface_token(&mut p, header, "android.os.IServiceManager");
-            push_string16(&mut p, &name);
-            p
-        };
-        let wb = d.txn_write(0, 1, true, &payload);
-        match d.bwr(&wb, true) {
-            Ok(n) => {
-                println!("  S2 one-way + read into mmap: ok (read_consumed={n})");
-                if working.is_none() {
-                    working = Some(i);
-                }
-            }
-            Err(e) => println!("  S2 one-way + read into mmap: {e}"),
-        }
-    }
-
-    let Some(wi) = working else {
-        println!("no variant could read; stopping");
-        return;
     };
-    println!("--- using variant {} for getService({name}) ---", variants[wi].0);
-    let (_, size, prot, flags) = variants[wi];
-    let mut d = open_driver(&path, size, prot, flags).unwrap();
-    let mut data = Vec::new();
-    push_interface_token(&mut data, header, "android.os.IServiceManager");
-    push_string16(&mut data, &name);
-    println!("  request data ({} bytes): {}", data.len(), hex(&data));
-    match transact(&mut d, 0, 1, &data) {
-        Ok(reply) => {
-            println!("  reply {} bytes: {}", reply.len(), hex(&reply));
-            if reply.len() >= 24 {
-                let obj: FlatBinderObject =
-                    unsafe { std::ptr::read_unaligned(reply.as_ptr() as *const FlatBinderObject) };
-                println!(
-                    "  flat_binder_object kind=0x{:08x} flags=0x{:08x} binder=0x{:x} cookie=0x{:x}",
-                    obj.kind, obj.flags, obj.binder, obj.cookie
-                );
-            } else if reply.len() >= 4 {
-                let first = u32::from_ne_bytes(reply[0..4].try_into().unwrap());
-                println!("  reply first u32 = 0x{first:08x} (0 = null binder)");
+    println!("// SurfaceFlinger handle={handle}");
+    match dump(&mut d, header, handle, &args) {
+        Ok(text) => {
+            print!("{text}");
+            if !text.ends_with('\n') {
+                println!();
             }
         }
-        Err(e) => println!("  transact: {e}"),
+        Err(e) => {
+            eprintln!("dump: {e}");
+            std::process::exit(1);
+        }
     }
 }
