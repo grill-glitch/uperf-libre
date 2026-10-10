@@ -265,7 +265,14 @@ pub(crate) fn apply_pending(
     }
     match fake_root {
         Some(root) => {
-            let mut files = crate::orchestrator::UnderRootSink::new(root);
+            // Record what each knob held before we touch it, so a later stop (or the
+            // watchdog's dead-man path) can put it back. Without a status target there
+            // is nowhere to record, and we write without one rather than inventing a
+            // location.
+            let mut files = match crate::sysfs_ledger::SysfsLedger::for_status() {
+                Some(l) => crate::orchestrator::UnderRootSink::with_ledger(root, l),
+                None => crate::orchestrator::UnderRootSink::new(root),
+            };
             for w in collected.writes {
                 files.write(&w);
             }

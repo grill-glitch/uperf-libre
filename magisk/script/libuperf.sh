@@ -92,6 +92,81 @@ uperf_restore_governors() {
     return 0
 }
 
+# The daemon's write ledger (`<USER_PATH>/sysfs_orig.txt`, written by
+# `rust/uperf-core/src/sysfs_ledger.rs`): the value each sysfs knob held before the
+# daemon's *first* write to it. Same contract as the governors above — a path with no
+# recorded original is left alone and reported, never invented.
+#
+# Why the restore lives here and not in the daemon: the interesting case is the daemon
+# that no longer exists. `/proc/<pid>/exe` has moved on; this file has not.
+SYSFS_ORIG="${UPERF_SYSFS_ORIG:-$USER_PATH/sysfs_orig.txt}"
+# Prefix for the paths in the ledger. Empty on a device (the ledger holds real paths);
+# set by the host/device harnesses so a restore never touches the real /sys.
+UPERF_SYSFS_ROOT="${UPERF_SYSFS_ROOT:-}"
+
+uperf_restore_sysfs() {
+    local restored=0 unknown=0 failed=0 kept=0 corrupt=0 p v target cur
+    if [ ! -f "$SYSFS_ORIG" ]; then
+        return 0
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+        ''|'#'*) continue ;;
+        esac
+        # Absolute paths only, exactly like the Rust loader this reads after. A line
+        # that is not one is *not* a path we can act on: skipping it silently would
+        # hide a hand-edited or truncated file, and treating it as a path would write
+        # somewhere the ledger never named (caught by the harness: `garbage with no
+        # path` became a write to `<root>garbage`).
+        case "$line" in
+        /*) ;;
+        *)
+            echo "uperf: ignoring unreadable line in $SYSFS_ORIG: $line"
+            corrupt=$((corrupt + 1))
+            continue
+            ;;
+        esac
+        # `<path> <value>`, or a bare `<path>` for "written, no readable original".
+        # Paths never contain whitespace (the config's knob table is the only source,
+        # and `every_knob_path_is_whitespace_free` keeps it that way), so the first
+        # space ends the path and the rest — spaces included — is the value.
+        p="${line%% *}"
+        if [ "$p" = "$line" ]; then
+            v=""
+        else
+            v="${line#* }"
+        fi
+        if [ -z "$v" ]; then
+            echo "uperf: no recorded original for $p, leaving it untouched"
+            unknown=$((unknown + 1))
+            continue
+        fi
+        target="$UPERF_SYSFS_ROOT$p"
+        cur=""
+        IFS= read -r cur <"$target" 2>/dev/null
+        [ "$cur" = "$v" ] && { kept=$((kept + 1)); continue; }
+        if printf '%s' "$v" >"$target" 2>/dev/null; then
+            restored=$((restored + 1))
+        else
+            echo "uperf: could not restore $p (write refused), ledger kept"
+            failed=$((failed + 1))
+        fi
+    done <"$SYSFS_ORIG"
+
+    [ "$restored" -gt 0 ] && echo "uperf: restored $restored sysfs knob(s)"
+    [ "$kept" -gt 0 ] && echo "uperf: $kept sysfs knob(s) already at their original value"
+    [ "$unknown" -gt 0 ] && echo "uperf: $unknown sysfs knob(s) left as-is (no recorded original)"
+    [ "$corrupt" -gt 0 ] && echo "uperf: $corrupt unreadable ledger line(s) ignored"
+    # Cleared only when nothing is owed: an entry we could not put back has to survive
+    # for the next attempt (a later stop, or the watchdog's dead-man path).
+    if [ "$unknown" -eq 0 ] && [ "$failed" -eq 0 ] && [ "$corrupt" -eq 0 ]; then
+        rm -f "$SYSFS_ORIG" 2>/dev/null
+    else
+        [ "$failed" -gt 0 ] && echo "uperf: sysfs ledger kept at $SYSFS_ORIG"
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------- M9 watchdog
 #
 # The external supervisor for the daemon. Why a *script* and not another thread:
@@ -153,6 +228,7 @@ uperf_stop() {
     # give the daemon its chance to disarm gracefully, then make sure
     sleep 1
     uperf_restore_governors
+    uperf_restore_sysfs
 }
 
 # Keep the previous run's log, but bounded. `uperf_start` moves the log aside on
@@ -204,6 +280,7 @@ uperf_start() {
     # A previous run may have died without disarming (SIGKILL). Undo that first,
     # then record the originals we are about to replace.
     uperf_restore_governors
+    uperf_restore_sysfs
     uperf_save_governors
 
     # raise inotify limit in case file sync existed

@@ -382,8 +382,13 @@ wd_teardown() {
 # watchdog log so the recovery is reconstructible from one file.
 wd_restore_governors() {
     local out
+    # Both halves of what a killed daemon may have left behind: the governor takeover
+    # (libuperf.sh's recorded originals) and the sysfs knobs (the daemon's write
+    # ledger). One log line each, so the recovery is reconstructible from one file.
     out="$(uperf_restore_governors 2>&1)"
     [ -n "$out" ] && wd_log "restore: $out"
+    out="$(uperf_restore_sysfs 2>&1)"
+    [ -n "$out" ] && wd_log "restore-sysfs: $out"
     return 0
 }
 

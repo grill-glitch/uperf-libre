@@ -30,6 +30,7 @@ pub mod watch_task;
 pub mod hint;
 pub mod orchestrator;
 pub mod sysfs;
+pub mod sysfs_ledger;
 pub mod topic_dispatch;
 
 use std::ffi::CStr;
