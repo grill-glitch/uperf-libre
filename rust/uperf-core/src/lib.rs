@@ -334,11 +334,23 @@ pub(crate) extern "C" fn uperf_rs_start(
             let cfg_str = cfg.to_string_lossy().to_string();
             std::path::Path::new(&cfg_str).parent().map(|p| p.to_path_buf())
         };
+        // The degraded leg's one honest assertion: nothing drawn in the window means
+        // the UI is idle. It goes through the same entry the injected hint uses
+        // (`Orchestrator::on_sf_hint`), and the queued scene writes are drained here
+        // because no event-bus message carries this one.
+        let hint_orch = ORCHESTRATOR.get().cloned();
+        let hint_root = std::env::var("UPERF_FAKE_ROOT").ok();
+        let on_hint = move |h: hint::SfHint| {
+            let Some(o) = hint_orch.as_ref() else { return };
+            if o.lock().on_sf_hint(h) {
+                crate::topic_dispatch::apply_pending(o, hint_root.as_deref());
+            }
+        };
         let mut guard = sf_binder_slot().lock();
         if let Some(mut prev) = guard.take() {
             prev.stop();
         }
-        match crate::sf_binder::FrameTask::spawn(cfg_dir, state, |m: &str| log_msg(m)) {
+        match crate::sf_binder::FrameTask::spawn(cfg_dir, state, on_hint, |m: &str| log_msg(m)) {
             Some(t) => {
                 log_msg("Rust: sf-binder frame source started");
                 *guard = Some(t);
