@@ -26,6 +26,7 @@ pub mod inotify;
 pub mod sched_apply;
 pub mod sched_task;
 pub mod sf_binder;
+pub mod sf_uprobe;
 pub mod status;
 pub mod startup_lines;
 pub mod shutdown;
@@ -326,6 +327,26 @@ pub(crate) extern "C" fn uperf_rs_start(
     // (dfps-rs is set up above, before the dispatcher, so events route into it
     // from the first message.)
 
+    // ⑪ (user-appended): the AppOpt FPS **primary** leg — a uprobe on the target app's own
+    // `libgui.so` `queueBuffer`, one probe per thread, so only *that* app's frames are
+    // counted (opt-in `UPERF_SF_UPROBE=1`). While its probe is healthy the ⑤ binder leg
+    // stands down; see `sf_uprobe` and `docs/m11-11-ebpf-uprobe-frame-leg.md`.
+    if sf_uprobe::UprobeTask::enabled() {
+        let orch = ORCHESTRATOR.get().cloned();
+        let top = move || orch.as_ref().and_then(|o| o.lock().top_app().map(str::to_string));
+        let mut guard = sf_uprobe_slot().lock();
+        if let Some(mut prev) = guard.take() {
+            prev.stop();
+        }
+        match sf_uprobe::UprobeTask::spawn(top, |m: &str| log_msg(m)) {
+            Some(t) => {
+                log_msg("Rust: sf-uprobe frame source started");
+                *guard = Some(t);
+            }
+            None => log_msg("Rust: sf-uprobe frame source could not start"),
+        }
+    }
+
     // ⑤: the direct-binder SurfaceFlinger frame source (opt-in
     // `UPERF_SF_BINDER=1`). The degraded leg for when the M8 injection library is
     // not there: read SF's `--latency` over binder instead of spawning dumpsys.
@@ -476,6 +497,12 @@ pub(crate) extern "C" fn uperf_rs_stop() {
         }
     }
     {
+        let mut guard = sf_uprobe_slot().lock();
+        if let Some(mut t) = guard.take() {
+            t.stop();
+        }
+    }
+    {
         let mut guard = sf_binder_slot().lock();
         if let Some(mut t) = guard.take() {
             t.stop();
@@ -536,6 +563,13 @@ static DFPS_SCHED: OnceLock<crate::dfps_rs::DfpsScheduler> = OnceLock::new();
 
 fn watch_task_slot() -> &'static PMutex<Option<watch_task::WatchTask>> {
     WATCH_TASK.get_or_init(|| PMutex::new(None))
+}
+
+/// ⑪ uprobe frame leg (opt-in `UPERF_SF_UPROBE=1`).
+static SF_UPROBE_TASK: OnceLock<PMutex<Option<sf_uprobe::UprobeTask>>> = OnceLock::new();
+
+fn sf_uprobe_slot() -> &'static PMutex<Option<sf_uprobe::UprobeTask>> {
+    SF_UPROBE_TASK.get_or_init(|| PMutex::new(None))
 }
 
 fn sf_binder_slot() -> &'static PMutex<Option<sf_binder::FrameTask>> {

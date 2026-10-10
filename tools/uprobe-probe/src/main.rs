@@ -154,6 +154,80 @@ fn main() {
         return;
     }
 
+    // `pmuall <path> <offset-hex> <pid> <secs>`: exactly what the daemon does -- one PMU
+    // event per thread of the process, summed. Isolates the aggregate from the daemon's code.
+    if a.first().map(|s| s.as_str()) == Some("pmuall") {
+        let path = a.get(1).cloned().unwrap_or_default();
+        let off = a
+            .get(2)
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+        let pid: i32 = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let secs: u64 = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(3);
+        let mut tids: Vec<i32> = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse().ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        tids.sort_unstable();
+        let uprobe_type: u32 = std::fs::read_to_string("/sys/bus/event_source/devices/uprobe/type")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(6);
+        let cpath = std::ffi::CString::new(path.clone()).expect("path");
+        let mut fds: Vec<i32> = Vec::new();
+        for t in &tids {
+            let attr = PerfEventAttr {
+                type_: uprobe_type,
+                size: std::mem::size_of::<PerfEventAttr>() as u32,
+                config: 0,
+                config1: cpath.as_ptr() as u64,
+                config2: off,
+                sample_period: 0,
+                flags: 1,
+                ..Default::default()
+            };
+            let fd = retry_int(|| unsafe {
+                libc::syscall(
+                    libc::SYS_perf_event_open,
+                    &attr as *const PerfEventAttr,
+                    *t as libc::pid_t,
+                    -1i32 as libc::c_int,
+                    -1i32 as libc::c_int,
+                    0u64,
+                )
+            });
+            if fd >= 0 {
+                fds.push(fd as i32);
+            }
+        }
+        println!("pmuall: {} of {} thread events opened", fds.len(), tids.len());
+        for fd in &fds {
+            retry_int(|| unsafe { libc::ioctl(*fd, PERF_EVENT_IOC_RESET as _, 0) as i64 });
+            retry_int(|| unsafe { libc::ioctl(*fd, PERF_EVENT_IOC_ENABLE as _, 0) as i64 });
+        }
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        let mut total = 0u64;
+        let mut per: Vec<(i32, u64)> = Vec::new();
+        for (i, fd) in fds.iter().enumerate() {
+            retry_int(|| unsafe { libc::ioctl(*fd, PERF_EVENT_IOC_DISABLE as _, 0) as i64 });
+            let mut c: u64 = 0;
+            let n = retry_int(|| unsafe { libc::read(*fd, &mut c as *mut u64 as *mut libc::c_void, 8) as i64 });
+            if n >= 0 {
+                total += c;
+                if c > 0 {
+                    per.push((tids[i], c));
+                }
+            }
+        }
+        println!("pmuall over {secs}s: {total} hits ({:.1}/s)", total as f64 / secs as f64);
+        println!("threads with hits: {per:?}");
+        return;
+    }
+
+
     let id: u64 = a.first().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
         eprintln!("usage: uprobe-count <tracepoint-id> <pid|0=all> <seconds> [inherit]");
         std::process::exit(2);
