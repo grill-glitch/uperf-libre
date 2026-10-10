@@ -558,6 +558,9 @@ pub fn pick_layer(list_text: &str, package: &str) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameSource {
     Hint,
+    /// ⑪'s primary leg: a uprobe on the app's own `libgui.so` `queueBuffer`, counted per
+    /// thread, so only that app's frames are counted.
+    Uprobe,
     Fps,
 }
 
@@ -565,6 +568,7 @@ impl FrameSource {
     pub fn as_str(self) -> &'static str {
         match self {
             FrameSource::Hint => "hint",
+            FrameSource::Uprobe => "uprobe",
             FrameSource::Fps => "fps",
         }
     }
@@ -710,7 +714,24 @@ impl FrameTask {
                             set_last_fps(0.0);
                             publish(FrameSource::Hint, age, None, 0, None, None);
                         }
-                        FrameSource::Fps => {
+                        // `choose_source` only ever returns Hint or Fps; Uprobe is the label
+                        // this branch publishes once ⑪'s probe has been found healthy.
+                        FrameSource::Fps | FrameSource::Uprobe => {
+                            // ⑪ sits between the injected hint and the binder fallback:
+                            // while its probe is healthy it is the fps source and binder is
+                            // not touched at all (each `--latency` poll is a round trip plus
+                            // a pipe read, so this is a cost decision, not a label).
+                            if crate::sf_uprobe::healthy() {
+                                let fps = crate::sf_uprobe::last_fps();
+                                let frames = crate::sf_uprobe::last_frames();
+                                set_last_fps(fps);
+                                publish(FrameSource::Uprobe, age, Some(fps), frames as usize, None, None);
+                                if last_derived.take().is_some() {
+                                    log("Rust: sf frame source -> uprobe (binder --latency stands down)");
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(window_ms));
+                                continue;
+                            }
                             let pkg = top_app();
                             if layer.is_none() || (pinned.is_none() && pkg != layer_for) {
                                 if let Some(p) = pkg.as_deref() {
