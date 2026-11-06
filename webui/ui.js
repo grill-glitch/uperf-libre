@@ -68,6 +68,7 @@ export function kvRows(container, pairs) {
  * and both locales stay in step.
  */
 export function openInfo(titleKey, blocks, params) {
+    const dialog = document.getElementById('info-dialog');
     document.getElementById('info-title').textContent = getString(titleKey, params);
     const body = document.getElementById('info-body');
     body.textContent = '';
@@ -86,6 +87,10 @@ export function openInfo(titleKey, blocks, params) {
         p.textContent = getString(block.text, { ...params, ...block.params });
         body.append(p);
     }
+    // The Close button is the dialog's only exit: without this handler the click did
+    // nothing and the overlay sat there (the same wiring `askConfirm` does per call, not
+    // once at startup, so a page that never opens the dialog cannot break it).
+    document.getElementById('info-ok').onclick = () => dialog.close();
     showDialog('info-dialog');
 }
 
