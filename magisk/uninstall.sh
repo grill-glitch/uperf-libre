@@ -48,7 +48,9 @@ on_remove() {
         kill -TERM "$(cut -d: -f1 "$MODDIR/flag/uperf_watchdog.lock/owner" 2>/dev/null)" 2>/dev/null
         rm -rf "$MODDIR/flag/uperf_watchdog.lock"
     fi
-    . $MODDIR/script/libuperf.sh 2>/dev/null || . $MODDIR/libuperf.sh 2>/dev/null
+    # One copy only: the libs live in script/ (the root-level duplicate was removed and
+    # `build.sh check` now rejects it coming back).
+    . $MODDIR/script/libuperf.sh 2>/dev/null
     uperf_stop 2>/dev/null || killall uperf 2>/dev/null
     uperf_restore_governors 2>/dev/null
 

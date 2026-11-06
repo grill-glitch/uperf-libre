@@ -127,6 +127,13 @@ SF pid 不变）。机制是 **GOT/PLT 改写**，与 vendor 静态链的 xHook 
 ```
 /config/                    63 份平台配置（冻结，勿改）
 /magisk/                    模块骨架；只需把 bin/uperf 换成自研产物
+  customize.sh service.sh post-fs-data.sh uninstall.sh   ← 只放 Magisk/KernelSU 按名字直接调用的入口
+  script/                  ← 其余全部在script/：initsvc.sh、libuperf.sh、libcommon.sh、libsysinfo.sh、
+                             libcgroup.sh、libpowercfg.sh、pathinfo.sh、powercfg_{main,once}.sh、
+                             miui_migt.sh、platform_special.sh、vtools_powercfg.sh、webui.sh、dfps.sh、
+                             setup.sh、uperf_watchdog.sh
+                             （`build.sh check` 断言根目录只剩 4 个入口、script/ 一个不少——
+                              历史上根目录曾有一份会漂移的副本，包括 governor 恢复路径）
 /cpp/
   dfps/                     ← vendor 自 yc9559/dfps（Apache-2.0），保留原文件头
     platform/ modules/ utils/ main.cpp CMakeLists.txt

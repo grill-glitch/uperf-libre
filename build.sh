@@ -214,6 +214,44 @@ check_uperf() {
         exit 1
     fi
     echo "    sfanalysis: libsfanalysis_rs.so matches build, vendor libsfanalysis.so absent"
+
+    # The module tree has exactly one copy of every library.
+    #
+    # `magisk/` used to carry a stale second copy of the whole script tree at its root
+    # (initsvc/libcommon/libuperf/libcgroup/libsysinfo/libpowercfg/pathinfo/powercfg_*/
+    # miui_migt/platform_special/vtools_powercfg — 1662 lines). `service.sh` runs
+    # `script/initsvc.sh`, so the root copies were dead, but they were self-consistent
+    # (the root initsvc.sh sourced the root libuperf.sh), and four of them had already
+    # drifted from the live ones — including `libuperf.sh`, i.e. the governor
+    # stop/restore path. `cp -a magisk/.` shipped both, so editing the wrong copy was a
+    # silent no-op on the device.
+    #
+    # The root stays the entry points Magisk/KernelSU look for by name; everything else
+    # lives in `script/`.
+    local root_sh
+    root_sh=$(cd "$BASEDIR/magisk" && ls *.sh 2>/dev/null | sort | tr '\n' ' ')
+    # Leading space on purpose: the `case` below matches " $f " inside the list.
+    local allowed=" customize.sh post-fs-data.sh service.sh uninstall.sh "
+    local stray=""
+    local f
+    for f in $root_sh; do
+        case "$allowed" in
+            *" $f "*) ;;
+            *) stray="$stray $f" ;;
+        esac
+    done
+    if [ -n "$stray" ]; then
+        echo " !! magisk/ root carries scripts that are not module entry points:$stray"
+        echo "    libs belong in magisk/script/ (the module's scripts source from there)"
+        exit 1
+    fi
+    for f in initsvc.sh libuperf.sh libcommon.sh libsysinfo.sh libcgroup.sh libpowercfg.sh \
+             pathinfo.sh powercfg_main.sh powercfg_once.sh miui_migt.sh platform_special.sh \
+             vtools_powercfg.sh webui.sh dfps.sh setup.sh uperf_watchdog.sh; do
+        [ -f "$BASEDIR/magisk/script/$f" ] || { echo " !! magisk/script/$f is missing"; exit 1; }
+    done
+    echo "    scripts   : root = entry points only ($(echo $root_sh | wc -w) file(s)), libs in script/"
+
     echo "    -> OK"
 }
 
