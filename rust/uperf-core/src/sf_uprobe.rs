@@ -24,7 +24,7 @@ use std::ffi::c_void;
 use std::io::Read as _;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -367,30 +367,10 @@ pub fn pids_for_package(pkg: &str) -> Vec<u32> {
 
 // ---------------------------------------------------------------- shared state
 
-/// The last uprobe-measured fps, ×100 (0 = the leg is not running or healthy).
-static UPROBE_FPS_X100: AtomicU64 = AtomicU64::new(0);
-/// Frames counted in the last window (for the state file's `frames=` field).
-static UPROBE_FRAMES: AtomicU64 = AtomicU64::new(0);
-/// Set while the uprobe leg has a healthy probe, so the binder `--latency` leg stands down.
-static UPROBE_HEALTHY: AtomicBool = AtomicBool::new(false);
-
-pub fn last_fps() -> f64 {
-    UPROBE_FPS_X100.load(Ordering::Relaxed) as f64 / 100.0
-}
-
-pub fn last_frames() -> u64 {
-    UPROBE_FRAMES.load(Ordering::Relaxed)
-}
-
-pub fn healthy() -> bool {
-    UPROBE_HEALTHY.load(Ordering::Relaxed)
-}
-
-fn set_state(healthy: bool, fps: f64, frames: u64) {
-    UPROBE_HEALTHY.store(healthy, Ordering::Relaxed);
-    UPROBE_FPS_X100.store((fps.max(0.0) * 100.0) as u64, Ordering::Relaxed);
-    UPROBE_FRAMES.store(frames, Ordering::Relaxed);
-}
+/// This leg reports into `frame_state`, which owns every leg's last reading and the
+/// ladder that decides which one is in effect — the uprobe does not publish to other
+/// legs directly, and nobody reaches into this module's globals any more.
+use crate::frame_state::publish_uprobe as set_state;
 
 // ---------------------------------------------------------------- daemon task
 

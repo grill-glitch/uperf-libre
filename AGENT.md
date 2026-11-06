@@ -251,6 +251,18 @@ void uperf_bridge_set_thread_name(const char *name);
 * 监听线程只在 daemon 已放进槽位**之后**启动：否则启动途中来信号会 `_exit` 在「governor 已 arm、daemon 未发布」的窗口里。
 * `Dispatcher::join_timeout` 必须先 `ffi::clear_dispatch_tx()`：FFI 槽位持有 sender，只 drop `_keep_alive` 时 receiver 永远收不到 `Disconnected`，线程会白等满 2 s 预算（真机实测：`caught signal` 与 `task 'cpu' stopped` 相差 2 s）。
 
+### 6.03 帧源阶梯（`frame_state.rs`）
+
+三条腿：注入 hint（M8）> uprobe（⑪）> binder `--latency`（⑤）。阶梯、各腿最后读数、状态文件
+`uperf_frames.state` 的**唯一写者**现在都在 `frame_state`：
+
+* 各腿只调用 `publish_uprobe()` / `publish_binder()` / `publish_hint()` 上报；读的一方只问
+  `active()`（hint 在看 hint、否则 uprobe 健康就看 uprobe、否则 binder）或 `last_fps()`（⑧ 记录用）。
+  以前阶梯住在 `sf_binder`（降级腿）里，还要伸手读 `sf_uprobe` 的模块级 static——加第四条腿要改降级腿的主循环。
+* hint 在生效时不带 fps（一个字节的 hint 不是计数），所以 `active()` 此时返回 `source=hint, fps=0`——
+  与记录器此前的行为一致，只是从散落的 `set_last_fps(0.0)` 收敛到一处。
+* 状态文件字段由 `Published::render()` 一处生成，测试钉住 WebUI 解析的每个 key（含"缺失值渲染成 `-` 而不是 0"）。
+
 ### 6.1 运行时旋钮面（`Settings`）
 
 `uperf_rs_start` 在最外层调用 `Settings::from_env(config, log)`，派生出 `uperf.state` / `orig_governor.txt` /

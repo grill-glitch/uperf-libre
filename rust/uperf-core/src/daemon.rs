@@ -250,7 +250,7 @@ impl Daemon {
     }
 
     /// The two frame legs. They are independent tasks; which one *wins* is decided in
-    /// `sf_binder` (`FrameSource`), not here.
+    /// `frame_state` (the ladder), not here.
     fn start_frame_legs(&mut self) {
         // ⑪ (user-appended): the AppOpt FPS **primary** leg — a uprobe on the target
         // app's own `libgui.so` `queueBuffer`, one probe per thread, so only *that*

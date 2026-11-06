@@ -296,7 +296,7 @@ impl RecorderTask {
                         break;
                     }
                     let (top, scene) = state();
-                    let fps = crate::sf_binder::last_fps();
+                    let fps = crate::frame_state::last_fps();
                     if let Some(s) = rec.observe(now, top.as_deref(), &scene, fps) {
                         commit_and_log(&mut rec, &s, &log);
                     }

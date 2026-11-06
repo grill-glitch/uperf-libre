@@ -30,6 +30,7 @@ pub mod daemon;
 pub mod dfps_rs;
 pub mod ffi;
 pub mod foreground;
+pub mod frame_state;
 pub mod hint;
 pub mod inotify;
 pub mod orchestrator;

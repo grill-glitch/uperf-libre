@@ -546,18 +546,10 @@ pub fn frame_hint(frames_in_window: usize) -> Option<SfHint> {
     }
 }
 
-/// The last fps the frame leg measured, ×100 (0 = none / not running). Process-wide so
-/// the recorder (⑧) can read it without a channel between the two tasks.
-static LAST_FPS_X100: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Last measured fps, or 0.0 when the frame leg is not the active source.
-pub fn last_fps() -> f64 {
-    LAST_FPS_X100.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0
-}
-
-fn set_last_fps(fps: f64) {
-    LAST_FPS_X100.store((fps * 100.0) as u64, std::sync::atomic::Ordering::Relaxed);
-}
+/// This leg reports into `frame_state` (which also owns the ladder and the published
+/// state file). The recorder reads `frame_state::last_fps()`, i.e. whichever leg is in
+/// effect, not this one specifically.
+use crate::frame_state::{choose_source, FrameSource};
 
 /// `CLOCK_MONOTONIC` in nanoseconds — the clock SF's timestamps are on.
 pub fn monotonic_ns() -> u64 {
@@ -611,42 +603,8 @@ pub fn pick_layer(list_text: &str, package: &str) -> Option<String> {
     names.into_iter().next()
 }
 
-// ---------------------------------------------------------------- source priority
-
-/// Which frame source is primary.
-///
-/// The M8-injected `sfanalysis.hint` wins whenever it is fresh — it is the real
-/// thing, a per-vsync event from inside SurfaceFlinger. The direct-binder FPS leg is
-/// the **degraded fallback** for when that library is not injected. While the hint is
-/// live the FPS leg is not even polled: each poll is a binder round trip plus a pipe
-/// read, so the priority has a real cost consequence, not just a label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameSource {
-    Hint,
-    /// ⑪'s primary leg: a uprobe on the app's own `libgui.so` `queueBuffer`, counted per
-    /// thread, so only that app's frames are counted.
-    Uprobe,
-    Fps,
-}
-
-impl FrameSource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            FrameSource::Hint => "hint",
-            FrameSource::Uprobe => "uprobe",
-            FrameSource::Fps => "fps",
-        }
-    }
-}
-
-/// Pick the primary source from the hint file's age. `None` (absent/unreadable) means
-/// the hint leg is not there at all.
-pub fn choose_source(hint_age_ms: Option<u64>, stale_after_ms: u64) -> FrameSource {
-    match hint_age_ms {
-        Some(age) if age <= stale_after_ms => FrameSource::Hint,
-        _ => FrameSource::Fps,
-    }
-}
+// The ladder lives in `frame_state`: the fallback leg must not own the policy, and the
+// `FrameSource` vocabulary is shared with the state file and the recorder.
 
 /// Age of the hint file in milliseconds, from its mtime. The hint carries no timestamp
 /// of its own (one raw byte, spec §2.2), so mtime is the only freshness signal — and
@@ -669,19 +627,6 @@ pub fn hint_age_ms(path: &Path) -> Option<u64> {
 pub struct FrameTask {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
-}
-
-/// Best-effort atomic write of the frame-source state file. Reporting must never take
-/// the sampler down, so every failure is silent.
-fn write_state(path: &Path, lines: &str) {
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".new");
-    let tmp = std::path::PathBuf::from(tmp);
-    if std::fs::write(&tmp, lines).is_ok() && std::fs::rename(&tmp, path).is_ok() {
-        return;
-    }
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::write(path, lines);
 }
 
 impl FrameTask {
@@ -711,33 +656,30 @@ impl FrameTask {
         let handle = std::thread::Builder::new()
             .name("uperf-sf-bind".into())
             .spawn(move || {
-                let publish = |source: FrameSource, age: Option<u64>, fps: Option<f64>, frames: usize, layer: Option<&str>, refresh: Option<u64>| {
-                    if let Some(p) = state_path.as_ref() {
-                        let mut out = String::with_capacity(256);
-                        out.push_str(&format!("source={}\n", source.as_str()));
-                        out.push_str(&format!(
-                            "hint_age_ms={}\n",
-                            age.map(|a| a.to_string()).unwrap_or_else(|| "-".into())
-                        ));
-                        out.push_str(&format!(
-                            "fps={}\n",
-                            fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "-".into())
-                        ));
-                        out.push_str(&format!("frames={frames}\n"));
-                        out.push_str(&format!(
-                            "refresh_ns={}\n",
-                            refresh.map(|r| r.to_string()).unwrap_or_else(|| "-".into())
-                        ));
-                        out.push_str(&format!("layer={}\n", layer.unwrap_or("-")));
-                        out.push_str(&format!("ts_ms={}\n", monotonic_ns() / 1_000_000));
-                        write_state(p, &out);
-                    }
+                let publish = |source: FrameSource,
+                               age: Option<u64>,
+                               fps: Option<f64>,
+                               frames: usize,
+                               layer: Option<&str>,
+                               refresh: Option<u64>| {
+                    crate::frame_state::write_state(
+                        state_path.as_deref(),
+                        &crate::frame_state::Published {
+                            source,
+                            hint_age_ms: age,
+                            fps,
+                            frames,
+                            layer,
+                            refresh_ns: refresh,
+                        },
+                    );
                 };
 
                 let mut client = match SfClient::connect() {
                     Ok(c) => c,
                     Err(e) => {
                         log(&format!("Rust: sf-binder connect failed: {e}"));
+                        crate::frame_state::publish_binder(false, 0.0);
                         publish(FrameSource::Fps, None, None, 0, None, None);
                         return;
                     }
@@ -753,6 +695,9 @@ impl FrameTask {
                 while !stop_thread.load(Ordering::SeqCst) {
                     let age = hint_path.as_deref().and_then(hint_age_ms);
                     let src = choose_source(age, stale_ms);
+                    // The ladder's answer is also what the recorder reads: while the hint
+                    // is live there is no fps (a hint is one byte, not a count).
+                    crate::frame_state::publish_hint(src == FrameSource::Hint);
                     if last_src != Some(src) {
                         log(&format!(
                             "Rust: sf-binder frame source -> {} (hint_age_ms={:?})",
@@ -766,7 +711,6 @@ impl FrameTask {
                         FrameSource::Hint => {
                             // The injected leg is live; do not touch binder at all.
                             last_derived = None;
-                            set_last_fps(0.0);
                             publish(FrameSource::Hint, age, None, 0, None, None);
                         }
                         // `choose_source` only ever returns Hint or Fps; Uprobe is the label
@@ -776,10 +720,10 @@ impl FrameTask {
                             // while its probe is healthy it is the fps source and binder is
                             // not touched at all (each `--latency` poll is a round trip plus
                             // a pipe read, so this is a cost decision, not a label).
-                            if crate::sf_uprobe::healthy() {
-                                let fps = crate::sf_uprobe::last_fps();
-                                let frames = crate::sf_uprobe::last_frames();
-                                set_last_fps(fps);
+                            let probe = crate::frame_state::uprobe();
+                            if probe.healthy {
+                                let fps = probe.fps;
+                                let frames = probe.frames;
                                 publish(FrameSource::Uprobe, age, Some(fps), frames as usize, None, None);
                                 if last_derived.take().is_some() {
                                     log("Rust: sf frame source -> uprobe (binder --latency stands down)");
@@ -813,7 +757,7 @@ impl FrameTask {
                                             refresh.unwrap_or(0),
                                             frames.len()
                                         ));
-                                        set_last_fps(fps);
+                                        crate::frame_state::publish_binder(true, fps);
                                         publish(FrameSource::Fps, age, Some(fps), frames.len(), Some(&l), refresh);
                                         if let Some(h) = frame_hint(in_win) {
                                             if last_derived != Some(h) {
@@ -831,6 +775,7 @@ impl FrameTask {
                                     Err(e) => {
                                         fails += 1;
                                         log(&format!("Rust: sf-binder latency: {e}"));
+                                        crate::frame_state::publish_binder(false, 0.0);
                                         publish(FrameSource::Fps, age, None, 0, Some(&l), None);
                                         if fails >= 5 {
                                             layer = pinned.clone();
@@ -838,7 +783,10 @@ impl FrameTask {
                                         }
                                     }
                                 },
-                                None => publish(FrameSource::Fps, age, None, 0, None, None),
+                                None => {
+                                    crate::frame_state::publish_binder(false, 0.0);
+                                    publish(FrameSource::Fps, age, None, 0, None, None)
+                                }
                             }
                         }
                     }
@@ -964,15 +912,8 @@ mod tests {
 
     /// The injected hint is primary while it is fresh; the binder leg takes over when
     /// it is gone. `None` (no hint file) is the degraded case, never a reason to wait.
-    #[test]
-    fn the_hint_wins_only_while_it_is_fresh() {
-        assert_eq!(choose_source(Some(0), 3000), FrameSource::Hint);
-        assert_eq!(choose_source(Some(3000), 3000), FrameSource::Hint);
-        assert_eq!(choose_source(Some(3001), 3000), FrameSource::Fps);
-        assert_eq!(choose_source(None, 3000), FrameSource::Fps);
-        assert_eq!(FrameSource::Hint.as_str(), "hint");
-        assert_eq!(FrameSource::Fps.as_str(), "fps");
-    }
+    // The ladder's own tests live in `frame_state` (it owns `choose_source` now); the
+    // binder only imports it.
 
     #[test]
     fn a_missing_hint_file_has_no_age() {
