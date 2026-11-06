@@ -609,15 +609,15 @@ done
 ├─────────────────────────────────────────────────────────────┤
 │ extern "C" 桥（cpp/include/uperf_rs.h）                      │
 ├─────────────────────────────────────────────────────────────┤
-│ Rust（本项目重写, staticlib libuperf_rs.a）                   │
-│  app      模块装配（替代 uperf.cpp）                         │
-│  config   JSON 解析 + 点号键覆盖 + 兼容告警                  │
-│  switcher hint FSM + preset/perapp 切换 + 时长               │
-│  profile  preset/scene → 各模块参数表下发                    │
-│  sysfs    6 类写入器 + 去重 + fd 缓存                        │
-│  governor 负载采样 + 能耗模型 + PL1/PL2 池 + 频点决策       │
-│  sched    上下文调度规则引擎（PCRE2 语义的 ERE）             │
-│  sf       sfanalysis.hint 消费 + 渲染结束/Hint 提前结束     │
+│ Rust（本项目重写，crate 都在 rust/ 下）                      │
+│  uperf-config   schema + 层叠 + sysfs 规划 + governor        │
+│                 + sched 规则引擎（无 unsafe，主机可测）      │
+│  uperf-core     daemon（任务注册表）+ orchestrator + 各任务  │
+│                 （cpu / sched / watch / record / ctl / 帧源）│
+│                 + C ABI                                      │
+│  uperf-dfps     动态刷新率（独立 subtree/crate）             │
+│  uperf-sfanalysis  注入库（cdylib，独立 profile）            │
+│  uperf-cli      主机端 parity 工具（不随模块发布）           │
 └─────────────────────────────────────────────────────────────┘
 ```
 

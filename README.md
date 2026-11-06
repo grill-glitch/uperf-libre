@@ -274,15 +274,15 @@ See [`AGENT.md`](./AGENT.md) for the full plan and acceptance criteria, and
             │ extern "C" bridge           │ event callbacks
             │ cpp/include/uperf_rs.h      │
 ┌─────────────▼──────────────────────────▼────────────────────┐
-│ Rust (this project, staticlib libuperf_rs.a)                 │
-│  app      module wiring (replaces uperf.cpp)                 │
-│  config   JSON parse + dot-key overrides + compat warnings   │
-│  switcher hint FSM + preset/perapp switching + duration      │
-│  profile  preset/scene → per-module parameter dispatch       │
-│  sysfs    5 writer kinds, per-kind payload (sink: offline)   │
-│  governor load sampling + energy model + PL1/PL2 pool + OPP │
-│  sched    context-scheduler rule engine (PCRE2-semantics ERE)│
-│  sf       sfanalysis.hint consumer + render-end / Hint EOF   │
+│ Rust (this project — crates under rust/)                     │
+│  uperf-config   schema + cascade + sysfs planner + governor  │
+│                 + sched rule engine (no unsafe, host-tested) │
+│  uperf-core     daemon (task registry) + orchestrator + the  │
+│                 tasks (cpu / sched / watch / record / ctl /  │
+│                 frame legs) + the C ABI                      │
+│  uperf-dfps     dynamic refresh rate (its own subtree/crate) │
+│  uperf-sfanalysis  injected library (cdylib, own profile)    │
+│  uperf-cli      host parity tool (not shipped)               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -301,7 +301,7 @@ see [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md) and the
   reproducible to <0.0015 against the upstream printout), the
   PL1/PL2 pool arithmetic, the scene → sysfs writer pipeline, and the
   inotify-based hot reload of `cur_powermode.txt` / `perapp_powermode.txt`.
-- **Supervision (M9)**: host-verified (`cargo test --release`, 211 tests; and
+- **Supervision (M9)**: host-verified (`cargo test --release`, 283 tests across the workspace; and
   `sh scripts/test_watchdog_host.sh`, 10 cases / 60 assertions against the real
   script), **device-verified** on alioth (`scripts/m9-device-verify.sh`, 33
   assertions: `/proc/<pid>/exe` survives dfps' cmdline rewrite, the dead-man path
