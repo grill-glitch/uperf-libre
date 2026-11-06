@@ -533,7 +533,7 @@ sh build.sh Release make check
 
 产物落到 `build/aarch64-linux-android23/runnable/uperf`。`make check` 目标**先**跑 `cargo test --release`（Rust 内核）再调 CMake，因为 FFI 签名变更后若 `libuperf_core.a` 是旧版本会在 `memcpy` 里 segfault（见 `AGENT.md §10` 与 [`docs/`](./docs) 中的真机证据）。
 
-Magisk 模块打包命令沿用上游约定；`build.sh pack` 产出一个 KernelSU 兼容 zip，落到下次开机时的 `/data/adb/modules_update/uperf-libre`。模块 id、路径、以及 `libuperf.sh` 脚本契约全部保留。
+Magisk 模块打包命令沿用上游约定；`sh build.sh Release pack` 产出一个 KernelSU 兼容 zip，落到下次开机时的 `/data/adb/modules_update/uperf-libre`。模块 id、路径、以及 `libuperf.sh` 脚本契约全部保留。省略 `Release` 也可以（`sh build.sh pack` 等同），但显式写出构建类型更稳。
 
 不使用 Magisk/KernelSU 时：把 zip 解到设备任意目录，执行 `sh <解压目录>/script/setup.sh`，它会把匹配到的 SoC 配置播种到 `$USER_PATH/uperf.json`，并在改动任何东西之前打印作者、许可证与免责声明。然后用模块相同的方式启动守护进程：
 

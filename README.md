@@ -173,10 +173,11 @@ change segfaults in `memcpy` (see `AGENT.md §10` and the upstream notes in
 
 ## Install
 
-The Magisk module packaging is unchanged from upstream; `build.sh pack` produces
+The Magisk module packaging is unchanged from upstream; `sh build.sh Release pack` produces
 a KernelSU-compatible zip that drops into `/data/adb/modules_update/uperf-libre`
 on next boot. The module id, paths, and the `libuperf.sh` script contracts
-are all preserved.
+are all preserved. The build type may be omitted (`sh build.sh pack` is the same
+invocation), but stating it explicitly is what the examples use.
 
 Without Magisk/KernelSU: unpack the zip somewhere on the device and run
 `sh <unpacked>/script/setup.sh`. That seeds the matched SoC config into

@@ -19,6 +19,7 @@
 # cmake invocation pattern). Added tasks: check, push, run, test.
 #
 # usage: sh build.sh [Release|Debug] <task> [task...]
+#   the build type is optional; `sh build.sh pack` means `sh build.sh Release pack`
 #   tasks: make pack push run install reboot clean check all
 # env:
 #   ANDROID_NDK   default ~/Android/Sdk/ndk/android-ndk-r30
@@ -29,9 +30,35 @@
 set -e
 
 BASEDIR="$(dirname $(readlink -f "$0"))"
-BUILD_TYPE="${1:-Release}"
-BUILD_TASKS="${*:2}"
-BUILD_TASKS="${BUILD_TASKS:-all}"
+
+# The build type is optional, but a *task* must never be read as one. `sh build.sh pack`
+# (the form the README advertised) used to become BUILD_TYPE=pack with the task list
+# defaulting to `all`: cmake got -DCMAKE_BUILD_TYPE=pack, matched neither branch in
+# cpp/uperf/CMakeLists.txt, and linked the driver default — libc++_shared, no -flto, no
+# strip. The result was a 7.4 MiB binary that `check` rejects (§ unexpected NEEDED libs)
+# and that cannot start on a device without /system/lib64/libc++_shared.so — and the
+# failure only surfaced in `check`, *after* `pack` had already written a zip. See issue #1.
+usage_uperf() {
+    echo "usage: sh build.sh [Release|Debug] <task> [task...]"
+    echo "  tasks: make pack push run install reboot clean check all  (default: all)"
+    echo "  the build type may be omitted: 'sh build.sh pack' == 'sh build.sh Release pack'"
+}
+
+BUILD_TYPE=Release
+case "${1:-}" in
+Release | Debug)
+    BUILD_TYPE="$1"
+    shift
+    ;;
+"") ;;
+make | pack | push | run | install | reboot | clean | check | all) ;;
+*)
+    echo " !! neither a build type (Release|Debug) nor a task: $1"
+    usage_uperf
+    exit 1
+    ;;
+esac
+BUILD_TASKS="${*:-all}"
 
 ANDROID_NDK="${ANDROID_NDK:-$HOME/Android/Sdk/ndk/android-ndk-r30}"
 TOOLCHAIN_PREBUILT="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64"
@@ -290,6 +317,13 @@ check_uperf() {
 }
 
 pack_uperf() {
+    # `pack` does not build; a bare `sh build.sh pack` on a fresh clone would otherwise
+    # fail inside `cp` with a path-only message.
+    [ -f "$BINARY" ] || {
+        echo " !! $BINARY is not built; nothing to pack"
+        echo "    run: sh build.sh $BUILD_TYPE make pack"
+        exit 1
+    }
     build_webui
     echo ">>> Packing uperf-magisk.zip"
     rm -rf $STAGE_DIR

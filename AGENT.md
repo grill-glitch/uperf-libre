@@ -522,6 +522,11 @@ falls back to 883200 and the pool refills.
 * NDK: same as dfps, `aarch64-linux-android23-*` (r24 verified; r30 works locally but requires re-running §10.1).
 * Rust: `aarch64-linux-android` target + `cargo-ndk`.
 * `build.sh` tasks: `make | pack | install | reboot | clean | check` (following dfps's build.sh style).
+  The first argument is the build type (`Release`/`Debug`) and is optional; a task name is
+  never read as one, and anything else is rejected before any work starts. Only `Release`
+  and `Debug` reach the link-flag branches in `cpp/uperf/CMakeLists.txt:87-99`; any other
+  `CMAKE_BUILD_TYPE` (e.g. the old `BUILD_TYPE=pack` mis-parse) silently links the driver
+  default `libc++_shared`, which `check` then rejects and which does not exist on a device.
 
 ### 9.2 Flow
 
