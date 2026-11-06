@@ -18,7 +18,6 @@
 //!
 //! `durations[scene]` is `cfg.switcher.hintDuration[scene]` (ms).
 
-#![allow(dead_code)]
 
 use serde_json::{Map, Value};
 use std::time::{Duration, Instant};

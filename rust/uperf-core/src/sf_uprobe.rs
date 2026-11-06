@@ -26,7 +26,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The library the probes live in, and the candidate symbols in the order they are tried.
 pub const LIBGUI: &str = "/system/lib64/libgui.so";
@@ -514,11 +514,6 @@ impl UprobeTask {
 }
 
 /// Timestamp helper kept local so the module does not depend on the frame-source one.
-#[allow(dead_code)]
-fn now_ms() -> u64 {
-    Instant::now().elapsed().as_millis() as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

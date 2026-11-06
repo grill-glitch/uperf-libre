@@ -15,7 +15,6 @@
 //! They are emitted **without** the `Rust:` prefix the rest of the rewrite uses, and
 //! the log sink's bare-prefix mode already renders them as `HH:MM:SS L <line>`.
 
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 

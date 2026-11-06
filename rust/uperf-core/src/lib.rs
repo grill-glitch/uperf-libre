@@ -52,7 +52,6 @@ pub mod watch_task;
 
 use std::ffi::CStr;
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex as PMutex;
 
@@ -268,14 +267,6 @@ pub(crate) fn log_msg(s: &str) {
     buf.push(b'\n');
     // SAFETY: spdlog file sink copies before returning.
     unsafe { ffi::uperf_bridge_write_log(std::ptr::null(), buf.as_ptr().cast(), buf.len()) };
-}
-
-#[allow(dead_code)]
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

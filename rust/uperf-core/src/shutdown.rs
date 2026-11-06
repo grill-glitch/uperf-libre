@@ -11,7 +11,6 @@
 //! So every join is bounded, and a task that owns something that must be undone
 //! gets a way to undo it from the stopping thread too.
 
-#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

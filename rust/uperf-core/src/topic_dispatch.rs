@@ -5,7 +5,7 @@
 //! the C++ side only ever calls `uperf_bridge_write_log` from this thread, so log
 //! lines cannot race. M3 will swap the print for the switcher / state machine.
 
-use std::ffi::{c_char, CStr};
+
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -404,14 +404,6 @@ fn write_log_line(s: &str) {
     }
 }
 
-#[allow(dead_code)]
-fn _cstr_assert(c: *const c_char) -> Option<&'static str> {
-    if c.is_null() {
-        return None;
-    }
-    // SAFETY: for diagnostics only.
-    unsafe { CStr::from_ptr(c) }.to_str().ok()
-}
 
 #[cfg(test)]
 mod foreground_tick_tests {

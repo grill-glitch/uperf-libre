@@ -6,7 +6,6 @@
 //! redirects them for offline validation and the real sysfs is untouched until
 //! a later milestone wires the fd-cached writer.
 
-#![allow(dead_code)]
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};

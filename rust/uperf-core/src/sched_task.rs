@@ -14,7 +14,6 @@
 //!   * `UPERF_SCHED_ONLY=<substr>` — restrict to processes whose name contains the
 //!     substring, so a live check can be confined to a process we own.
 
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 

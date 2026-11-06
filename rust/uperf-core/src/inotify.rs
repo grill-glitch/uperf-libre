@@ -8,7 +8,6 @@
 //!
 //! Only `inotify_add_watch`/`poll`/`read` are wrapped, with no external crates.
 
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::io;

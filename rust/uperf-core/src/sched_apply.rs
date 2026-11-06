@@ -8,7 +8,6 @@
 //! Every function here is safe to call on the *current* thread, which is how the
 //! host unit tests exercise them for real rather than mocking the syscalls.
 
-#![allow(dead_code)]
 
 use std::io;
 use std::path::PathBuf;
@@ -366,27 +365,6 @@ mod tests {
     /// ->NORMAL  EPERM
     /// ->BATCH   EPERM
     /// ->FIFO10  EPERM
-    /// ```
-    ///
-    /// So every destructive policy assertion here is written to accept either
-    /// outcome and only checks the part the kernel permits. On device uperf runs
-    /// as real root with full caps, where the round trip succeeds.
-    fn can_raise_priority() -> bool {
-        let me = current_tid();
-        let before = thread_sched(me).expect("read own stat").0;
-        if set_sched(0, P::Idle).is_err() {
-            return false; // cannot even lower -> nothing to learn
-        }
-        let raised = set_sched(0, P::Normal { nice: 0 }).is_ok();
-        if !raised {
-            // Leave the thread as the kernel will let us: nothing more to do,
-            // it is the last thing this test thread runs.
-            return false;
-        }
-        let _ = set_sched(0, P::Normal { nice: 0 });
-        let _ = before;
-        true
-    }
 
     #[test]
     fn sched_idle_sets_policy_5() {

@@ -22,7 +22,6 @@
 //! Applying a mode reuses `topic_dispatch::apply_pending`, so a preset switched
 //! from a file produces the same sysfs writes as one switched by an event.
 
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};

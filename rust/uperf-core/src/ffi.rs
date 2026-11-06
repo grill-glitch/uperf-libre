@@ -9,27 +9,6 @@ use parking_lot::Mutex as PMutex;
 
 use crate::topic_dispatch::Event;
 
-/// Opaque C++ log line — `msg` is NUL-terminated UTF-8 valid for the call only.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub(crate) struct LogLine {
-    msg: *const c_char,
-}
-
-#[allow(dead_code)]
-impl LogLine {
-    /// SAFETY: caller must guarantee `msg` is a NUL-terminated UTF-8 byte slice.
-    pub(crate) unsafe fn msg(&self) -> &'static str {
-        if self.msg.is_null() {
-            return "";
-        }
-        // SAFETY: contract.
-        unsafe { std::ffi::CStr::from_ptr(self.msg) }
-            .to_str()
-            .unwrap_or("(non-utf8 log)")
-    }
-}
-
 /// Process-lifetime handle to the C++ bridge. C++ gives us a single `Bridge*` at
 /// boot via `uperf_rs_init`; Rust subscribes / writes logs through it.
 ///

@@ -11,7 +11,6 @@
 //!   * real device writes land in a later step (they need fd caching plus the
 //!     read-modify-write retry semantics of the upstream writer classes)
 
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
