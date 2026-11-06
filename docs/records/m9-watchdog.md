@@ -58,8 +58,8 @@ Started by `uperf_start` (last, after the 2 s daemon bring-up), stopped by
    * Why not the process name: dfps rewrites the cmdline of the supervisor **and**
    the worker to plain `uperf`, `pidof` does not match a zombie, and a `killall`
    teardown that matches the binary's filename kills only the supervisor and
-   orphans the worker that owns the governor (`docs/m6b-evidence.md` §9-§11,
-   `docs/m7-evidence.md` §1).
+   orphans the worker that owns the governor (`docs/records/m6b-evidence.md` §9-§11,
+   `docs/records/m7-evidence.md` §1).
    * Why not a recorded pid: a restart can reuse the same pid for the same
    binary. `exe` cannot be reused.
    * The scan filters candidates on `/proc/<pid>/comm` **first**, because a
@@ -188,7 +188,7 @@ hide why the platform governor is in charge.
 
 Both are written through a same-directory temp file plus `rename`, with a direct
 write as the fallback: `/sdcard` is FUSE and a root `unlink` there can silently
-no-op on this device (`docs/m6b-evidence.md` §6), so `rename` is not assumed to
+no-op on this device (`docs/records/m6b-evidence.md` §6), so `rename` is not assumed to
 stick — and status reporting must not depend on it either.
 
 `uperf_watchdog.log` records every decision (start, each unhealthy sample, the
@@ -270,7 +270,7 @@ after; the installed module's daemon is only observed (`UPERF_WATCHDOG_DRY_RUN=1
   the 1 s sleep slices (one `sleep` fork per slice), the `armed` reads, and the
   state-file write. Measured, not estimated.
 
-The raw log is kept at [`docs/m9-device-run-alioth.txt`](./m9-device-run-alioth.txt)
+The raw log is kept at [`docs/records/m9-device-run-alioth.txt`](./m9-device-run-alioth.txt)
 (the harness also writes a `.completed` marker on the device, so a truncated log
 cannot pass for a finished run — that failure mode cost two rounds here).
 
@@ -303,7 +303,7 @@ premise).
 
 **[V] Device, install + boot** (`scripts/m9-device-boot-verify.sh`, **23
 assertions, 0 failures**, raw log in
-[`docs/m9-boot-run-alioth.txt`](./m9-boot-run-alioth.txt)). The module was installed
+[`docs/records/m9-boot-run-alioth.txt`](./m9-boot-run-alioth.txt)). The module was installed
 with `ksud module install` (staged binary md5 == the local build) and the device
 restarted:
 
@@ -346,7 +346,7 @@ restarted:
 * the poll-then-drop-lock fallback in `uperf_watchdog_stop` was not exercised
   against a watchdog that refuses to die within 5 s;
 * a full day of uptime (the log cap's long-run behaviour is inferred from the
-  rotation being size-driven — see `docs/m10-log-cap.md`).
+  rotation being size-driven — see `docs/records/m10-log-cap.md`).
 
 ## 6. Knobs
 

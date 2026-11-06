@@ -1,7 +1,7 @@
 # uprobe-probe — ⑤b（AppOpt 主腿）的计数原语
 
 `uprobe-count` 用 `perf_event_open` 数一个 uprobe 的命中，目标是"**只数目标应用的帧**"。
-两条路都实现并对过（真机结论见 `docs/m11-11-ebpf-uprobe-frame-leg.md`）：
+两条路都实现并对过（真机结论见 `docs/records/m11-11-ebpf-uprobe-frame-leg.md`）：
 
 ```sh
 # 路线 B（定形）：uprobe PMU，按 TID 绑定

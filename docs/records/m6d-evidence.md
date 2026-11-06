@@ -99,6 +99,6 @@ the line (`dry_would_change=`), so a dry run reports what it would have done.
 
 ## 4. Still open
 
-* `modules.input.enable` is not honoured (see `docs/m6b-evidence.md` §11). **[U]**
+* `modules.input.enable` is not honoured (see `docs/records/m6b-evidence.md` §11). **[U]**
 * the `sfanalysis.hint` producer's path (see §8 of `m6b`). **[U]**
 * `auto` in `cur_powermode.txt` **[I]**.

@@ -21,10 +21,10 @@ BASEDIR="$(dirname "$0")"
 . $BASEDIR/libcgroup.sh
 
 # The rewrite drives frequency through `scaling_governor=userspace` (the only
-# writable path on a qcom-cpufreq-hw kernel — see docs/m5-cpu-governor.md §2), which
+# writable path on a qcom-cpufreq-hw kernel — see docs/records/m5-cpu-governor.md §2), which
 # is a *takeover*: if the daemon dies without disarming, the policies stay pinned at
 # the last published frequency. The daemon restores them on every stop path it can
-# run (including SIGTERM/SIGINT — see docs/m6b-evidence.md §9), but a SIGKILL leaves
+# run (including SIGTERM/SIGINT — see docs/records/m6b-evidence.md §9), but a SIGKILL leaves
 # nothing able to do it. This is the script-side safety net, and it only ever undoes
 # our own state: a policy is touched solely while it reads `userspace`.
 GOVERNOR_STATE="$USER_PATH/orig_governor.txt"
@@ -173,7 +173,7 @@ uperf_restore_sysfs() {
 # the two exits that leave the CPU pinned in `userspace` (SIGKILL, and a Rust
 # panic under `panic = "abort"`) are exactly the ones no in-process path survives,
 # so the reaction has to come from outside the process. See
-# `magisk/script/uperf_watchdog.sh` and `docs/m9-watchdog.md`.
+# `magisk/script/uperf_watchdog.sh` and `docs/records/m9-watchdog.md`.
 
 uperf_watchdog_pid() {
     local owner lock_dir
@@ -301,7 +301,7 @@ uperf_start() {
     # shell at boot, or the WebUI's `exec`, whose read end disappears the moment the
     # command returns. A write to that broken pipe raises SIGPIPE and took the daemon
     # down ~90s after a WebUI-style restart (see app_main.cpp and
-    # docs/m7-evidence.md §7). The daemon also ignores SIGPIPE; this keeps the failure
+    # docs/records/m7-evidence.md §7). The daemon also ignores SIGPIPE; this keeps the failure
     # impossible rather than merely survivable, and keeps `-o` the only sink.
     #
     # `setsid()` inside the daemon is what makes it outlive this script; the

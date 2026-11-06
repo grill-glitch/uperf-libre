@@ -2,7 +2,7 @@
 //! `libsfanalysis.so`.
 //!
 //! What the vendor library does (established by r2 + on-device strace,
-//! docs/m8-sfanalysis-reverse.md §5/§5b):
+//! docs/records/m8-sfanalysis-reverse.md §5/§5b):
 //!
 //!   1. injected into `surfaceflinger` via `patchelf --add-needed`;
 //!   2. the ctor sets the calling thread to `SCHED_FIFO` priority 3, arms a
@@ -20,7 +20,7 @@
 //! This crate reproduces 1–5. The only intentional deviations are the ones the
 //! spec records: `dlsym` instead of a hand-rolled ELF dynsym walk, and the
 //! maps scan filters on the `x` permission (the vendor's does not, which makes
-//! it patch the ELF-header segment — see docs/m8-sfanalysis-reverse.md §0).
+//! it patch the ELF-header segment — see docs/records/m8-sfanalysis-reverse.md §0).
 //!
 //! Env (documented, not part of the vendor surface):
 //!   UPERF_SFANALYSIS_DISABLE=1     do nothing
@@ -33,7 +33,7 @@
 // `dl_iterate_phdr`, rewrites relocation slots and calls libc through `dlsym`.
 // The `unsafe` therefore cannot be removed — but it must stay minimal, remain
 // inside an explicit block even inside an `unsafe fn`, and never become
-// decorative (audit: `UNSAFE_AUDIT_REPORT.md`).
+// decorative (audit: `docs/audit/unsafe-audit-report.md`).
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unused_unsafe)]
 

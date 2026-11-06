@@ -64,7 +64,7 @@
 
 ## Not yet specified
 
-（Fog 文件在 `.wayfinder-fog.md`。新问题出现时记在那里。）
+（Fog 文件在 `docs/history/wayfinder-fog.md`。新问题出现时记在那里。）
 
 ## Out of scope
 

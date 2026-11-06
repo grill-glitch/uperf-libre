@@ -1,6 +1,6 @@
 //! Inline-hook engine for the four libc functions the vendor library observes.
 //!
-//! Behaviour being replicated (docs/m8-sfanalysis-reverse.md §5): the vendor
+//! Behaviour being replicated (docs/records/m8-sfanalysis-reverse.md §5): the vendor
 //! registers replacements for `ioctl`, `epoll_wait`, `pthread_cond_wait` and
 //! `pthread_cond_timedwait`; each replacement calls the original first, keeps
 //! its return value, runs an observer, then returns the original's value.
@@ -233,7 +233,7 @@ pub fn resolve_entry(name: &str) -> Result<usize, HookError> {
 ///
 /// The vendor's scan does NOT filter on perms and therefore patches the
 /// *first* matching mapping — for `libandroidfw.so` that is the r--p ELF
-/// header, not the r-xp text (docs/m8-sfanalysis-reverse.md §0). Filtering is
+/// header, not the r-xp text (docs/records/m8-sfanalysis-reverse.md §0). Filtering is
 /// a deliberate correction, recorded in the spec.
 pub fn is_executable(addr: usize) -> bool {
     let Ok(txt) = std::fs::read_to_string("/proc/self/maps") else {
@@ -344,7 +344,7 @@ mod arch {
     ///
     /// # Unreachable, and not in the shipped library
     ///
-    /// Established by the R-2 audit (`UNSAFE_AUDIT_REPORT.md` §R-2 / §11); re-verify
+    /// Established by the R-2 audit (`docs/audit/unsafe-audit-report.md` §R-2 / §11); re-verify
     /// with the commands recorded there before relying on it.
     ///
     /// * **No caller anywhere in the workspace** — not a call, not a function

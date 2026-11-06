@@ -74,7 +74,7 @@ $ sh dfps.sh set-rule com.hermes.previewtest 45 90
 ```
 
 The RESTART path is what exposed four real defects in the module's own scripts; they are
-written up in `docs/m7-evidence.md` §7. The two that mattered most: a lost `$USER_PATH`
+written up in `docs/records/m7-evidence.md` §7. The two that mattered most: a lost `$USER_PATH`
 used to disable the module permanently (now self-healing), and the daemon used to die of
 `SIGPIPE` ~90s after any shell-scoped restart (now it ignores `SIGPIPE` and the launcher
 detaches its stdio) — which is exactly what a WebUI restart would have triggered.

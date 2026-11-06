@@ -2,7 +2,7 @@
 //! `queueBuffer`, counted per thread, so only *that* app's frames are counted
 //! (AGENT.md §11 queue item ⑪).
 //!
-//! The measurements behind this design are in `docs/m11-11-ebpf-uprobe-frame-leg.md`:
+//! The measurements behind this design are in `docs/records/m11-11-ebpf-uprobe-frame-leg.md`:
 //!
 //! * this kernel has `CONFIG_UPROBES`/`UPROBE_EVENTS` and the `uprobe` perf PMU (type 6),
 //!   and no kprobes;

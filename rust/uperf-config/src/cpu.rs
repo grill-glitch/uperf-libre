@@ -218,7 +218,7 @@ mod tests {
     }
 
     /// The exact `opp <freq> pwr <x> cost <y>` triples the upstream binary
-    /// printed on alioth at startup (docs/m5-evidence.md §1).
+    /// printed on alioth at startup (docs/records/m5-cpu-governor.md §1).
     const UPSTREAM_OPPS: [&[(f64, f64, f64)]; 3] = [
         &[
             (614400.0, 0.053, 0.075),

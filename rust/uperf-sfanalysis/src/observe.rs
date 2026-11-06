@@ -1,6 +1,6 @@
 //! The observer state machine.
 //!
-//! Mirrors the vendor's shape (docs/m8-sfanalysis-reverse.md §5): each hooked
+//! Mirrors the vendor's shape (docs/records/m8-sfanalysis-reverse.md §5): each hooked
 //! call feeds `note()`, which timestamps the call, bumps counters, and — for an
 //! `ioctl` carrying `BINDER_WRITE_READ` — walks the transaction buffer. The
 //! vendor's machine gates on a `state` word and, on some transitions, re-reads

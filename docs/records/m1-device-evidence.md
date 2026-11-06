@@ -1,6 +1,6 @@
 # M1 真机验证（2026-10-05，alioth `f748d277`）
 
-> **前提**：M1 build/check 已通过（`docs/m1-evidence.md` §1-§4）；真机断开未做真机验证。
+> **前提**：M1 build/check 已通过（`docs/records/m1-evidence.md` §1-§4）；真机断开未做真机验证。
 > 本文是 M1 **真机补验**——设备重新插上 USB 之后的事实留档。
 
 ## 1. 上传与启动
@@ -120,7 +120,7 @@ adb -s f748d277 shell su -c 'killall uperf; sleep 1; rm -f /data/local/tmp/uperf
 | C ABI 桥 (`uperf_bridge_t`) | ✅ | `uperf_bridge_init_rust` 返回非阻塞（§2） |
 | 13 topic 端到端贯通 | ✅ | `cgroup.{ta,fg,bg,re}.list/update`、`topapp.pkgName`、`offscreen.state` 全部双侧日志一致（§3, §4） |
 | payload 转换 (bool/string/pid_list 结构) | ✅ | pid list 预览 8/8 字节相等；空列表还原（§3） |
-| 单元测试（10/10 payload_decode） | ✅ | `docs/m1-evidence.md` §4 |
+| 单元测试（10/10 payload_decode） | ✅ | `docs/records/m1-evidence.md` §4 |
 | `input.touch` / `input.state` 真机事件 | ⚠️ 待 M2 | `adb shell input` 走 SF 注入而非 evdev；详见 §5 |
 
 **结论**：M1 **真机达成**。除 §5 的 `input.*` 事件待 M2 用真触摸补齐外，M1 全部交付项完成。

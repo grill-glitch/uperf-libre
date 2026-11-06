@@ -14,7 +14,7 @@
 //! We write all four so the same binary is correct on both AOSP-derived and
 //! stock MIUI ROMs. On crDroid alioth only `peak_refresh_rate` actually
 //! drives `dumpsys display` modeId — verified in
-//! `docs/m3-standalone-evidence.md` §(c).
+//! `docs/records/m3-evidence.md` §(c).
 //!
 //! ## Why `/system/bin/cmd settings` and not `/system/bin/settings`
 //!

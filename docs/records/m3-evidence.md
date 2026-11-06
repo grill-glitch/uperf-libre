@@ -102,7 +102,7 @@ AGENT.md §8.3 列了 6 类（string/percluster/percpu/cpufreq/cgroup_procs/uxaf
 
 ## 7. 数据来源
 
-- `~/uperf-rewrite/docs/ugt-configs/sdm888.json`（21 KB）
-- `~/uperf-rewrite/docs/upstream-configs/sdm888.json`（14 KB）
+- `~/uperf-rewrite/docs/configs/ugt/sdm888.json`（21 KB）
+- `~/uperf-rewrite/docs/configs/upstream/sdm888.json`（14 KB）
 - 真机 `/proc/22416/fd/`：原版 uperf v3 启动后的 fd 快照
 - `~/.hermes/cache/scratch/uperf_re/uperf/bin/uperf`：原版二进制 v3

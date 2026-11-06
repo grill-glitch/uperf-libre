@@ -5,7 +5,7 @@
 # Why this exists
 # ---------------
 # The CPU governor drives frequency through `scaling_governor=userspace`
-# (`docs/m5-cpu-governor.md` §2 — the only writable path on a `qcom-cpufreq-hw`
+# (`docs/records/m5-cpu-governor.md` §2 — the only writable path on a `qcom-cpufreq-hw`
 # kernel). That is a *takeover*: once armed, the kernel stops scaling the policy
 # and only the daemon can hand it back. Every stop path the daemon can run
 # restores the originals (SIGTERM/SIGINT in `cpp/uperf/app_main.cpp`, the
@@ -263,7 +263,7 @@ wd_classify() {
 # Can the cache be reused as-is? A matching pid *and* start time is the same identity
 # rule the owner lock uses, and it is two `read`s of /proc/<pid>/stat — no forks, no
 # sweep. `exe` is deliberately NOT re-read here: it is what decides *membership* of the
-# set, and membership is decided at every sweep (docs/m9-watchdog.md §6). A pid whose
+# set, and membership is decided at every sweep (docs/records/m9-watchdog.md §6). A pid whose
 # start time moved is a different process and fails the check.
 wd_cache_fresh() {
     local rec pid st
@@ -529,7 +529,7 @@ wd_state_body() {
 
 # Same-directory temp + rename where it works, direct write where it does not: a
 # root `unlink` under /sdcard can silently no-op on this device
-# (docs/m6b-evidence.md §6), so `mv` is not assumed to stick.
+# (docs/records/m6b-evidence.md §6), so `mv` is not assumed to stick.
 wd_state_write() {
     WD_LAST_WRITTEN="$1"
     wd_state_body "$1" "$2" >"$WD_STATE.new" 2>/dev/null

@@ -145,7 +145,7 @@ $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf \
 1. 在 vendor 件（baseline）和新件（replacement）下，分别录制同一段
    30s SF 渲染日志（包含切前台、切后台、滑动、点击各 ≥3 次）
 2. 把 `sfanalysis.hint` 的 byte 序列逐字节 diff
-3. 不一致的位置写入 `docs/m8-sfanalysis-reverse.md §3` 的 deviation table
+3. 不一致的位置写入 `docs/records/m8-sfanalysis-reverse.md §3` 的 deviation table
 4. **deviation > 0**：M8 不通过；≤0：进入 M9（vendor 件过渡期结束）
 
 ### 5.3 0 闭源 blob 不变量
@@ -168,14 +168,14 @@ done
 
 | 步骤 | 状态 | 文档 |
 |---|---|---|
-| 1. r2 静态逆向上游 libsfanalysis.so | 待办 | `docs/m8-sfanalysis-reverse.md` |
+| 1. r2 静态逆向上游 libsfanalysis.so | 待办 | `docs/records/m8-sfanalysis-reverse.md` |
 | 2. 写 `rust/uperf-sfanalysis/` 骨架（cdylib） | 待办 | — |
 | 3. hook.rs（mprotect + 跳转） | 待办 | — |
 | 4. fsm.rs（6 值 FSM） | 待办 | — |
 | 5. sink.rs（open + write 单字节） | 待办 | — |
 | 6. NDK r30 build 集成 | 待办 | `build.sh` 新增 `build_sfanalysis` |
 | 7. `magisk/customize.sh` patchelf | 待办 | — |
-| 8. 真机 byte 对账 | 待办 | `docs/m8-sfanalysis-reverse.md` §3 |
+| 8. 真机 byte 对账 | 待办 | `docs/records/m8-sfanalysis-reverse.md` §3 |
 | 9. `build.sh make check` 新增断言 | 待办 | §5.1 |
 
 ---
@@ -190,7 +190,7 @@ AGENT.md §10.5 没要求 SfAnalysis 走动态验证；r2 静态 + 真机 byte �
 ## 8. M8 前提被推翻（2026-10-09 真机证据）
 
 真机测试发现 **`sfanalysis.hint` 没有生产者**，证据见
-`docs/m8-sfanalysis-reverse.md §6`（符号表 + harness strace + daemon strace 三证）。
+`docs/records/m8-sfanalysis-reverse.md §6`（符号表 + harness strace + daemon strace 三证）。
 因此：
 
 * **`libsfanalysis.so` 不是 hint 生产者**，是一个纯进程内代码补丁库
@@ -270,7 +270,7 @@ surfaceflinger，纯内存、无磁盘改动：
 不存在；本仓库卡在 `execmem` 策略）。vendor 模块没发布任何 `sepolicy.rule`，
 它自己也没解决这个问题 —— 该特性在 enforcing 的新 Android 上本来就是死的。
 
-**第二轮（见 `docs/m8-sfanalysis-reverse.md §8` 末段）**：探针证明 **只有带
+**第二轮（见 `docs/records/m8-sfanalysis-reverse.md §8` 末段）**：探针证明 **只有带
 `PROT_EXEC` 的匿名 mmap 被拒**（RW 正常）；临时 `setenforce 0` 时 **4 个 hook
 全部装上、SF 存活** → 库本身可用，唯一拦路者是 SELinux。模块 `sepolicy.rule`
 （正确语法 `allow surfaceflinger surfaceflinger process execmem`）与

@@ -55,7 +55,7 @@ pub struct Settings {
     pub fake_root: Option<String>,
     /// Whether the userspace CPU governor may take the frequency policies over.
     /// Default off: the measured takeover was worse than the platform's own governor
-    /// on alioth (see `docs/m5-cpu-governor.md` and the note in `cpu_task.rs`).
+    /// on alioth (see `docs/records/m5-cpu-governor.md` and the note in `cpu_task.rs`).
     pub cpu_governor: bool,
     /// Root of the thermal zones, for the PL1 feedback.
     pub thermal_root: PathBuf,

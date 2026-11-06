@@ -3,7 +3,7 @@
 # eBPF / uprobe frame-source capability probe  (the ⑤-main-leg gate)
 #
 # *** NOT YET RUN ***  — written while the device was off USB (see the commit
-# message and docs/m11-ebpf-frame-source.md §0). Every line below is the check
+# message and docs/records/m11-11-ebpf-uprobe-frame-leg.md §0). Every line below is the check
 # I would run, not a result I have. Do not read anything in this file as
 # evidence until it has produced output on a real device.
 #

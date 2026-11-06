@@ -14,5 +14,5 @@
    cur_freq=1344000 governor=schedutil
    VERDICT: scaling_max_freq is driver read-only here -> the userspace
             takeover (scaling_governor=userspace + scaling_setspeed) is the
-            only frequency path, as docs/m7-evidence.md §6 recorded.
+            only frequency path, as docs/records/m7-evidence.md §6 recorded.
 PROBE_DONE

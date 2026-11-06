@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 
 // Re-declare the minimal `hint::SfHint` enum + `HintDurations` so we don't have to
 // pull the whole crate (which depends on libc etc.). The enum tag/values match the
-// upstream binary's jump tables — see docs/m1-static-reverse.md §1.3.
+// upstream binary's jump tables — see docs/records/m1-static-reverse.md §1.3.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i8)]

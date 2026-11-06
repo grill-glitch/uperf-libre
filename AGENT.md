@@ -1,4 +1,8 @@
-# AGENT.md — Uperf 重写方案（Rust 核心 + 复用 dfps C++ 平台）
+# AGENT.md — Uperf 重写：契约、不变量与验收
+
+> 本文只写**当前**成立的东西：契约（§5/§7）、架构不变量（§6/§8）、验收（§10）、规则（§13）。
+> 历史决策、逐里程碑证据、已解决的未知项在 [`docs/history/`](./docs/history/)。
+> 改代码前读 §6 与 §13；改 shell 前读 §4；动构建读 §9。
 
 > 本文件是本仓库的**施工说明与验收标准**。任何在本仓库工作的 agent 必须先读完本文件，
 > 并在提交时对照第 10 节的验收条目自查。**禁止把"应该能"写成"已验证"。**
@@ -20,55 +24,38 @@
 - 不改 `magisk/*.sh` 的调用契约（除第 7 节允许的最小适配）。
 - 不追求与闭源二进制逐指令等价；追求**配置语义等价 + 运行时行为等价**（用 §10 的 parity 工具证明）。
 
-**0 闭源 blob 不变量（M8 起新增）**：
-**0 闭源 blob 不变量（M8 起新增）**：uperf 模块发布的二进制树里**不得包含任何闭源 `.so`**。SfAnalysis 的 SF 注入库
-`libsfanalysis.so`（26 KB / 47 函数 / 静态链 xHook）必须由本仓库自研重写；vendor 的
-`magisk/bin/libsfanalysis.so` 自 M8 起从发布产物中**移除**。
+**0 闭源 blob 不变量**：模块发布的二进制树里**不得包含任何闭源 `.so`**。SfAnalysis 的注入库由本仓库
+重写（`uperf-sfanalysis` → `libsfanalysis_rs.so`），vendor 的 `libsfanalysis.so` 已从产物中移除，
+`build.sh check` 会断言这一点。机制与边界见 §12.1 与 `docs/spec/sfanalysis.md`。
 
-重写件 `rust/uperf-sfanalysis/`（产物 `libsfanalysis_rs.so`）已在真机（alioth /
-crDroid A16 / KernelSU Next / **SELinux enforcing**）验证：4/4 hook 在
-`surfaceflinger` 内装上并持续观测真实活动（`ioctl=167 / epoll=50 / binder 事务 132`，
-SF pid 不变）。机制是 **GOT/PLT 改写**，与 vendor 静态链的 xHook 默认机制一致，**不需要
-任何 exec 权限**（既无 `execmem` 也无 `execmod`）。注意：`xh_refresh_loop` 是 xHook 的
-线程名，**不是**被 hook 的函数——真目标是 4 个 libc 函数（`ioctl` / `epoll_wait` /
-`pthread_cond_wait` / `pthread_cond_timedwait`）。重写边界、注入机制、兼容性缺口见
-§12.1 / `docs/spec/sfanalysis.md` / `docs/m8-sfanalysis-reverse.md`（§10 为真机结论）。
+**成功判据（每条都要有可复现的证据）**：
 
-**成功判据（全部要有真机证据）**：
-1. `magisk/bin/uperf` 被自研二进制替换后，模块在 alioth（crDroid A16 / KernelSU Next）与 polaris（LineageOS 22.2）上开机自启成功，`/sdcard/Android/yc/uperf/uperf_log.txt` 无 `[E]`，`killall uperf` 能正常停止。**M8 起新增**：发布产物中**不存在任何闭源 `.so`**——`magisk/bin/` 下 vendor 的 `libsfanalysis.so` 已被 `libsfanalysis_rs.so` 替换，`build.sh make check` 脚本化断言。
-2. 63 份 `config/*.json` 全部解析成功，且**告警/忽略行与原版逐字一致**（见 §10.2）。
-3. 在 §10.3 的脚本化 sysfs 镜像上，切换全部 5 个 preset × 7 个 scene，**写入序列与原版一致**。
-4. §10.4 的 7 张 golden trace 场景中，hint 状态机的跳转顺序与原版一致。
+1. `magisk/bin/uperf` 是自研构建，模块在 alioth（crDroid A16 / KernelSU Next）开机自启，
+   `uperf_log.txt` 无 `[E` 级别错误（§10.3 的装机/开机脚本）。
+2. 63 份 `config/*.json` 全部解析，且**告警/忽略行与上游逐字一致**（§10.2 的 parity 工具）。
+3. `modules.sysfs.enable: true` 的配置在 fake root 镜像上的写入序列与参考一致（§8.3 + §10.2）。
+4. 停机路径干净：`killall uperf` 后无残留进程、`userspace` 接管已恢复、`state=stopped`（§10.3）。
+5. 发布产物 0 闭源 blob（`build.sh check`）。
 
 ---
 
-## 2. 现状基线（VERIFIED 事实，勿再猜测）
+## 2. 设备与运行契约（当前约束）
 
-| 事实 | 证据 |
+只列**仍然约束代码**的事实；每条的量测过程、证据链与当时结论在
+[`docs/history/device-findings.md`](./docs/history/device-findings.md)。
+
+| 约束 | 后果 |
 |---|---|
-| `magisk/bin/uperf` = 上游 `dev-22.09.04` 二进制 | sha256 `f1265757009ff0c85dd8587d9e7bfcf5e51d10d36fe5e1341688215ae1fb49d8`（与上游发行包一致） |
-| 该二进制 1,461,512 B、aarch64 PIE、stripped、NDK r24、`.text` 987,320 B / 2,320 函数 | `readelf` / `.eh_frame_hdr` 二分表解析（自洽校验通过） |
-| 只依赖 `libm/libdl/libc`，`BIND_NOW` + full RELRO | `readelf -d/-l` |
-| 26 个自有类名（含 `CpufreqWriter` 全家族）、14 个源文件路径、全量日志串保留在二进制里 | RTTI 名 + `__FILE__` 串 + `strings` |
-| 调用契约：`bin/uperf <USER_PATH>/uperf.json -o <USER_PATH>/uperf_log.txt`，`USER_PATH=/sdcard/Android/yc/uperf` | `magisk/script/libuperf.sh:38`；`Usage: uperf [-o log_file] config_file` 亦在二进制内 |
-| 进程名必须是 `uperf`（`killall uperf` 停服）；启动后脚本会把它移入 background cpuset | `libuperf.sh: uperf_stop/uperf_start` |
-| 配置由 `setup.sh` 从 `config/<soc>.json` 拷成 `USER_PATH/uperf.json` | `magisk/script/setup.sh:67` |
-| 配置 schema v3 = `meta` / `modules` / `initials` / `presets`，**层叠覆盖用点号键**（`cpu.margin`、`sysfs.xxx`、`sched.scene`） | 仓库内 `config/README.md`（376 行，v3 权威规范） |
-| Q: 根 `README.md` 里的 `powermodes/actions`、`knob type` 是 **v1/v2 旧文档**，与 v3 配置不符 | 对照 `config/template.json` 与 `config/sdm855.json` 实际键 |
-| 事件总线 topic 与 dfps 逐字相同 | `cgroup.{ta,fg,bg,re}.{list,update}`、`input.{touch,btn,state}`、`offscreen.state`、`topapp.pkgName`；uperf 独有 `anim.running`、`sfanalysis.hint`、`config.profile` |
-| uperf v3 的日志 pattern 就是 dfps 的 `%H:%M:%S %L %v`；`Usage:`/`Uperf is running`/守护横幅/`v3(22.09.04)`/作者串与二进制逐字一致 | 见 §7.3 的证据链 |
-| 12 个业务模块源文件名在二进制里保真：`anim_watcher / atrace_switcher / cgroup_listener / context_scheduler / cpu_governor / input_listener / offscreen_monitor / profile_switcher / sfanalysis_listener / sysfs_writer / topapp_monitor / main` | `__FILE__` 串 |
-| uperf 比 dfps 多出的能力层 | `context_scheduler`（PCRE2 正则规则引擎）、`cpu_governor` + `cpu_busy_reader`、`profile_switcher`、`sysfs_writer` + 12 个 `CpufreqWriter*`、`sfanalysis_listener`、`anim_watcher`、`log_level_switcher` |
-| **alioth 内核 `4.19.325-cip131-st15-perf`（crDroid A16 / KernelSU-Next / Enforcing）上复核（2026-10-10，M9/M10 期间）** | |
-| `scaling_max_freq` 仍是**驱动级只读**：`policy0` 上「写同值」与「写不同值」都被拒（`Permission denied`），mode 0444（模块自己的 `powercfg_once.sh` 会 `lock_val` 成 0444，但拦截来自驱动而非 mode） | `scripts/cpufreq-write-probe.sh`（可重跑）与原始输出 `docs/cpufreq-probe-alioth.txt`；判定必须看 shell 对重定向失败的**自身**报告（readback 区分不了「写成功」与「写的正是原值」——旧版探针曾因此误报） |
-| `/proc/sys/fs/inotify/*` 的**写入可用**（`max_queued_events`/`max_user_watches`=1048576、`max_user_instances`=1024），但 `chown/chmod` 在 ksu 域下 EACCES | 同上探针；`lock_val` 已改为 best-effort 并对失败明确报一行 |
-| 设备上**没有 patchelf**（`bin/`、`/system/bin`、PATH 都没有），所以安装时不会注入 surfaceflinger；且 M8 注入仍被 SELinux 挡（§12.1）⇒ 注入改为**显式 opt-in**（`UPERF_SF_INJECT=1`），默认只装库不碰 SF（避免 "NEEDED 装不上 → surfaceflinger 起不来" 的 UI 死法） | `magisk/customize.sh`；装机日志 |
-| daemon 日志量约 0.3-2 MB/分钟（活动相关，与 `modules.log.level` 无关：`trace` 也几乎不增），所以上限必须按**大小**轮转 | `docs/m10-log-cap.md` 的实测 |
-| **M8 SF 注入的交付方式（2026-10-10 复核，真机 Enforcing）**：库放 `system_file` 标签的路径（`/data/misc/surfaceflinger/`，0700 但 root 可写）→ `injector <目标完整 cmdline> <lib>` 即可 `dlopen` 成功；SF 里出现 `r-xp` 映射 + `xh_refresh_loop`/`sfh_stats_loop` 线程，**无任何 execmem/execmod 拒绝、不需要任何 sepolicy 改动** | `/data/local/tmp/injector`（用法 `[cmdline] [lib]`，按**完整 cmdline** 匹配，不是 comm）；本文件下方 §12.1 |
-| 两条**不需要**的路线（别在这上面花时间）：① `debug.ld.app.<name>`/`debug.ld.all` 预载在 `ro.debuggable=0` 的用户版上不生效（linker64 里有这两个串，实测注入 `sh` 0 命中）；② SF 自身 `.dynamic` 只有 1 个 `DT_NULL`、`.dynstr` 只剩 2 字节余量 ⇒ 无法原地插 `DT_NEEDED`，要走 patchelf 式重排（设备上确实有可用的 aarch64 `patchelf`，928 KB，`/data/local/tmp/patchelf`） | `scripts/cpufreq-write-probe.sh` 同期的 `m8_*` 侦察输出；`readelf -SW/-dW /system/bin/surfaceflinger` |
-| **`modules.sysfs` 的 knob 表在真机上根本不写**（2026-10-10 实测，两层门都关着）：① 出厂配置里 `"sysfs": {"enable": false}`（其余 5 个 module 都是 true）；② 代码里真写只在 `UPERF_FAKE_ROOT` 设置时走 `UnderRootSink`，没有 fake root 时走 `CollectingSink`（只计划、只记日志，不落盘）。所以「启动写 16 个 knob、停止只恢复 governor」这个说法**不成立**——今天之前我按 M4 文档这么说过一次，是错的 | e2e 里把 enable 翻成 true + 真 `UPERF_FAKE_ROOT` 跑真二进制：`grep -ciE "sysfs\|knob\|fake-write" daemon_log.txt` = **0**；切 `fast/performance/balance` 三种 preset 后仍是 0（说明 plan 只在事件/场景路径上产生，preset 单独切不出来）。真机上唯一的 sysfs 写是 governor 接管（`scaling_governor` + `scaling_setspeed`），那条本来就有记录+恢复 |：`Internal error: Oops - BUG`，`pc: __list_del_entry_valid` → `__dentry_kill`/`dentry_kill`/`dput`/`terminate_walk`/`path_openat`/`do_sys_open`/`__arm64_sys_openat`，即**在 `openat` 里踩到被写坏的 dentry 链表**；寄存器里出现过 ASCII `" corrupt"`（`x7=0x74707572726f6320`）；`Tainted: G S W`。踩雷线程是 `uperf-watch`（本模块的 watcher，4 Hz 开文件 ⇒ 最常踩到），**但这不是它的 bug**：损坏来自别处，且与本轮 M8 注入无关（SF 无新 tombstone、注入只让 SF 停了几十毫秒）。两次 panic 与本模块历史里「疑与 `ksud sepolicy patch` 相关」的两次极可能是同一个 dcache 问题 | `sys.boot.reason=kernel_panic,bug`；`/sys/fs/pstore/console-ramoops-0`（两次 dump 的 call trace 一致）；dmesg 里 `KP KernelPatch Version: d05` banner（设备装了 `KPatch-Next` 内核补丁框架，首要嫌疑） |
-
----
+| alioth 的 `scaling_max_freq` 是**驱动级只读**（0444，root 写也 EACCES，且 `[ -w ]` 因 `CAP_DAC_OVERRIDE` 会骗人） | 调频只能 `scaling_governor=userspace` + `scaling_setspeed`；写前判 mode 位，不判 `access(2)`。见 §8.4 |
+| `/sdcard`（FUSE）下 root `unlink` 会**静默成功但文件仍在** | 删除走 `/data/media/0/...`（同步清 FUSE 视图） |
+| 守护进程与它的 worker **都叫 `uperf`**（dfps 改写自己的 cmdline），`pidof` 也不匹配 zombie | 停服用 `killall uperf`；找活体用 `/proc/<pid>/exe`，不用名字/pid 文件 |
+| 模块路径 `.` = `/data/adb/modules/uperf`；`USER_PATH=/sdcard/Android/yc/uperf`；CLI 契约 `uperf <cfg> -o <log>` | 见 §7 |
+| `setup.sh` 安装时把 `config/<soc>.json` 播种成 `USER_PATH/uperf.json`（旧文件备份 `.bak`），然后删掉模块里的 `config/` | 装机后比对 zip 与模块目录时必须允许 `config/` 缺席（`scripts/install-and-verify-staged.sh`） |
+| 设备上没有 `patchelf`；SF 注入要求库落在带 `system_file` 标签的路径且显式 `UPERF_SF_INJECT=1` | 默认只装库不碰 surfaceflinger |
+| 本机 SELinux（Enforcing）拒绝 `execmem`/`execmod`，KernelSU-Next 也无可用 sepolicy 通道 | SF 侧的 hook 只能走 **GOT/PLT 改写**，不能 inline hook |
+| `modules.sysfs.enable` 出厂 63 份配置全为 `false` | 真实 sysfs 写入是显式 opt-in；`RealSink` 存在但默认不跑（§8.3） |
+| **已知内核缺陷**：KSU-Next 的模块挂载 + 本内核会在关机阶段触发 dcache panic（`list_del corruption` → `__dentry_kill`），`sys.boot.reason=kernel_panic,bug`；panic 后 f2fs 可能丢最近写入的块 | 每次开机后必须核对模块文件 md5 与全 NUL 扫描（`scripts/post-boot-verify.sh`）；不要假设 boot 是干净的 |
+| `/proc/sys/fs/inotify/*` 可写（`max_queued_events`/`max_user_watches`），但 `chown/chmod` 在 ksu 域 EACCES | 调参 best-effort，失败只报一行 |
 
 ## 3. 架构与选型
 
@@ -90,17 +77,11 @@ SF pid 不变）。机制是 **GOT/PLT 改写**，与 vendor 静态链的 xHook 
                 │ cpp/include/uperf_rs.h    │
 ┌───────────────┴──────────────────────────▼───────────────────┐
 │ Rust 侧（本项目重写，staticlib `libuperf_rs.a`）               │
-│  app      模块装配（替代 uperf.cpp）                            │
-│  config   JSON 解析 + 层叠覆盖 + 兼容性告警                     │
-│  switcher hint 状态机 + preset/perapp 切换 + 时长                │
-│  profile  preset/scene → 各模块参数表下发                       │
-│  sysfs    6 类写入器（string/percluster/percpu/cpufreq/         │
-│           cgroup_procs/uxaffinity）+ 去重 + fd 缓存             │
-│  governor 负载采样 + 能耗模型 + 功耗池(PL1/PL2) + 频点决策       │
-│  sched    上下文调度规则引擎（PCRE2 语义的正则匹配）             │
-│  sf       sfanalysis.hint 消费 + 渲染结束/Hint 提前结束          │
-│  anim     anim.running 消费（系统动画）                          │
-│  log      atrace/日志级别切换                                    │
+│  uperf-config  schema/层叠/告警 + sysfs 规划 + governor + sched │
+│  uperf-core    daemon(任务注册表) + orchestrator + 各任务 + C ABI│
+│  uperf-dfps    动态刷新率（独立 crate/subtree）                  │
+│  uperf-sfanalysis 注入库（cdylib，独立 profile）                 │
+│  uperf-cli     主机端 parity 工具（不发布）                      │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -112,7 +93,7 @@ SF pid 不变）。机制是 **GOT/PLT 改写**，与 vendor 静态链的 xHook 
 | crate | 用途 | 备注 |
 |---|---|---|
 | `serde` + `serde_json` | 配置解析 | 不允许换成手写 parser |
-| `pcre2`（绑定 PCRE2） | `sched` 规则正则 | **必须**保留 PCRE2 语义：现有配置含 `^(RenderThread\|GLThread)`、`/HOME_PACKAGE/`、`/MAIN_THREAD/`、可能的 POSIX 类 `[[:<:]]`；Rust `regex` crate 不支持 POSIX word-boundary，若改用 `regex` 必须在 §10.2 里证明 63 份配置全部规则语义一致 |
+| `regex` | `sched` 规则正则 | **不需要 PCRE2**：63 份配置的 28 个唯一模式全是普通 ERE（无 lookaround/atomic/`\K`/反向引用/POSIX word-boundary），`uperf-config/tests/all_sched_configs.rs` 会拒绝新增的 PCRE-only 语法。见 §8.5 |
 | `libc` | syscall/inotify/prctl/affinity | |
 | `log` + 自写 formatter | 日志 | 输出格式必须与原版一致，见 §7.3 |
 | `thiserror` | 错误类型 | 禁止 `unwrap()` 于运行路径 |
@@ -144,13 +125,19 @@ SF pid 不变）。机制是 **GOT/PLT 改写**，与 vendor 静态链的 xHook 
     include/uperf_rs.h      给 Rust 看的 C 头（与 cbindgen 产物对齐）
     CMakeLists.txt
 /rust/
-  Cargo.toml                workspace
-  uperf-core/               staticlib crate（pub extern "C" 入口）
-    src/{lib.rs,ffi.rs,config/,switcher/,profile/,sysfs/,governor/,sched/,sf/,anim/,logmod/}
+  Cargo.toml                workspace（5 个 crate）
+  uperf-config/             schema/层叠/告警 + sysfs 规划 + governor + scheduler（无 unsafe）
+  uperf-core/               daemon/任务/orchestrator/FFI（staticlib）
+  uperf-dfps/               动态刷新率（独立 crate，git subtree）
+  uperf-sfanalysis/         SF 注入库（cdylib，独立 profile）
   uperf-cli/                纯 Rust 工具（离线配置/parity 用，不随模块发布）
-/docs/
-  spec/config-v3.md         从 config/README.md 提炼的机器可校验规范
-  spec/sfanalysis.md        SF 注入重写权威 spec（边界 / 注入机制 / 兼容性缺口，§12.1）
+/docs/                      索引见 docs/README.md
+  spec/                     契约与规格（config-v3、sfanalysis）
+  research/                 上游/第三方调查
+  records/                  逐里程碑的设计、证据与设备跑批日志（m0..m11）
+  history/                  项目史：里程碑汇总、设备事实、已解决的未知
+  audit/                    unsafe 审计报告
+  configs/{upstream,ugt}/   38 份上游基线配置 / 63 份 UGT 配置（只读快照）
 /build.sh                   make / pack / install / reboot / clean / check
 ```
 
@@ -219,14 +206,14 @@ void uperf_bridge_set_thread_name(const char *name);
 | 配置管理（原 JSON/knob 体系） | **Rust** | `config/`，含层叠覆盖与告警文案 |
 | `switcher`（hint 状态机 + preset + perapp） | **Rust** | `switcher/`，状态机见 §8.1 |
 | `profile`（scene → 参数表下发） | **Rust** | `profile/` |
-| `sysfs` 写入器（6 类） | **Rust** | `sysfs/`，见 §8.3 |
+| `sysfs` 写入器 | **Rust** | `uperf-config/src/sysfs.rs`（按路径推断的 5 类 + `payload()`）+ `uperf-core/src/{orchestrator,real_sink}.rs`，见 §8.3 |
 | `cpu` 调频器（governor + 负载采样） | **Rust** | `governor/`，见 §8.4 |
 | `sched` 上下文调度器 | **Rust** | `sched/`，见 §8.5 |
 | `sfanalysis` 监听 | **Rust** | `sf/`，见 §7.4 / §12.1 |
 | `anim_watcher` / `log_level_switcher` / `atrace_switcher` | **Rust** | `anim/`、`logmod/` |
 | `CpufreqWriter{Msm,Ppm,Epic}{Base,Fixed,Powersave}` + `Performance` | **Rust** | 平台差异（`/sys/kernel/msm_performance/...`、`/proc/ppm/policy/...`、`/dev/cluster{}_freq_{min,max}`）在 Rust 里用策略表表达 |
-| `libsfanalysis.so`（SF 注入库）→ `libsfanalysis_rs.so` | **Rust 重写** | 见 §12.1 / `docs/spec/sfanalysis.md`；M0..M7 阶段仍使用 vendor 件过渡，M8 起替换 |
-| 外置看门狗 / 状态文件（M9） | **shell + Rust** | `magisk/script/uperf_watchdog.sh`（进程外监督 + 死手恢复 + 预算内重启）、`rust/uperf-core/src/status.rs`（`uperf.state`）；见 §11 M9 与 `docs/m9-watchdog.md` |
+| `libsfanalysis.so`（SF 注入库）→ `libsfanalysis_rs.so` | **Rust 重写** | 见 §12.1 / `docs/spec/sfanalysis.md`；vendor 件已不再随模块发布（`build.sh check` 断言 0 闭源 blob） |
+| 外置看门狗 / 状态文件（M9） | **shell + Rust** | `magisk/script/uperf_watchdog.sh`（进程外监督 + 死手恢复 + 预算内重启）、`rust/uperf-core/src/status.rs`（`uperf.state`）；见 §11 M9 与 `docs/records/m9-watchdog.md` |
 | 运行时旋钮（无上游对应物） | **Rust** | `rust/uperf-core/src/settings.rs`：全部 `UPERF_*` 环境变量在此**一次性**解析成 `Settings`，下游模块只接受参数，不再自己 `std::env::var`。新增旋钮只改这一处 + 传参，见 §13 |
 | 守护进程装配 / 任务生命周期（无上游对应物） | **Rust** | `rust/uperf-core/src/daemon.rs`（谁存在、按什么顺序起停）、`task.rs`（`Task` trait + `Registry`）。停止顺序由注册顺序推导（逆序），**唯一例外**是 CPU governor 按名字先停：userspace 接管是唯一不可由进程内恢复的状态 |
 
@@ -347,7 +334,8 @@ Rust 侧必须：
 2. 监视 hint 文件（inotify）；
 3. 把状态映射到「渲染开始 / 渲染滞后 / 渲染结束」，并按 `renderIdleSlackTime` 判定渲染结束；
 4. 在渲染结束信号后 66ms 内结束 Hint（README 所述行为基线）。
-**状态码到语义的映射未知（§12.2）**：M2 阶段必须先真机抓取原版行为（Frida hook 或抓日志）再实现，禁止猜。
+**状态码到语义的映射已静态推导**（6 值 idle/switch/trigger/gesture/touch/junk ↔ 0..5，≥6 = unknown）：
+见 [`docs/records/m1-static-reverse.md`](./docs/records/m1-static-reverse.md) §1.3，实现见 §8.1。
 
 ---
 
@@ -373,7 +361,7 @@ touch   -> idle     : 超时或渲染结束
 
 ### 8.2 配置层叠（**已按 38 份真实配置修正：不是 `base_hint` 嵌套**）
 
-实测的 v3 结构（`docs/upstream-configs/*.json` 全量验证，见 `docs/m2-evidence.md`）：
+实测的 v3 结构（`docs/configs/upstream/*.json` 全量验证，见 `docs/records/m2-evidence.md`）：
 
 ```jsonc
 {
@@ -403,7 +391,7 @@ touch   -> idle     : 超时或渲染结束
 
 **路径不来自代码，来自配置**：`modules.sysfs.knob` 是 `{knob名: 绝对路径}` 表。
 上游二进制里**没有**任何 `devfreq`/`llcc`/`ufshc` 字符串（`strings` 0 命中），
-所以 `uperf-cli plan` 与设备侧都从这张表查路径（见 `docs/m4-evidence.md` §1）。
+所以 `uperf-cli plan` 与设备侧都从这张表查路径（见 `docs/records/m4-evidence.md` §1）。
 
 写入器种类**由路径形状推断**（schema 里没有 `type` 字段，README 的 type 列是 v1/v2 遗留）：
 
@@ -452,7 +440,7 @@ sink 由 `Daemon` 持有（一个实例——fd 缓存与去重表就是靠"跨�
 #### 8.4.1 能耗模型已解出（精确闭式）[V]
 
 用上游二进制启动时自己打印的 25 组 `opp <freq> pwr <x> cost <y>` 反推得到
-（`docs/m5-cpu-governor.md` §1）：
+（`docs/records/m5-cpu-governor.md` §1）：
 
 ```
 x = freq_GHz / typicalFreq;   Rp = plainFreq/typicalFreq;   Rs = sweetFreq/typicalFreq
@@ -501,7 +489,7 @@ daemon 的 `SIGTERM/SIGINT` 分支改为先给 worker 发信号再退出（原�
 * 场景来自 `initials.sched.scene`（`idle|touch|boost`）+ 前台/后台判定（由 `topapp.pkgName` / `cgroup.*` 事件驱动）。
 * 正则：**用 Rust `regex` crate，不需要 PCRE2**（原 §3.2 的"PCRE2 必须"是未经验证的假设，已由数据推翻）。
   实测 63 份配置共 2528 处 pattern、**28 条唯一模式**，全为普通 ERE：无 lookaround/lookbehind/atomic/branch-reset/
-  conditional/recursion/`\K`/inline flag/反向引用。见 `docs/m6-sched-evidence.md` §2 与
+  conditional/recursion/`\K`/inline flag/反向引用。见 `docs/records/m6-sched-evidence.md` §2 与
   `uperf-config/tests/all_sched_configs.rs::no_shipped_pattern_needs_pcre2`（新增 PCRE-only 语法会编译失败）。
   全量编译自检在 `all_sched_configs.rs`：101 个 sched 模块 / 1014 条进程规则 / 4048 个 pattern。
 * `pinned` 语义（README line 248）：**"始终作为处于顶层可见的进程应用规则"**，不是"首匹配优先"。
@@ -548,209 +536,112 @@ C 侧禁止 `-fno-exceptions`（桥要能抛给 upper 层兜底）。
 
 ## 10. 测试与验收
 
-### 10.1 单元测试（`cargo test`，主机运行）
+### 10.1 单元测试（`cargo test --release`，主机运行）
 
-* 配置：63 份 `config/*.json` 全部解析；`config/template.json` 的空值是合法输入；层叠覆盖断言（`initials` → `presets.*` → `presets.<mode>.<scene>`）。
-* 规则引擎：遍历所有配置里的 `sched.rules[].regex` 与 `k`，断言可用 PCRE2 编译，且 `/HOME_PACKAGE/`、`/MAIN_THREAD/` 替换后语义正确。
-* 调频数学：`demand` 公式、`predictThd` 分支、功耗池增减/恢复、`burst` 旁路 —— 纯函数 + 表驱动测试。
-* 状态机：按 §8.1 逐条转移，含超时与"渲染结束提前退出"。
-* sysfs 值展开：6 类写入器的字符串展开（`percluster`/`percpu`/`cpufreq`×100000/`cgroup_procs`/`uxaffinity`），用黄金用例。
+当前 288 个（`uperf-core` 141、`uperf-config` 79、`uperf-dfps` 29、`uperf-cli`/集成 39）。覆盖的是
+**能在主机上判定**的东西：
 
-### 10.2 parity 工具（关键：必须有真证据）
+* 配置：63 份 `config/*.json` 全部解析；`template.json` 的空值是合法输入；层叠覆盖
+  （`initials` → `presets.*` → `presets.<mode>.<scene>`）；38 份上游基线配置在 `uperf-cli` 的集成测试里。
+* 规则引擎：所有 `sched.rules[].regex` 与 `k` 编译通过，`/HOME_PACKAGE/`、`/MAIN_THREAD/` 替换后语义正确；
+  新增 PCRE-only 语法会让 `all_sched_configs` **编译失败**（§8.5）。
+* 调频数学：`demand` / `predictThd` / 功耗池 / `burst` 纯函数 + 表驱动；能耗模型对上游打印值 <0.0015。
+* 机制层：hint 状态机（§8.1）、帧源阶梯（`frame_state`）、`SysfsWrite::payload()` 逐 kind、
+  `RealSink`（落盘/去重/账本/写后回读）、ctl 协议与 `STATUS` 分帧、`procfs`、`Settings` 解析、
+  任务注册表与信号路径。
 
-> **两套配置要分清**：
-> * **上游 v3 发行包**里是 **38** 份 `config/*.json` → 已 vendor 到 `docs/upstream-configs/`，
->   用作 parser 的回归基线（38/38 通过，见 `docs/m2-evidence.md` §2）。
-> * **本仓库（UGT 基线）**里是 **63** 份 `config/*.json`（UGT 在 38 份基础上补了自己的平台）
->   → M3 起用 `uperf-cli` 对**这 63 份**做全量 plan 对账，那才是发货目标。
+### 10.2 parity 工具（离线，不需要设备）
 
-`rust/uperf-cli` 提供三个子命令，**离线**对账（不需要设备）：
+> 两套配置要分清：**上游 v3 发行包** 38 份在 `docs/configs/upstream/`（parser 回归基线）；
+> **本仓库（UGT 基线）** 63 份在 `config/`，那才是发货目标。
 
-```
+```bash
 uperf-cli parse  <config.json>                  # 结构摘要（meta/modules/initials/presets）
-uperf-cli warn   <config.json>                  # 告警行（应与原版 CfgMgr 日志逐字一致）
-uperf-cli plan   <config.json> <mode> <scene>   # 层叠后的键值 + 来源（M3 起再接 sysfs path 展开）
+uperf-cli warn   <config.json>                  # 告警行（与上游 CfgMgr 日志逐字一致）
+uperf-cli plan   <config.json> <mode> <scene>   # 层叠结果 + 每个键的来源
 ```
-> 原计划的 `expand` 子命令已并入 `plan`（同一份层叠结果，`plan` 额外标出每个键的来源：
-> `preset[scene]` / `preset[*]` / `init`）。
-验收：对 63 份配置 × 5 preset × 7 scene 全组合跑 `warn`/`plan` 并与原版日志/实测写入比对，
-差异必须为 0（或每一处差异都有书面理由）。
 
-### 10.3 真机 parity（sysfs 镜像法）
+判定：63 份 × 5 preset × 7 scene 全组合的 `warn`/`plan` 与参考输出差异为 0，或每处差异都有书面理由。
+`plan` 额外标出来源（`preset[scene]` / `preset[*]` / `init`）；原计划的 `expand` 子命令已并入 `plan`。
 
-1. 用 `jq` 把 `modules.sysfs.knob` 的所有 path 重写到一个 tmpfs 镜像目录（`/data/local/tmp/fakesys/...`），生成 `uperf.fake.json`。
-2. 原版二进制与自研二进制各跑一遍，同样的模式/场景序列（脚本写入 `cur_powermode.txt` + 模拟 input 事件）。
-3. `diff` 两次的写入序列与最终文件内容 —— **必须一致**。
-4. 真机再跑一轮**未重写路径**的对照：真实 sysfs 上比较 `atrace`/`perfetto` 上的 CPU 频点曲线。
+### 10.3 设备验证脚本（真机验收的实际入口）
 
-### 10.4 行为基线（仓库内 7 张 golden trace）
+主机跑得动的：`scripts/test_watchdog_host.sh`（看门狗，109 断言，含每个脚本 `sh -n`）。
 
-`media/*.png` 是原版在真机上的 Perfetto 行为基线，逐张当作验收场景：
-`wechat_resume`（热启动重负载）、`android_am`（顶层 APP 切换/亮屏）、`sflag`（渲染滞后即刻升频）、
-`render_stop`（渲染结束 66ms 内退升频）、`render_restart`（滞后 UI 重启渲染则恢复 Hint）、
-`fingerprint`（指纹最大性能）、`adjusted_demand_capacity_relation`（需求-容量模型）。
-每个场景要有一条可复现脚本 + 一张新 trace，与原图同口径对比。
+需要 alioth 的：
 
-### 10.5 完成判定（硬性）
+| 脚本 | 验什么 |
+|---|---|
+| `scripts/cpufreq-write-probe.sh` | 内核 knob 可写性（mode 位 vs 实际写入） |
+| `scripts/p1-signal-device.sh`、`p1-signal-burst-device.sh` | 停机路径：8 轮 `killall uperf` + 20 连发 SIGTERM，断言退出、disarm、`state=stopped` |
+| `scripts/p2-task-registry-{1task,4tasks}.sh` | 任务注册表与停止顺序（governor 先停，其余逆序） |
+| `scripts/takeover-device.sh` | 真实 sysfs 的 `userspace` 接管与恢复 |
+| `scripts/realsink-device.sh` | `RealSink`（knob 表指向 `/data/local/tmp` 的普通文件） |
+| `scripts/install-and-verify-staged.sh`、`post-boot-verify.sh`、`post-boot-restart-verify.sh` | 装机、开机后文件完整性、两次热重启 |
+| `tools/uprobe-probe/e2e-*.sh`、`tools/binder-probe/e2e-*.sh`、`tools/ctl-listen/e2e-ctl.sh` | 两条帧源腿、控制面 `STATUS` |
 
-* 任何"已实现"必须附带：`cargo test` 输出、`uperf-cli plan` 的 diff 输出、或真机 trace/日志片段。
-* 禁止：把 UNKNOWN 写成 VERIFIED；用"应该/预期"代替实测；未跑 parity 就宣布配置兼容。
-* 未完成的项写入 §12 的未知清单，不许静默略过。
+纪律：sysfs 默认走 `UPERF_FAKE_ROOT`（`RealSink` 例外——它按定义写真路径，所以测试时把 knob 指到
+`/data/local/tmp`）；调度必须同时 `UPERF_SCHED_DRY_RUN=1`；**每次**重启后核对模块文件 md5 与全 NUL
+扫描（§2 的内核缺陷）。`media/*.png` 是上游行为基线截图，仅供对照，不构成门槛。
+
+### 10.4 完成判定（硬性）
+
+* "已实现"必须附带：`cargo test` 输出、`uperf-cli plan` 的 diff、或真机日志/trace 片段。
+* 禁止：把 UNKNOWN 写成 VERIFIED；用"应该/预期"代替实测；没跑 parity 就宣布配置兼容。
+* 没做完的写进 §12，不静默略过。
 
 ---
 
-## 11. 里程碑
+## 11. 功能清单（①..⑪ 就是代码里那些圆圈编号）
 
-| 阶段 | 内容 | 交付 | 验收 |
+M11 当初排的队列，编号已经成了代码注释里的词汇（`⑪` = uprobe 帧计数等），所以留在这里；**逐里程碑的
+证据、真机结论与"当时没做什么"在 [`docs/history/milestone-log.md`](./docs/history/milestone-log.md)**。
+
+| # | 功能 | 默认 | 代码 |
 |---|---|---|---|
-| **M0** ✅ | vendor dfps 到 `cpp/dfps/`，跑通 dfps 原样构建；确定 CLI/日志/进程名适配点 | `DFPS_VENDOR.md`、可编译的 `cpp/uperf`、`docs/m0-evidence.md` | **已达成**（2026-10-02，alioth）：`build.sh check` 全绿，进程监督器/日志格式/CLI/4 个事件源/配置热重载全部真机验证；`offscreen.state` 未触发，列入 §12.2 |
-| **M1** ✅ | Rust staticlib 骨架 + C ABI 桥跑通 | `rust/uperf-core/`（Cargo.toml + lib.rs + ffi.rs + topic_dispatch.rs + tests/）、`cpp/uperf/bridge.cpp`、`cpp/include/uperf_rs_bridge.h` | **已达成**（2026-10-05，alioth）：`build.sh check` 全绿；10/10 payload 解码单元测试通过；**真机过**：C++/Rust 同步出现 `EventTap:` / `[Rust] Rust: ...` 两份日志，pid list 预览(8/8)字节相等；电源键触发 `offscreen.state=true`，**officially§12.2 第 1 条已解** |
-| **M2** 🚧 | 配置系统 + `uperf-cli parse/warn/plan`；38 份配置全部解析 | `rust/uperf-cli/`、`docs/upstream-configs/`、`docs/m2-evidence.md` | **部分达成**：38/38 配置解析通过、`warn` 零误报；`plan` 已出层叠结果。待做：`plan` 的 sysfs 路径展开（需 M3 writer）、与原版日志文案逐条对账 |
-| **M3** 🚧 | hint FSM + sysfs writer dispatch | `rust/uperf-core/src/hint.rs`、`rust/uperf-core/src/sysfs.rs`、`docs/m3-evidence.md` | **已达成（构建+fd 验证）**：`SfHint` 枚举（0..5）匹配上游 binary；dispatch 表覆盖 13/14 个真实 device fd；`uperf-cli plan` 与上游 v3 在 alioth 上的 sysfs 写入路径一一对应；待做：把 hint FSM 接入 dispatch loop（事件→hint transition→`plan_scene`→真写）+ UFSmax 这类 SoC 专属 hex 路径发现 |
-| **M4** ✅ | 事件→hint→config→sysfs 写入链路 | `rust/uperf-config/`、`rust/uperf-core/src/{hint,orchestrator}.rs`、`docs/m4-evidence.md` | **已达成**（真机）：16 条 sysfs 写入计划与配置路径逐字一致，fake-root 16 文件落地 |
-| **M5a** ✅ | CPU 调频器：能耗模型 + 负载采样 + 功耗限制 + 真机控频 | `rust/uperf-config/src/{cpu,governor,gov_build,freq_target,proc_stat}.rs`、`rust/uperf-core/src/cpu_task.rs`、`docs/m5-cpu-governor.md` | **已达成**（alioth）：25/25 上游 `pwr/cost` 黄金值复现；真机 `userspace`+`setspeed` 控频生效；PL1=1.0W 下满载小核贴上限 1612800 kHz；撤载回落；SIGTERM 干净 disarm |
-| **M6a** ✅ | 上下文调度器（`modules.sched`）：配置层 + 内核应用 + 真机验证 | `uperf-config/src/sched.rs`、`uperf-core/src/{sched_apply,sched_task}.rs`、`uperf-config/tests/all_sched_configs.rs`、`docs/m6-sched-evidence.md` | **已达成**：全配置闸通过（101 模块/1014 规则/4048 pattern，异常集恰为白名单 3 项）；真机隔离实验 `0-7/policy5 → 0-1/policy3` 双值命中且 6s 稳定；写后回读校验；`SIGCHLD` 跨层 bug 已修 |
-| **M6b** ✅ | 预设热切换（`cur_powermode.txt` + perapp 规则）、`sfanalysis.hint` 监听、`log.level` | `uperf-config/src/switcher.rs`、`uperf-core/src/{inotify,watch_task}.rs`、`docs/m6b-evidence.md` | **已达成**（真机）：`Preset inode -> 'x'` → `Preset 'a' -> 'b'` → `preset applied writes=16`（与 M4 同 16 条）；`auto` 走 perapp；未定义值报上游原串；hint 字节 `transitioned=true`；`log.level` info/debug 双验；SIGTERM 干净 |
-| **M6c** ✅ | `modules.input.*` 接入（唯一一处 vendored 改动）、`killall` 停止路径的真 bug | `cpp/dfps/source/modules/input_listener.{h,cpp}`、`cpp/uperf/{app_main,bridge}.cpp`、`docs/m6b-evidence.md` §9-§11 | **已达成**：真机 `killall uperf` 后 governor 回 `powersave`、0 残留（修复前 2 残留 + 永久卡 `userspace`）；`swipeThd` 随配置 0.01/0.03 双验；DFPS_VENDOR.md 记录了唯一偏离并用上游 clone 实证 |
-| **M6d** ✅ | `atrace`（复用 dfps 自己的 `utils/atrace.c`）、`pinned`+top-app 真机验证 | `cpp/uperf/bridge.cpp`、`rust/uperf-core/src/{ffi,lib}.rs`、`docs/m6d-evidence.md` | **已达成**：marker 机制由 vendored `atrace.c` 定死（格式 `B\|<pid>\|<tag>`），设备上取到 **34 条**来自本进程的真实 marker；`pinned` 语义真机验证（Settings 线程 90×bg → 209×idle，pinned 进程落 bg 次数 **0**）；`top=` 实测 launcher3 → settings |
-| **M7a** ✅ | 打包 + 整机替换 + alioth 装机 | `build.sh`（pack 注入构建产物、check 断言仓库件必须等于构建）、`NOTICE`、`module.prop`、`docs/m7-evidence.md` | **已达成**（真机）：`ksud module install` → 重启后自启；staged 二进制 md5 == 本地构建（`f5ff1ce0…`）；日志 **1075 行全为 I 级（0 E / 0 W）**；SoC 映射 kona→sdm865 并播种正确配置；governors 保持 `schedutil`、`mi_thermald` 存活、`tracing_on=0` |
-| **M7b** 🚧 | §1 判据 2/3/4 的对账（63 份配置告警逐字、5 preset×7 scene 写入序列 vs 上游、7 张 golden trace）、polaris 真机 | — | 判据 2 已部分落地（`startup_lines.rs`）：`Config '<name>' by '<author>'` **逐字节**一致；`Knob '<path>' not writeable` 的**格式**一致、**集合**是上游 16 条的真子集（8 条，零误报），原因是"可写"的判定无法用单一 syscall 复现上游——见 `docs/m7-evidence.md` §6 的对照表。判据 3/4：上游在本内核上起不来，只能与"配置推导"对账；polaris 未接触 |
-| **M7-crit** ✅ | **上线前修掉两个真 bug**（见 `docs/m7-evidence.md` §1） | `uperf-core/src/{inotify,watch_task,cpu_task}.rs`、`rust/uperf-core/src/lib.rs`、`magisk/script/libuperf.sh`、`magisk/uninstall.sh` | **已达成**：① watcher 的目录 watch 与 daemon 自己的日志形成反馈闭环 → worker **1065 → 68 ticks/10s**（15.7 倍），这正是手机卡顿主因；② 调频器接管改为**默认关闭**（实测把小核钉在 691200 最低档 vs 系统 schedutil 的满频 1804800），且**永不臆造 governor**、记录真实原值、模块脚本在启动/停止/卸载时还原 |
-| **M7c** ✅ | 控制入口 `webui.sh`（WebUI 与 adb 共用同一契约）+ 重启路径暴露的 4 个真 bug | `magisk/script/webui.sh`、`cpp/uperf/app_main.cpp`、`magisk/script/{libuperf,setup}.sh`、`docs/m7-evidence.md` §7 | **已达成**：① 用户目录丢失曾使模块**永久静默失效**（`Config file not found` 后每boot一次；现 `uperf_ensure_config` 自愈）；② daemon 继承调用者 stdout 管道，**SIGPIPE** 使 shell/WebUI 重启后 ~90s 自杀（init 只看到 zombie 9601）；现忽略 SIGPIPE + 启动器 `</dev/null >/dev/null 2>&1`，实测 120s 存活、日志 1240→**17767 行**；③ 模块自带 busybox 的 `ps` 影子（不支持 `-o`）使 status 谎报 `daemon.count=0`、`restart.ok=0`（改用 `/system/bin/ps`）；④ `ps` 的 STAT 是 `Ss` 两字符，位置匹配全失配 |
-| **M7d** ✅ | KernelSU WebUI：底部三标签（首页 / 模式切换 / 更多）+ 构建与闸门 | `webui/**`（Vite + `@material/web` + `kernelsu-alt` + XML i18n + 管理器主题变量）、`magisk/webroot`（产物，`.gitignore`）、`build.sh`（`build_webui` + webroot 闸门）、`docs/webui.md` | **已达成（管理器内实测除外）**：真机数据驱动的渲染/交互测试 **0 JS 报错**；模式列表取自**已加载配置**（sdm865 实为 5 个预设含 `crazy`）；写路径 adb 端到端验证（`preset.ok=1` → `preset.current=powersave`）；无 ksu 时如实提示；`check` 断言 webroot 必须引用控制脚本且 `kernelsu-alt` 已打包（`index.html + index-CkpJpgai.js 480543 bytes, imports resolved`）。**未验**：管理器 WebView 内的实际绘制 [U] |
-| **M8** 🚧 | **SfAnalysis 注入库 Rust 重写**：`libsfanalysis.so` → `libsfanalysis_rs.so`，0 闭源 blob | `magisk/bin/libsfanalysis_rs.so`、`rust/uperf-sfanalysis/`（cdylib）、`rust/uperf-sfanalysis/src/{lib.rs,hook.rs,observe.rs}`、`docs/spec/sfanalysis.md`、`docs/m8-sfanalysis-reverse.md`、`scripts/sfanalysis-deobf.py`、`magisk/customize.sh`（注入改为**显式 opt-in** `UPERF_SF_INJECT=1`：设备无 patchelf，默认只装库不碰 SF，避免 "NEEDED 加载失败 → surfaceflinger 起不来"） | **行为复刻版已在真机跑通**（2026-10-09）：[V] host 单测 **15/15**；[V] aarch64 cdylib（293 KB）在 alioth 的隔离 harness 里：4 个 libc 目标全部 inline hook 成功（`ioctl`/`pthread_cond_wait`/`pthread_cond_timedwait` 直接补，`epoll_wait` 跟尾调用桩到 `__epoll_pwait`），观察者计数与调用一一对应（ioctl 2 / epoll_wait 1 / cond_timedwait 1 / binder_txns 1 / binder_writes 1），**exit=0 不崩**；`strace -f` 与 vendor 件同形（`sched_setscheduler(0,SCHED_FIFO,3)`、mprotect 补丁、`/proc/self/maps` 扫描）。[U]：SF 侧注入已实测两轮。① `injector`（ptrace+dlopen）注入成功，ctor/worker 在 SF 里跑起来；② enforcing 下 mmap 探针显示 **只有带 `PROT_EXEC` 的匿名映射被拒**（RW ok / RX,RWX EACCES），`avc_spoof` 关掉也无 avc → `dontaudit` 或审计去重；③ **临时 `setenforce 0` 时 4 个 hook 全部装上、SF 存活** → 库本身在 SF 里可用，唯一拦路者是 SELinux；④ 模块 `sepolicy.rule` 与 `ksud sepolicy patch/apply`（均 rc=0、语法 check 通过）都**没能放行**；⑤ 期间两次**内核 panic**（`console-ramoops-0`）与本轮 `ksud sepolicy patch` 时间相关 → 已停止在用户机上调策略。交付：`magisk/sepolicy.rule` 已进模块（产品侧修复，落地未验证）。**⚠️ 2026-10-10 更正**：③ 里"SELinux 是唯一拦路者、需要策略"的结论**不再成立**——库只要落在 `system_file` 标签的路径（`/data/misc/surfaceflinger/`），Enforcing 下 SF 就能 `r-xp` 映射并起线程，**零策略改动**（§2 有实测）；同一天的两次 panic 的 call trace 指向内核 dcache 损坏（VFS 路径、踩雷线程是本模块自己的 watcher），与 SELinux 和注入都无关。
+| ① | 看门狗稳态成本缓存化（活体判定走 pid+start_ticks 缓存，过期才全扫 `/proc`） | 开 | `magisk/script/uperf_watchdog.sh` |
+| ② | 写入账本 + 恢复断言（改过的 sysfs knob 先记原值，停止/被杀后由脚本回滚） | 开（有写入才记账） | `src/sysfs_ledger.rs`、`libuperf.sh::uperf_restore_sysfs` |
+| ③ | SF 重启后自动重注入 | `UPERF_SF_INJECT=1` | `uperf_watchdog.sh` |
+| ④ | 前台助手文件源（`foreground.txt` 作 top-app 来源，C++ monitor 兜底） | 开（文件不存在即回落） | `src/foreground.rs` |
+| ⑤ | 直连 binder 的 SF `--latency` 帧源（降级腿） | `UPERF_SF_BINDER=1` | `src/sf_binder.rs` |
+| ⑥ | 热反馈削 PL1（§8.4 的 thermal） | 随 governor（默认关） | `uperf-config/src/thermal.rs` |
+| ⑦ | socket 控制面：反连握手 + `PING`/`PONG`/`STATUS` | `UPERF_CTL_SOCKET` | `src/ctl_socket.rs` |
+| ⑧ | 记录通道（按 pkg+epoch 的会话，≥3 min，DEFLATE） | `UPERF_RECORD=1` | `src/recorder.rs` |
+| ⑨ | 配置标准档合并 | **放弃**（会动到与上游逐字对齐的配置格式） | — |
+| ⑩ | 32 位覆盖的诚实声明 + 装机守卫（32 位构建明确不做） | 守卫常开 | `libsysinfo.sh::require_aarch64` |
+| ⑪ | uprobe 每线程帧计数（AppOpt 风格的主腿，perf PMU，不加载 BPF） | `UPERF_SF_UPROBE=1` | `src/sf_uprobe.rs`、`src/frame_state.rs` |
 
-| **M11** ✅/[U] | **写入账本 + 恢复断言**（借 AppOpt 的 batch/`original_cpuset`/`assert_restored_for_test`、fas-rs 的 `Cleaner`）：凡本守护进程改过的 sysfs knob，原值先记账再写，停止/被杀后由脚本侧恢复；**读不到原值就记为 unknown 并报告，绝不臆造** | `rust/uperf-core/src/sysfs_ledger.rs`（新）、`rust/uperf-core/src/orchestrator.rs`（`UnderRootSink::with_ledger`）、`rust/uperf-core/src/{topic_dispatch,cpu_task}.rs`（接线）、`magisk/script/libuperf.sh`（`uperf_restore_sysfs`）、`magisk/script/uperf_watchdog.sh`（死手路径一并恢复）、`scripts/test_watchdog_host.sh`（case 12）、`scripts/m11-ledger-e2e.sh`（新） | **[V]** `cargo test --release` **108 个 lib 测试全过**（新增 8 个：首次写入优先跨重启保持、读不到→unknown 而非臆造、含换行/含空格的值不可承载→unknown、尾换行被 trim 而真值保留、坏行计数不阻断其余、sink 只记一次原值）；**[V]** 主机 harness **12 用例 / 83 断言 / 0 失败**（case 12 的 12 条：改过的 knob 回到原值、已是原值的只计数不重写、无原值条目只报告、写被拒只报告且账本保留、非绝对路径的行被忽略并报告——Rust 加载器与 shell 解析器行为对齐，这条正是被 harness 抓出来的真 bug——、账本只在两清时清空）；**[V]** `build.sh Release pack check` 全绿。**[U]** 真机端到端（`scripts/m11-ledger-e2e.sh`，9/14）：真二进制在 `UPERF_FAKE_ROOT` 下**能接管**、控制组断言（真 cpufreq 前后 byte 相同）全过，但 **daemon 侧没有可恢复的写入**——knob 路径双重关闭（§2），所以「账本由真 daemon 写出」今天在设备上无法成立；等该路径真正启用时再验。**[M8/③ 真机]** 2026-10-10 一次跑通（alioth，Enforcing）：装好的看门狗带 opt-in `UPERF_SF_INJECT=1` 时对**运行中的真 surfaceflinger** 完成"**自己先把库搬到可读路径**（`/data/misc/surfaceflinger/`，755 + `system:system` + `system_file`）→ 注入 → 回读 maps 验证"整条链：`sf_injects=1 sf_fails=0 sf_state=injected`，第三方核对 SF 的 maps 有 3 处映射（含 `r-xp`）且 `xh_refresh_loop` 线程在跑；真 CPU 全程 `schedutil` 未被碰。**关键实测**：直接从 `<module>/bin/` 注入会让远程 `dlopen` 返回 0（"Injection failed..."）——所以"库必须落在一个目标域**读得到**且带 `system_file` 标签的路径"是**交付的硬前置**，看门狗现在每次尝试前自己 staging（顺带自愈丢失的副本）。**[U]** SF 真重启后的重挂载只在主机 harness 验证（真机要重启 SF = 设备重启，代价不划算）；注入器仍不由模块提供（`UPERF_SF_INJECTOR` 指路）。**[队列]** 本轮排序：① 看门狗稳态成本缓存化 **✅**（`0088efc`，56-67→30 ticks/60 s）；② 写入账本+恢复断言 **✅代码/测试，真机端到端 [U]**（本条）；③ SF 重启后自动重注入 **✅（主机 + 真机）**；④ 前台助手（AppOpt 的 `app_process`+TaskStackListener 取代 dfps 的「任务数 >10」启发式）**✅ 代码/测试完成，真机 daemon 端跑通**：① 上个 boot 报的「多类 dex 必被 SIGKILL」**在本 boot 不复现**——V1/V2/V3 与真实助手全 rc=0，V2 连跑 10 次 0 失败，dmesg/logcat 无 OOM；旧 rc=137 系设备状态相关（已被重启清掉），根因仍 **[U]**；② 真缺陷是 `packageOf` 只查 getter，而 `RootTaskInfo`/`TaskInfo` 的 `topActivity`/`baseActivity` 等是**公有字段**（`getMethod` 抛 NoSuchMethodException）——改为**先读字段、后回退 getter**，真机 `am start` 实测 `launcher3 → settings → launcher3 → documentsui` 逐次正确且监听回调同时触发；③ daemon 新增 `rust/uperf-core/src/foreground.rs`：dispatcher 每 tick（默认 500 ms）读 `<USER_PATH>/foreground.txt`，新鲜即作 `topapp.pkgName` 来源（`UPERF_FOREGROUND=0` 关、`UPERF_FOREGROUND_FILE` 换路径），过期/缺失回落 vendored C++ monitor。[V] `cargo test --release` **117 lib 测试**（+7 foreground +2 tick 集成）；[V] `build.sh Release make pack check` 全绿；[V] 真机 e2e：新构建真 daemon 在 fake root 下打出 `foreground helper file source = …`，并按 `am start` 打出 `topapp.pkgName = settings/launcher3/documentsui`、`sched … top=Some("com.android.documentsui")` 一并对上。**未做**：没有任何东西**启动**该助手（launcher 接线属下一步），故正常开机仍只走 C++ monitor 一路来源；⑤ 直连 binder 帧源（AppOpt 降级腿）**✅ 传输+解析+daemon+主源优先级+真接管 全跑通**：设计源=AppOpt(`cinitdev/AppOpt`，**GPL-3.0/无顶层 LICENSE ⇒ 只作参考、不得拷贝**)；客户端在 `rust/uperf-core/src/sf_binder.rs`：`SfClient`（root→`/dev/binder`→servicemanager 取 **legacy** `SurfaceFlinger`→`DUMP_TRANSACTION=0x5f444d50`，parcel=`[fd 对象(BINDER_TYPE_FD=0x66642a85)][String16[] args]`，fd 最前、无 token，pipe 并发读回）+ 纯函数 `parse_latency`/`fps_in_window`/`frames_in_window`/`pick_layer`/`choose_source`/`frame_hint` + opt-in `FrameTask`。**主源优先级**：注入 `sfanalysis.hint` 新鲜（`UPERF_SF_BINDER_HINT_STALE_MS`，默认 3 s）时为主源且**完全不碰 binder**；缺席/过期降级到帧腿。**真接管**：降级时帧腿把「窗口内 0 帧 ⇒ `Idle`」经 `Orchestrator::on_sf_hint` 送进 FSM——**只推断 idle**（touch/gesture/switch 是输入事实，不拿帧测量冒充注入 hint）；这补上一个真缺口：`HintState::expired()` 在本 daemon **从未被轮询**，故无输入事件时场景本不会自己回 idle。[V] `cargo test --release` **127**；[V] `build.sh Release make pack check` 全绿；[V] 真机 e2e：无 hint→`source=fps`（launcher 层 63 帧、refresh 8333333）；写一次 `touch` hint→`SfAnalysis hint 'touch' transitioned=true` + `scene=touch`；hint 过期→`frame source -> fps` → `sf-binder frame hint -> idle (nothing drawn in 1000 ms)` → `scene=idle`；[V] `webui.sh status` 出 `frame.source/fps/hint_age_ms/refresh_ns/layer`，WebUI 加 `label_frame_leg`/`label_frame_fps`。九条 binder 坑见 `tools/binder-probe/README.md`。**[U]**：`hint_age_ms` 走 mtime（墙钟）；帧腿只接管 idle 方向。详见 `docs/research/m11-5-sf-binder-frame-source.md`；⑥ 热反馈调预算（fas-rs `core_temp_thresh`，**先削 PL1 不先削频点**）**✅ 真机跑通**：新增 `uperf-config/src/thermal.rs`（`ThermalPolicy` + 纯函数 `pl1_scale`/`discover_cpu_zones`/`read_max_temp_c`）+ `Governor.thermal_scale`（`pl1 = slow_limit_power × scale`，PL2 与 OPP 目标不动）+ `cpu_task` 1 Hz 采样 `/sys/class/thermal` 里 `type` 含 `cpu-` 的 zone 取最热。阈值/跨度/地板/根目录均可 env 覆盖（`UPERF_THERMAL_*`），默认 60 °C / 20 °C / x0.5；读不到 zone 就不动 PL1。[V] `cargo test --release`：uperf-config +5 thermal 单测 +1 governor 单测（热的一方不得高于冷的一方、必须真绑住、**每个目标频点都在该 cluster 自己的 OPP 表内**）；[V] 真机 e2e：thresh=25 时 `thermal 24 zone(s) … now 33.3 C` → `PL1 x0.79 (of 1.00 W)`；thresh=90 时同一温度**不降 PL1**（对照）；真实 governor 全程 `schedutil`（fake root）。**[U]**：阈值/跨度/地板是默认值、非校准；只在 `UPERF_CPU_GOVERNOR=1`（默认关）下生效；未做温度迟滞（阈值附近可能抖动），也未与帧率联动（fas-rs 是降目标帧率，本实现是降功耗预算，刻意不等价）。详见 `docs/m11-6-thermal-pl1.md`；⑦ socket 控制面（AppOpt 的 token/version/pid **反连**，先做便宜的握手子集）**✅ 真机跑通（握手+保活，命令集未做）**：新增 `rust/uperf-core/src/ctl_socket.rs`——守护进程主动**连出去**（`UPERF_CTL_SOCKET`；`@name`=抽象本地 socket（Android LocalSocket 惯用法），否则按路径；留空即关闭）→ 发 `HELLO v=1 pid= uid= token=<32hex>` → 要求 `OK v=1`（版本不同即拒）→ 之后守护进程驱动 `PING`/`PONG` 保活（连续 3 次无回应即判定链路断并重连，也回答对端 PING）；token 取 `UPERF_CTL_TOKEN_FILE` 或 `<USER_PATH>/uperf.token`，无则从 `/dev/urandom` 取 16 字节 hex 以 **0600** 落盘，取不到熵就不发握手。[V] `cargo test --release` **133**（+6 ctl_socket：HELLO 往返/缺字段拒/回复严格解析/token 随机且 0600 且二次读回一致/抽象与路径地址/**对接自建 listener 的握手**）；[V] 真机 e2e（`tools/ctl-listen/`，peer 为本仓新工具）：`peercred uid=0 pid=21312` + `HELLO v=1 pid=21312 uid=0 token=441f19ea…` + `replied OK v=1` + `pong`，daemon 侧 `handshake ok, peer v1` / `pong #1`；reject 对端 → daemon `handshake failed: peer refused` 并退避重试；token 文件 `-rw-------` 0600。**[U]**：**没有命令集**（`status`/`set-preset` 仍走 `webui.sh`）；对端未核对 token 值、无 uid 白名单；SELinux 只在双方同域（root/ksu）下验证过。详见 `docs/m11-7-ctl-socket.md`；⑧ 记录/自测规则与通道（opt-in、会话 ≥3 min、Deflate、按 pkg+epoch 去重）**✅ 真机跑通**：新增 `rust/uperf-core/src/recorder.rs` + `RecorderTask`（opt-in `UPERF_RECORD=1`，1 Hz tick）——会话 = 一个包的一段前台 `{pkg, epoch_ms, duration_ms, samples[{t_ms, scene, fps}]}`；四条规则逐条落地：①关着时 `observe()` 立即 None、一个字节不写；②`MIN_SESSION_MS=180000`（`UPERF_RECORD_MIN_MS` 可覆盖），不足者丢弃不平均；③**裸 DEFLATE**（`flate2` `rust_backend`，纯 Rust 交叉编译）；④key=`sanitize(pkg)-epoch` 既是文件名也是去重键，启动扫 `history/` 载入已有 key，同 pkg+epoch 永不写第二遍。fps 取 `sf_binder::last_fps()`（帧腿没跑就是 0.0）。存储在 `<USER_PATH>/history/`；**daemon 是唯一读者**（shell inflate 不了 Deflate，对外暴露是有意的下一步）。[V] `cargo test --release` **141**（+8 recorder）；[V] `build.sh Release make pack check` 全绿；[V] 真机 e2e：`recorder session com.android.settings 7100 ms (7 samples) -> …-13916266.dfl` 与 `com.android.documentsui 8278 ms (8 samples) -> …-13923366.dfl`，首 4 字节 `8d cc cd 0a`（非 zlib 0x78），拉到主机用 **python `zlib.decompressobj(-15)`** 解回预期 JSON（含 duration/samples）。**[U]**：本次 fps 全 0（钉的 layer 名不存在）；无容量/保留策略与清理命令；无对外读取通道；本项只做记录、不做自测判读。详见 `docs/m11-8-recording.md`；⑨ 配置标准档合并 **❌ 放弃（为兼容 uperf）**：合并/规范化那 63 份上游配置会动到**与上游逐字对齐的配置格式**（`docs/upstream-configs/` 的 CLI 契约、`setup.sh` 按 SoC 播种单文件、以及 M2/M7b 的逐条对账判据都建立在该格式上），收益不抵兼容风险 —— 用户决定放弃；⑩ 32 位覆盖的诚实声明/补构建 **✅ 声明+装机守卫真机验证；32 位构建明确不做**：查清**恰好三样**与架构绑定（`bin/uperf` aarch64、`bin/busybox/busybox` aarch64 静态、`bin/libsfanalysis_rs.so` aarch64），其余 shell/dex 中立；改前 `customize.sh` **无任何 ABI 检查**、`is_aarch64()` 是**死代码** ⇒ 32 位设备会「装机成功 → 开机 ENOEXEC 静默失败」；现 `libsysinfo.sh` 提供 `module_abi`/`abi_supported`/`is_aarch64`/`require_aarch64`（带 `UPERF_FAKE_ABI` 测试缝），`setup.sh` 装机前 `require_aarch64；⑪ **（用户追加）AppOpt 的 FPS 主腿：uprobe 每线程帧计数** **✅ 已实现并真机验证（daemon 侧 sf_uprobe + 阶梯 + e2e）**：①内核实测 `CONFIG_BPF/BPF_SYSCALL/BPF_EVENTS/BPF_JIT=y`、`CONFIG_UPROBES/UPROBE_EVENTS=y`、**`CONFIG_KPROBES` is not set**、`unprivileged_bpf_disabled=0`、uprobe PMU `type=6`、tracefs `uprobe_events` ksu 域可写；②符号（`/system/lib64/libgui.so`，仅 `.dynsym`）：`android::Surface::queueBuffer` @**0xf43ec**、`queueBufferInternal` @0x1138fc、`hook_queueBuffer_DEPRECATED` @0x112f40，**tracefs 不接受符号名**（必须自己解偏移）；③路线 A（tracefs uprobe + perf）：能注册、trace 缓冲区同窗口 **990 hits**，但 **per-task 绑定数不到（0）**，per-CPU 能数（220/5s）却是**全局**的；**同开 trace 消费者会让 perf 那条挂死**；④路线 B（**uprobe PMU 按 TID**）：偏移非法→`EINVAL`（真校验），主线程 tid→0，**RenderThread tid→600 hits/5s = 120.0/s**（正好面板速率）⇒ **枚举 `/proc/<pid>/task/*` 每 tid 一事件求和 = 只数该应用的帧**，且**不需要加载 BPF 程序**。两个必踩细节：`sample_period` 必须 0（否则是 sampling 事件、`read` 阻塞）、必须重试 `EINTR`。**[实现]** `rust/uperf-core/src/sf_uprobe.rs`：自研 ELF64 `.dynsym` 解析（含 `PT_LOAD` 地址→文件偏移映射，合成 ELF 单测）、`/proc/<pid>/task` 每 tid 一个 uprobe PMU 事件求和、`pids_for_package`、以及 opt-in `UPERF_SF_UPROBE=1` 的任务（`UPERF_SF_UPROBE_PID` 可钉住进程、`UPERF_SF_UPROBE_WINDOW_MS`=1000）；`sf_binder::FrameSource` 增加 `Uprobe` 变体，健康时 ⑤ **完全不碰 binder**，状态文件 `source=uprobe`；三级阶梯 注入 hint(M8) > uprobe(⑪) > binder `--latency`(⑤)。**真机 e2e（[V]，`tools/uprobe-probe/e2e-shade.sh`）**：daemon 自己从设备库解出 `0xf43ec`、`attached pinned pid=4909 events=110 of 110 threads, RenderThread=Some(5021)`、窗口 fps 91–124，**同一窗口独立对照 526 hits/5s = 105.2/s**，状态文件 `source=uprobe fps=104.0 frames=104`。两个坑已修：窗口开头 `RESET` ⇒ 末读即本窗口帧数（减去上一窗口会抵消成 ~0）；连续 3 个零窗口就重新枚举线程（RenderThread 可能后建）。**[未做]** `--timestats` 兜底。详见 `docs/m11-11-ebpf-uprobe-frame-leg.md`、`tools/uprobe-probe/` |
-| **M9** ✅(真机) | **外置看门狗 + 状态文件**：SIGKILL / `panic = "abort"` 之后仍能恢复被接管的 governor | `magisk/script/uperf_watchdog.sh`、`rust/uperf-core/src/status.rs`、`magisk/script/libuperf.sh`（start/stop 接线 + `UPERF_CPUFREQ_ROOT`）、`magisk/script/webui.sh`（status 新键）、`magisk/uninstall.sh`、`scripts/test_watchdog_host.sh`、`scripts/m9-device-verify.sh`、`docs/m9-watchdog.md` | **已达成**（2026-10-10）：[V] `cargo test --release` **211/211**；[V] 主机 `scripts/test_watchdog_host.sh` **60 断言 / 10 用例 / 0 失败**（健康→不动；死亡且已接管→预算内重启后放弃并恢复 `schedutil`；重启成功→回 running；只剩孤儿 worker→被收尾并恢复；单实例 owner 锁；双 supervisor 收敛；`webui.sh status` 新键；dry-run 只报不做；语法 + 接线）；[V] `build.sh Release make pack check` 全绿（`magisk/bin/uperf` == 本次构建）。**[V] 真机 alioth**（crDroid A16 / 内核 4.19.325-cip131 / KernelSU-Next / Enforcing）`scripts/m9-device-verify.sh` **33 断言 / 0 失败**：`/proc/<pid>/exe` 穿过 dfps 的 cmdline 改写（真 daemon：cmdline=`uperf`、exe 指向模块二进制，supervisor ppid=1）；真机「两个进程 SIGKILL + 三 policy 已接管」→ 死手路径经真实 `uperf_restore_governors` 全部恢复、无僵尸；只杀 supervisor 时孤儿 worker 在做完孤立判定后被看门狗 SIGTERM 并**自身 disarm**；`/sdcard` temp+rename 与 rm 均可用；出厂 15 s 节奏下 **56 ticks / 60 s = 0.93% 单核**（单次扫描 ~0.13 s）；真实 CPU 前后 byte 相同（接管只写在 fake root）。**[V] 真机暴露并修掉四个只有设备才会出现的缺陷**：① 逐 pid `readlink|sed` 扫描（1289 进程）单趟 **19.9 s** → 循环从未完成一次采样，改为 `comm` 内建过滤 + 免 fork 的 stat 解析（0.19 s，100 倍）；② 过滤用进程名不是镜像文件名（dfps 固定 `PROC_NAME=uperf`，拷贝成 `fake_uperf` 后 comm 仍是 `uperf`）；③ `read` 在**无换行文件**上返回非零，而 daemon 写 `userspace` 不带换行，`|| continue` 把所有已接管 policy 漏掉（`armed=[]`）；④ 快速重启时上一代 worker 的 `state=stopped` 会盖在新 worker 的 `running` 之后（`superf_stop` 与 `uperf_start` 重叠），现已改为 `status::write_if_owner()` 按文件内 `pid=` 判定归属。[V] 装机 + 重启验收（`ksud module install` + 一次重启；`scripts/m9-device-boot-verify.sh` **23 断言 / 0 失败**）：KernelSU 的 `service.sh` 路径确实拉起看门狗并活过重启（锁 owner 的 `start_ticks` 与活进程一致、状态文件带本 boot 的 boot_id、仍在 15 s 节奏采样）；`uperf.state` 由本 build 写出（`state=running`、`takeover=off`）；`webui.sh restart` 把 owner 锁干净交接给新实例（旧看门狗消失、无双监督）；日志有界（装机后 `uperf_log.txt` 161 KB / `.bak` 161 KB）。[U] 仍待验：`webui.sh status` 新键在 WebUI 内的呈现；`comm` 过滤器的失败模式（进程名被改则判为不在）；满一天的长期日志行为。见 `docs/m9-watchdog.md` §5 |
-| **M10** ✅(真机) | **日志上限**：daemon 自己轮转日志，启动路径丢弃超限备份 | `cpp/uperf/app_main.cpp`（spdlog `rotating_file_sink_mt`，4 MiB × 3，`UPERF_LOG_MAX_BYTES` 可覆盖）、`magisk/script/libuperf.sh`（`uperf_trim_log_backup`，`UPERF_LOG_BACKUP_MAX_BYTES` 默认 16 MiB）、`docs/m10-log-cap.md` | **已达成**：改前实测 `uperf_log.txt` 34 MB + `.bak` 138 MB（≈172 MB）；[V] 真机（`m9-device-verify.sh` part 4，cap 8 KiB）看到 `daemon_log.1.txt`/`.2.txt` 落在 8 KiB 且 base 回落到数百字节；[V] 装机后 `uperf_log.txt` 161 KB / `.bak` 161 KB；[V] 主机用例 10 覆盖「超限备份被丢弃 / 未超限保留」。[U] 满一天的长期表现由「按大小轮转」推断，未实等一天 |
+## 12. 仍未解决的问题
 
-M0–M2 之间不得并行改动 `cpp/dfps/**`；M3 起 Rust 侧可并行（config/sysfs/governor/sched 互相独立）。
+只有**当前**仍然成立、且会影响判断的几条。已解决的（以及当时怎么坏的）在
+[`docs/history/unknowns-resolved.md`](./docs/history/unknowns-resolved.md)。
 
----
+### 12.1 SfAnalysis 的 hook 点（M8 已重写，0 闭源 blob）
 
-## 12. 风险与未知（当前必须承认的）
-
-### 12.1 SfAnalysis 的 hook 点（**M8 起重写,0 闭源 blob**）
-
-**目标（M8 重写计划）**：在 uperf 模块发布的二进制树中**移除所有闭源 `.so`**。
-SfAnalysis 的 SF 注入库 `libsfanalysis.so`（26 KB / 47 函数、纯 C、静态链 xHook）
-由本仓库**自研 Rust 重写**，新库名 `libsfanalysis_rs.so`。**注意**：vendor 件其实
-**不写** `sfanalysis.hint`（见下），所以"接口契约"实际上是"在 SF 进程内装上 4 个 hook
-并保持宿主存活"，重写件按同一语义实现。
-
-**逆向现状（m1-static-reverse.md §1.5 的结论已被 `docs/m8-sfanalysis-reverse.md` 推翻）**：
-- `libsfanalysis.so` 通过 `patchelf --add-needed` 注入 surfaceflinger；
-  解析 `/proc/self/maps` 定位 `/system/lib64/libandroidfw.so`，再按名挂钩。
-- **被 hook 的是 4 个 libc 函数**：`ioctl` / `epoll_wait` / `pthread_cond_wait` /
-  `pthread_cond_timedwait`（函数名字符串 TEA 加密在 `.data` 里，解密器见
-  `scripts/sfanalysis-deobf.py`）。`xh_refresh_loop` 是 **xHook 自己的线程名**，
-  不是 hook 目标——m1 §1.5 把它当成目标函数是错的。
-- 机制是 **xHook 的 GOT/PLT 改写**（不是 inline patch）：改写调用方 GOT 槽，
-  只需对数据页 `mprotect(RW)`。
-- **它不写 `sfanalysis.hint`**：43 个未定义符号里没有 `write`/`pwrite`/`syscall`/
-  `mmap`，真机 strace 也未见文件写。也就是说 **hint 在生产端根本不存在**
-  （详见 `docs/m8-sfanalysis-reverse.md` §6）。重写件同样不写——这是复刻，不是缺功能。
-- 本机（crDroid A16）的 SF **不加载 libandroidfw.so**，所以 vendor 件在 enforcing 下
-  既不崩也不 hook——这是它自己的目标选择问题，与权限无关。
-- 静态产物（vendor 二进制里保留全部字符串）：
-  `/system/lib64/libandroidfw.so`（目标 .so）、
-  `/system/lib64/libandroid.so`（备用）、
-  `/system/bin/surfaceflinger`（进程 anchor）、
-  `/proc/%d/comm`、`/proc/self/maps`、`/proc/%d/stat`、
-  `xh_refresh_loop`（被 hook 函数名）。
-- v3 二进制里的 4 条 13/21/29/29 字节不透明 `.data` 记录
-  （均以 `0x9e3772XX` 开头、`0xb5` 结尾）—— **这条 v3 说的是 uperf 主二进制**，
-  不是 libsfanalysis；libsfanalysis 内已见到明文符号名。
-
-**M8 重写交付物**：
-1. `magisk/bin/libsfanalysis_rs.so`：Rust 实现（同 26 KB 量级），NDK r30 toolchain。
-2. **不依赖 xHook**：自写 mprotect + 跳转（PLT/GOT 不适用——目标在 RWX 外的 .text，
-   需要 inline patch），保留 vendor 件的"hook on first call"语义。
-3. **SfHint 6 值 FSM 与 §1.3 已对齐**（idle/switch/trigger/gesture/touch/junk，
-   ≥6 = unknown）；M8 真机抓 byte 序列，验证每条 hint 触发条件与 vendor 件一致。
-4. **magisk 注入路径**：`customize.sh` 在 `setup.sh` 之前执行 `patchelf --add-needed
-   libsfanalysis_rs.so $MODPATH/system/bin/surfaceflinger`；SF 启动时 dlopen 拉入。
-   （surfaceflinger 是 magisk 注入体系的常规目标，与 vendor 件路径同。）
-
-**约束（不可破）**：
-- **不能改** §7.4 的 hint 文件协议（路径 / 单字节 / 0..5 枚举）—— 消费端已经按
-  vendor 件字节协议实现，改了 SfAnalysisListener 必须同步动，违反 §7 不可变清单。
-- **不能动** `cpp/dfps/**`—— libsfanalysis_rs 是新模块，不是 dfps 的复制品。
-- **`magisk/bin/uperf` 仍是 Rust 重写产物**（M0 已完成），不含闭源 blob。
-
-**进度追踪**：`docs/m8-sfanalysis-reverse.md`（r2 静态逆向后写入），
-`docs/spec/sfanalysis.md`（边界 spec），AGENT.md §11 milestone 表 M8 行。
-**不做 Frida**：本仓库 §7.1 / §10.5 不要求动态验证，r2 静态 + 真机 byte 抓取已够。
-**状态码→语义映射**：M2 起逐条采集（与现有 §12.2 第 1 行同项，M8 完成后转为已解）。
-
-**M8 真机测试发现（2026-10-09，alioth/A16，见 `docs/m8-sfanalysis-reverse.md` §0/§1.4/§2）**：
-r2 深挖推翻了 M1 的 hook 目标结论——`xh_refresh_loop` 是 **xHook 自己的后台线程名**
-（`pthread_setname_np`），不是被 hook 的函数。真正的 4 个 hook 目标以
-TEA 变体加密在 `.data`，已解密：**`ioctl` / `epoll_wait` /
-`pthread_cond_timedwait` / `pthread_cond_wait`**（libc 函数，解密器见
-`scripts/sfanalysis-deobf.py`）。当前 `rust/uperf-sfanalysis` 的
-`HOOK_TARGET_SYM = "xh_refresh_loop"` **是错的**，且 `patch_target` 会写到
-libandroidfw 的 **ELF 头段**（maps 首条 r--p）而非 `.text`——真机 harness 已实证
-该段被 trampoline 覆写、perms 变 `rwxp`。**M8 未完成，需按新目标重写。**
-
-**另一条真机事实**：A16 的 `surfaceflinger` 根本不加载 `libandroidfw.so`
-（431 个 .so + DT_NEEDED 双证），故 vendor 件在这台设备上同样静默失效。
-
-**M8 前提被推翻（2026-10-09，三证见 `docs/m8-sfanalysis-reverse.md` §6）**：
-`sfanalysis.hint` **没有生产者**。两份 vendor 库（`libsfanalysis.so` /
-`libssanalysis.so`）的未定义符号里**没有 `write` / `syscall` / `mmap` / `pipe`**，
-即没有写文件或建 IPC 的能力；`strace -f` 全量追踪（harness 1733 行 + 运行中 daemon
-29129 行）确认零文件写入，daemon 只是在轮询一个永不存在的文件
-（`openat(hint, O_RDONLY) = ENOENT`）。所以"重写 hint 生产者"**没有可对齐的对象**。
-处置路线（删 blob / 移植进程内行为 / 新增 opt-in 生产者）见
-`docs/spec/sfanalysis.md §8`，**待定**。当前 `rust/uperf-sfanalysis` 在选定方向前
-不接入发布流程。
+结论：在 alioth 上 `execmem`/`execmod` 都被拒（SELinux + 无可用 sepolicy 通道），所以 hook 由
+**GOT/PLT 改写**安装（只需 `mprotect` 数据页），这也是 vendor 的静态 xHook 本来就在做的事。
+注入库 `libsfanalysis_rs.so` 由本仓库构建、独立 profile（`panic = "unwind"`，见 §9），
+默认只装库不碰 SF，`UPERF_SF_INJECT=1` 才注入。规格与逆向证据在
+[`docs/spec/sfanalysis.md`](./docs/spec/sfanalysis.md)、
+[`docs/records/m8-sfanalysis-reverse.md`](./docs/records/m8-sfanalysis-reverse.md)；当年怎么排查的在
+[`docs/history/unknowns-resolved.md`](./docs/history/unknowns-resolved.md) 与 §12.1 原文。
 
 ### 12.2 其它未知
-| 项 | 状态 | 处理 |
+
+| 项 | 状态 | 影响 / 做法 |
 |---|---|---|
-| `sfanalysis.hint` 的状态码语义 | UNKNOWN | M8 完成后转已解（见 `docs/m8-sfanalysis-reverse.md` §3） |
-| **悬空类别引用 / 逗号 cpumask** | **已解**：3 份配置有真实缺陷（见上），按"容忍 + 记录 Anomaly"处理，白名单钉死 | `docs/m6-sched-evidence.md` §3 |
-| **worker 里 `std::process::Command` 报 `ECHILD`** | **已解**：vendored dfps 监督器装了 `SIGCHLD`→`wait()` 处理器，worker 继承后**偷走并回收** Rust 的子进程。worker 不监督任何东西，故在 `uperf_rs_start` 重置为 `SIG_DFL` | `docs/m6-sched-evidence.md` §4 |
-| **空替换会让正则匹配一切** | **已解 + 加锁**：home 解析失败曾返回空串，`/HOME_PACKAGE/`→`""` 使 Launcher 规则匹配全系统（3400 条判定）。三重防护：空结果视为失败、失败时保留字面 token、`SchedPlanner` 直接拒绝空 process pattern | `docs/m6-sched-evidence.md` §5 |
-| **Android 自己的 task-profile 控制器会改写亲和性/SCHED 类** | **已解（方法层面）**：新进程 1–2s 内被 Android 归类（实测落到 cpus 0-3 / SCHED_IDLE，恰好与配置同值→曾造成假阳性）。**真机调度实验必须使用与 Android 取值不相交的目标值**，并做对照实验 | `docs/m6-sched-evidence.md` §7 |
-| **`comm` 被截断到 15 字符**（`com.android.launcher3` → `com.android.lau`） | **已知**：`/MAIN_THREAD/` 用观测到的 `comm` 替换，因此自洽（pattern 与线程名同源） | `docs/m6-sched-evidence.md` §7 |
-| **无 CAP_SYS_NICE 时不能把调度类"升"回去**（NORMAL→IDLE 可以，IDLE→NORMAL EPERM） | **已解**（内核真实规则，非沙箱怪癖）；host 单测按此写成"接受两种结果" | `docs/m6-sched-evidence.md` §6 |
-| `/proc/<tid>/stat` 字段 18 是 `priority`(=20+nice)，**nice 是字段 19** | **已解**：曾读 index 15 得到 25（nice=5 时） | `docs/m6-sched-evidence.md` §6 |
-| **`atrace` 的 marker 载荷** | **已解**：payload 由 vendored `cpp/dfps/source/utils/atrace.c` 定义（`B\|<pid>\|<tag>`/`E\|<pid>`/`C\|<pid>\|<tag>\|<n>`），开关就是 `AtraceToggle()`；**marker 字面量本就不该出现在二进制里**（由埋点处的 `ATRACE_*` 宏构造，埋点在 `inotify.cpp:59`/`topapp_monitor.cpp:50`）。设备实测 34 条真实 marker | `docs/m6d-evidence.md` §1 |
-| **`sfanalysis.hint` 的生产端** | **已解（真机证伪"有生产者"）**：vendor `libsfanalysis.so` / `libssanalysis.so` 的未定义符号里**无 `write`/`syscall`/`mmap`/`pipe`**（不能写文件/建通道）；harness `strace -f`（1733 行）写标志 open = 0；运行中 daemon 的 `strace`（29129 行）只见到 `openat(hint, O_RDONLY) = ENOENT` 轮询。**该文件没有生产者**——上游此特性未完成/已废弃 | `docs/m8-sfanalysis-reverse.md` §6 |
-| **`modules.input.*` 未接入** | **已知 parity 缺口**：`swipeThd/gestureThdX/gestureThdY/gestureDelayTime/holdEnterTime` 仍是 vendored `input_listener.cpp` 的硬编码默认值（`0.01/0.03/0.03/2.0/1.0`），而二进制里这 5 个键**确实存在**（上游会读）。sdm888 的值恰好等于默认值，所以本机看不出来，其他配置会有差异 | 因阈值是 private 且无 setter，改它必须动 `cpp/dfps/**`（违反 M0 的"零改动"不变量）。M7 二选一：(a) 加 setter 并在 `DFPS_VENDOR.md` 记录该 diff；(b) 在 `cpp/uperf/` 侧重写 InputListener |
-| **`auto` 的语义** | [I]：`cur_powermode.txt` 的合法值之一但非预设名；二进制有 `Internal perapp switcher {}`/`Internal perapp switcher cannot be enabled`，故读作"交给 perapp 规则" | `docs/m6b-evidence.md` §1 |
-| **`UPERF_FAKE_ROOT` 只覆盖 sysfs 写入** | **已知**：`sched_setaffinity`/`sched_setscheduler` 是 syscall，无路径可重定向。真机调度测试必须同时设 `UPERF_SCHED_DRY_RUN=1` | `docs/m6b-evidence.md` §7 |
-| **`killall uperf` 会把 governor 永久留在 `userspace`** | **已解**：`SIGTERM` 同时到达 daemon 与 worker，daemon 再转发 `SIGUSR1` ⇒ worker 的信号处理函数**在同一线程重入**，两次 `uperf_rs_stop()` 争同一个**不可重入**日志 Mutex → 死锁，进程不退出。三处修：handler 同时处理 `SIGTERM/SIGINT`；handler 入口用 `sigprocmask` 屏蔽这三个信号；所有日志辅助改用 `try_lock` 并丢弃（丢日志远好于挂死 daemon） | `docs/m6b-evidence.md` §9 |
-| **`modules.input.*` 曾未接入** | **已解**：README 标 `gestureDelayTime`/`holdEnterTime` 为"暂不使用"，故只接 3 个；`swipeThd` 在 62/63 份配置里是 vendored 默认值的 **3 倍**（0.03 vs 0.01），只有开发用的 sdm888.json 恰好是 0.01 所以本机看不出来。这是 `cpp/dfps/**` **唯一**的改动（3 行 setter），已实证 `diff -rq` 只差那两个文件 | `docs/m6b-evidence.md` §11、`cpp/dfps/DFPS_VENDOR.md` |
-| **`modules.input.enable` 未生效** | **UNKNOWN**：63 份配置全为 true，且 vendored 监听器在配置解析前就由平台层启动；配置若禁用只会打日志不会真的不启动 | `docs/m6b-evidence.md` §11 |
-| **watcher 目录 watch 与自身日志形成反馈闭环**（跑满一个核） | **已解**：目录 watch 的 mask 含 `IN_CLOSE_WRITE\|IN_MODIFY`，而日志就在该目录 ⇒ 写日志触发监听→重读→再写日志。改为只报结构性事件（`IN_CREATE\|IN_MOVED_TO\|IN_DELETE`），内容写入交给文件自身 watch。**1065→68 ticks/10s** | `docs/m7-evidence.md` §1.1 |
-| **userspace 接管会让小核掉到最低档**（实测 691200 vs 系统 1804800） | **已解**：接管改**默认关闭**（`UPERF_CPU_GOVERNOR=1` 才启用），因为上游 governor 在本内核上本就起不来、无 parity 可保；且不再臆造 `powersave`（alioth 真实默认是 `schedutil`，臆造等于把 CPU 永久钉在最低频） | `docs/m7-evidence.md` §1.2 |
-| **`/sdcard` 下 `unlink` 对 root 静默失效**（`rm` 返回 0 但文件仍在） | **已解**：走底层 `/data/media/0/...` 删除即可（FUSE 视图同步清除）。这也解释了为何 5 份配置用 `/data/media/0/Android/yc/uperf/...` 而非 `/sdcard/...` | `docs/m6b-evidence.md` §7 |
-| **`offscreen.state` 在 alioth 上从未触发**：vendored 判据是 `/dev/cpuset/restricted` pid 数 > 10，而该集合在本机恒为 0 | **已解（M1 真验）**——电源键物理熄屏后 `restricted` 立即从 0 涨到 221，`Rust: offscreen.state = true` 出现。`input keyevent 26` 在某些场景下不会真正熄屏，必须真的按电源键。 |
-| `/dev/cpuset` 在本机是 **cgroup v1 形态**（有 `tasks`/`notify_on_release`），`/sys/fs/cgroup` 是 v2（只有 `apps`/`system`） | **已解（静态+真机）**——v3 二进制只读 `tasks`，写 `cpus`（不是 `tasks`！），fd 15-19 = `cpuset/{background,foreground,restricted,system-background,top-app}/cpus`，所以 cgroup v1 是真视图。**M3 的 sysfs 写入器必须新增 cpuset cpus (cpu mask) 子类型。** |
-| `topapp.pkgName` 的 `|Δpid| > 10` 门槛（`TOP_TASK_NR_DIFF_MIN`）是否与原版一致 | **已解**——dfps vendored `topapp_monitor.cpp` 与原版同源，原版**不复写**该模块，门槛=10 与 dfps 一致 |
-| NDK r26（clang 21）下 vendored scnlib / spdlog 需要非侵入式 shim | 已解决 | `cpp/CMakeLists.txt` 三处注释 + `docs/m0-evidence.md` §1（未改动 `cpp/dfps/**` 任何字节） |
-| **新增**：原版写 `/dev/cpuset/<g>/cpus`（cpu mask），不是 cgroup v2 cpu.max | 已发现 | M3 sysfs 写入器必须新增 cpu-mask 子类型（详见 `docs/m1-static-reverse.md` §3-§4） |
-| **SfHint 枚举值 ↔ 字符串映射** | **已静态推导出（6 值：idle/switch/trigger/gesture/touch/junk，对应 0..5；≥6 = unknown）** | 见 `docs/m1-static-reverse.md` §1.3；M3 hint state machine 按此实现 |
-| **`presets` 的真实结构** | **已解**：扁平 `presets[preset][scene]`，无 `base_hint` | 见 §8.2 与 `docs/m2-evidence.md` |
-| **stale `libuperf_core.a` 导致 ABI 错位崩溃** | 已修（工程性坑） | 症状：进程 `SIGSEGV` @ `memcpy(src=0x79,len=120)`；根因：改了 Rust 侧 FFI 签名但 `.a` 未重编，C++ 把 `len` 当指针。修法：`build.sh make` 现在**先跑 cargo 再 cmake**（见 `build.sh::build_rust`） |
-| v3 的 Hint 命名与日志文案（v2 文档不可信） | UNKNOWN | 以原版真机日志为准（M2 起逐条采集） |
-| `.data` 4 条不透明记录 | **已分类为 uperf 主二进制特性**：与 libsfanalysis 无关；M8 不再 carry vendor libsfanalysis，故不影响 | `docs/m1-static-reverse.md` §1.5 |
-| 原版 `CpufreqWriter` 各平台子类的确切分支条件 | **已解**（机制层面）：8 个候选子类全部要求一个 **min-freq 节点**（`epic minfreq`/`msm minfreq`/`scaling min`），在 alioth 上全被驱动锁死 → 原版直接 `No CpufreqWriter supported for this platform` 退出。本实现改走 `scaling_governor=userspace` + `scaling_setspeed`（实测可用），见 §8.4.2 | 已记录 `docs/m5-cpu-governor.md` §2 |
-| **上游打印的 OPP 列表是设备表的子集**（cluster0 打了 9/17），规则拟合不出（非成本去重/非凸包/非功率阈值） | **UNKNOWN**（疑为当时抓取残缺） | 本实现用**全量**设备 OPP 表（上游可选集的超集），不影响可达频点范围 |
-| 上游功耗受限时的**分配规则**（是否也做边际成本等值） | UNKNOWN | 本实现按"边际成本相等 = 限定功耗下总容量最大"实现，属读法 [I]，非字节级对齐 |
-| `SIGKILL` 情况下 governor 不会被 disarm（`scaling_max_freq` 驱动级只读，无从外部救援） | **已知隐患** | 进程内不可解（SIGKILL 后无代码可执行）；须由 magisk 模块的 `uninstall.sh`/启动自检还原 governor，**未实现** |
-| `context_scheduler` 的原版默认规则效果 | 已文档化但未实测 | §10.4 场景对齐 |
-| UGT 的 `asoulopt.zip` / `miui_migt.sh` / `platform_special.sh` / MTK 功耗表 | 不属本项目 | 原样保留，不解析 |
+| 上游打印的 OPP 列表是设备表的子集（cluster0 打了 9/17），规则拟合不出（非成本去重/非凸包/非功率阈值） | **UNKNOWN**（疑为抓取残缺） | 本实现用**全量**设备 OPP 表（上游可选集的超集），可达频点范围只多不少 |
+| 上游的功率预算分配规则、latency 平滑细节 | **UNKNOWN** | 本实现是"每样本一个 OPP、`predict` 触发才跳"，不是渐近逼近 |
+| `modules.input.enable=false` 是否真的能停掉输入监听 | **UNKNOWN** | 63 份配置全 `true`，且 vendored 监听器在配置解析前就由平台层启动；配成 false 只会多打一行日志 |
+| `cur_powermode.txt` 里 `auto` 的语义 | **[I]** 读作"交给 perapp 规则"（二进制里只有 `Internal perapp switcher …` 的痕迹） | 代码按 `[I]` 实现，未真机对照过原版 |
+| `comm` 被内核截断到 15 字符 | **已知**（不是缺陷） | `/MAIN_THREAD/` 用观测到的 `comm` 替换，模式与线程名同源 |
+| 帧源两条腿只在人工 e2e 里验过（`tools/uprobe-probe/e2e-shade.sh`、`tools/binder-probe/e2e-frames.sh`） | **已知** | 默认都不开；开机后 `frame.source=` 为空是正常的 |
 
 ### 12.3 许可与署名
+
 * 本仓库内容与上游一致为 **Apache-2.0**；vendor 的 dfps 代码保留其 "Copyright (C) 2021-2022 Matt Yang" 头。
 * `NOTICE` 需追加：dfps 来源与 commit、Rust 依赖清单。
 * 仓库内保留的原版二进制仅作 parity 参照，发布产物必须替换为自研构建。
-
----
 
 ## 13. 编码规范
 

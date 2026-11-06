@@ -24,7 +24,7 @@
 #
 # Not covered here (needs a device): that `/proc/<pid>/exe` really survives dfps'
 # cmdline rewrite, that a root `rename` onto /sdcard sticks, and the real daemon's
-# SIGTERM disarm. Those are the device items in docs/m9-watchdog.md.
+# SIGTERM disarm. Those are the device items in docs/records/m9-watchdog.md.
 
 set -u
 

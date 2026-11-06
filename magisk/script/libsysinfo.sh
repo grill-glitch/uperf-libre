@@ -91,7 +91,7 @@ require_aarch64() {
     echo "    bin/libsfanalysis_rs.so loaded into surfaceflinger"
     echo "  None of them can exec on a 32-bit-only device, and the injection target"
     echo "  would be 32-bit too, so the install is refused rather than left to fail"
-    echo "  silently at boot. No 32-bit build is shipped (docs/m11-10-32bit.md)."
+    echo "  silently at boot. No 32-bit build is shipped (docs/records/m11-10-32bit.md)."
     return 1
 }
 

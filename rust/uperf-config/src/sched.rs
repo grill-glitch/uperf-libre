@@ -912,7 +912,7 @@ mod tests {
         // Pins the known-quirk set: the gate test whitelists exactly this, so a
         // new config with a dangling class fails there.
         let mut with_anomalies = Vec::new();
-        for dir in ["docs/ugt-configs", "docs/upstream-configs"] {
+        for dir in ["docs/configs/ugt", "docs/configs/upstream"] {
             let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .unwrap()

@@ -421,5 +421,5 @@ stats ioctl=167 epoll=50 cw=28 ctw=0 txns=132 writes=126 state=1 idle_ms=282 ins
 
 - `scripts/sfanalysis-deobf.py`：§1.3/§1.4 的解密器（可复现）
 - `docs/spec/sfanalysis.md`：M8 边界 spec
-- `docs/m1-static-reverse.md §1.5`：M1 逆向笔记（**本节推翻其 hook 目标结论**）
+- `docs/records/m1-static-reverse.md §1.5`：M1 逆向笔记（**本节推翻其 hook 目标结论**）
 - `rust/uperf-core/src/hint.rs`、`rust/uperf-core/src/watch_task.rs`：消费端（已落地）

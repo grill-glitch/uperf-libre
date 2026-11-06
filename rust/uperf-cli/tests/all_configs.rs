@@ -1,7 +1,7 @@
 //! AGENT.md §10.2 — load every *.json from both vendored config trees:
-//!   * `docs/upstream-configs/` — the 38 configs from the upstream v3 release
+//!   * `docs/configs/upstream/` — the 38 configs from the upstream v3 release
 //!     (`yerf_dev-22.09.04.zip`). Parser regression baseline.
-//!   * `docs/ugt-configs/` — the 63 configs from the UGT fork. These extend the
+//!   * `docs/configs/ugt/` — the 63 configs from the UGT fork. These extend the
 //!     upstream shapes (extra sysfs.CPU* knobs, extra hintDuration.swjunk, etc.)
 //!     and are the shipping target.
 //!
@@ -16,11 +16,12 @@ fn run(dir_name: &str) -> Vec<PathBuf> {
         .parent().unwrap()           // rust/
         .parent().unwrap()           // uperf-libre/
         .join("docs")
+        .join("configs")
         .join(dir_name);
     let cfg_dir = match std::fs::canonicalize(&cfg_dir) {
         Ok(p) => p,
         Err(_) => {
-            eprintln!("skipping: docs/{} not vendored ({})", dir_name, cfg_dir.display());
+            eprintln!("skipping: docs/configs/{} not vendored ({})", dir_name, cfg_dir.display());
             return Vec::new();
         }
     };
@@ -52,14 +53,14 @@ fn check_all(entries: &[PathBuf], label: &str) {
 
 #[test]
 fn upstream_v3_configs() {
-    let entries = run("upstream-configs");
-    check_all(&entries, "upstream-configs");
-    eprintln!("upstream-configs: {} parsed", entries.len());
+    let entries = run("upstream");
+    check_all(&entries, "upstream");
+    eprintln!("upstream: {} parsed", entries.len());
 }
 
 #[test]
 fn ugt_configs() {
-    let entries = run("ugt-configs");
-    check_all(&entries, "ugt-configs");
-    eprintln!("ugt-configs: {} parsed", entries.len());
+    let entries = run("ugt");
+    check_all(&entries, "ugt");
+    eprintln!("ugt: {} parsed", entries.len());
 }

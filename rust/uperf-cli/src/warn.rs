@@ -1,7 +1,7 @@
 //! `uperf-cli warn` — emit unknown-module / unknown-key lines.
 //!
 //! Upstream's `CfgMgr` logs lines like (extracted from binary, see
-//! `docs/m1-static-reverse.md`):
+//! `docs/records/m1-static-reverse.md`):
 //!   * `CfgMgr: Unknown module '<m>' defined in base hint of preset '<p>'`
 //!   * `CfgMgr: Unknown key '<k>' of module '<m>' defined in base hint of preset '<p>'`
 //!   * `CfgMgr: Base hint of preset '<p>' not defined`

@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 ///
 /// Known divergence: this reports **fewer** warnings than upstream for
 /// `/dev/cpuset/<group>/cpus`, where upstream warns but this device accepts the write
-/// (`echo 0-7 > /dev/cpuset/top-app/cpus` succeeds). See docs/m7-evidence.md §6.
+/// (`echo 0-7 > /dev/cpuset/top-app/cpus` succeeds). See docs/records/m7-evidence.md §6.
 pub fn is_writeable(path: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let Ok(meta) = std::fs::metadata(path) else {

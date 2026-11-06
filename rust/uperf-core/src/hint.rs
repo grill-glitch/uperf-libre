@@ -2,7 +2,7 @@
 //! into `HintState` transitions + emits preset/scene change commands.
 //!
 //! AGENT.md §8.1 mermaid spec; SfHint enum values 0..5 derived in
-//! `docs/m1-static-reverse.md` §1.3 from the upstream v3 binary's two jump
+//! `docs/records/m1-static-reverse.md` §1.3 from the upstream v3 binary's two jump
 //! tables (one for old_hint, one for new_hint). Both tables index the SAME
 //! 6 string-construction cases, so the mapping is:
 //!
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn enum_mapping_matches_upstream() {
         // The SfHint enum value 0..5 mapping was extracted from upstream's two
-        // parallel jump tables in docs/m1-static-reverse.md §1.3.
+        // parallel jump tables in docs/records/m1-static-reverse.md §1.3.
         assert_eq!(SfHint::from_byte(0), SfHint::Idle);
         assert_eq!(SfHint::from_byte(1), SfHint::Switch);
         assert_eq!(SfHint::from_byte(2), SfHint::Trigger);

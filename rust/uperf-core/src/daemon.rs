@@ -286,7 +286,7 @@ impl Daemon {
         // app's own `libgui.so` `queueBuffer`, one probe per thread, so only *that*
         // app's frames are counted (opt-in `UPERF_SF_UPROBE=1`). While its probe is
         // healthy the ⑤ binder leg stands down; see `sf_uprobe` and
-        // `docs/m11-11-ebpf-uprobe-frame-leg.md`.
+        // `docs/records/m11-11-ebpf-uprobe-frame-leg.md`.
         if let Some(cfg_uprobe) = self.settings.sf_uprobe.clone() {
             let orch = self.orchestrator.clone();
             let top = move || orch.as_ref().and_then(|o| o.lock().top_app().map(str::to_string));

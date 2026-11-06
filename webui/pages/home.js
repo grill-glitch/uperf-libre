@@ -189,7 +189,7 @@ function renderConfig(data, config, onPresetChanged) {
  * (`uperf_watchdog.state`). The two together are what make a kill visible — a stale
  * `daemon.state=running` with no process is the documented signature of one, and
  * `watchdog.state=gave-up` means the restart budget was spent and the platform governor
- * is in charge on purpose (docs/m9-watchdog.md).
+ * is in charge on purpose (docs/records/m9-watchdog.md).
  */
 function renderSupervision(data) {
     const running = Number(data['daemon.count'] || 0) > 0;

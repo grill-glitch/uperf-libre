@@ -64,7 +64,7 @@ sysfs/sched/cpu/anim/input/log），且 preset 下的 scene 名全部合法。
 集成测试（`rust/uperf-cli/tests/all_configs.rs`）覆盖 38 份，断言 meta.name/author 非空、
 preset 有 scene、`cpu.margin` 可解析；`cargo test -p uperf-cli --release` → **1 passed**。
 
-上游配置已 vendor 到 `docs/upstream-configs/`（38 个 .json），供测试与 parity 使用。
+上游配置已 vendor 到 `docs/configs/upstream/`（38 个 .json），供测试与 parity 使用。
 
 ## 3. 真机回归（修完 stale-staticlib 之后）
 

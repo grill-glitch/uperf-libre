@@ -155,7 +155,7 @@ impl SysfsLedger {
 
     /// Persist through a same-directory temp file plus `rename`, with a direct write as
     /// the fallback — `/sdcard` is FUSE and a root `rename` there can silently no-op on
-    /// this device (`docs/m6b-evidence.md` §6), so a status/recovery file must not
+    /// this device (`docs/records/m6b-evidence.md` §6), so a status/recovery file must not
     /// depend on it.
     pub fn flush(&mut self) -> std::io::Result<()> {
         if !self.dirty {

@@ -888,7 +888,7 @@ in-function ones by +26 (symbol names are the stable reference).
 * Documented as a historical/experimental reference: yes — the doc comment says the
   inline route is refused on this device and the code is kept as the reference for what
   an inline patch would have to do. The one-shot probe in item 3 is the *instrument*
-  that established the device's policy, which is recorded in `docs/m8-sfanalysis-reverse.md`
+  that established the device's policy, which is recorded in `docs/records/m8-sfanalysis-reverse.md`
   and in the `got.rs` header (`execmem` refused for the anonymous RWX map, `execmod` for
   mprotecting a code page).
 

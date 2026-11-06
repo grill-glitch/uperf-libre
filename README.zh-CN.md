@@ -46,11 +46,11 @@ uperf-libre 是同样的对外表面，重写实现：
 
 ### CPU 与内存控制
 
-- **CPU 频率通过 `userspace` 调速器 + `scaling_setspeed` 接管**。在 alioth（`qcom-cpufreq-hw`，`scaling_max_freq` 驱动级只读）上这是唯一可工作的路径；每个 policy 逐个被接管。详见 [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md)。
+- **CPU 频率通过 `userspace` 调速器 + `scaling_setspeed` 接管**。在 alioth（`qcom-cpufreq-hw`，`scaling_max_freq` 驱动级只读）上这是唯一可工作的路径；每个 policy 逐个被接管。详见 [`docs/records/m5-cpu-governor.md`](./docs/records/m5-cpu-governor.md)。
 - **能耗模型驱动的 OPP 选择**。每个 cluster 的 power / cost 曲线在三个 cluster × 25 个 OPP 上与上游 printout 的拟合误差 <0.0015；然后在共享 PL1/PL2 池下做最优 OPP 选择。
 - **Devfreq 与 LLCC boost** —— 对 DDR-bandwidth、L3-latency、CPU-LLCC-bandwidth、UFS devfreq 调速器的 `min_freq` / `max_freq` 写入。
 - **cgroup、cpuset、devfreq 节点去重写入** —— 相同值重复写入会被跳过，从而把守护进程自身的 wakeup 开销压到最低。
-- **外置看门狗 + 死手开关（M9）** —— `uperf_start` 会拉起一个 shell 守护：它用 `/proc/<pid>/exe` 识别 daemon（dfps 会把 supervisor 和 worker 的进程名都改写成 `uperf`，因此进程名与 pid 文件都不可信），并针对进程内无法自救的两种退出动手：`SIGKILL`，以及 `panic = "abort"` 下的 Rust panic。它会先 SIGTERM 收尾、恢复 daemon 记录过的 governor、在一个 per-boot 预算内重启 daemon；预算用尽后就让系统 governor 接管，而不是留下一个被钉死的频点。机器可读状态见 `<USER_PATH>/uperf.state`（daemon 写）与 `<USER_PATH>/uperf_watchdog.state`（看门狗写）；详见 [`docs/m9-watchdog.md`](./docs/m9-watchdog.md)。
+- **外置看门狗 + 死手开关（M9）** —— `uperf_start` 会拉起一个 shell 守护：它用 `/proc/<pid>/exe` 识别 daemon（dfps 会把 supervisor 和 worker 的进程名都改写成 `uperf`，因此进程名与 pid 文件都不可信），并针对进程内无法自救的两种退出动手：`SIGKILL`，以及 `panic = "abort"` 下的 Rust panic。它会先 SIGTERM 收尾、恢复 daemon 记录过的 governor、在一个 per-boot 预算内重启 daemon；预算用尽后就让系统 governor 接管，而不是留下一个被钉死的频点。机器可读状态见 `<USER_PATH>/uperf.state`（daemon 写）与 `<USER_PATH>/uperf_watchdog.state`（看门狗写）；详见 [`docs/records/m9-watchdog.md`](./docs/records/m9-watchdog.md)。
 - **Cluster 亲和性 / 动态 stune 风格绑定** —— 前台 App 的 UI 线程迁到大核，idle 与后台工作被排除在大核外。
 
 ### Hint 状态机
@@ -82,7 +82,7 @@ uperf-libre 是同样的对外表面，重写实现：
   （`<USER_PATH>/sfanalysis.hint`，单字节 0..5）与上游消费端字节兼容。
   发布产物中不再携带任何闭源 .so。重写边界见
   [`docs/spec/sfanalysis.md`](./docs/spec/sfanalysis.md)，r2 静态逆向记录见
-  [`docs/m8-sfanalysis-reverse.md`](./docs/m8-sfanalysis-reverse.md)。剩余的
+  [`docs/records/m8-sfanalysis-reverse.md`](./docs/records/m8-sfanalysis-reverse.md)。剩余的
   真机 byte 序列一致性对账是 M8 的最后一道验收。
 - **APK 安装加速** 是上游通过一个独立事件支持的；未移植。
 
@@ -621,13 +621,13 @@ done
 └─────────────────────────────────────────────────────────────┘
 ```
 
-CPU 调频器通过将每个 `cpufreq` policy 的 `scaling_governor` 切到 `userspace`、然后每 ~20 ms 通过 `scaling_setspeed` 发布下一个 OPP 目标来接管。在驱动层锁住 `scaling_max_freq` 的场景（例：`qcom-cpufreq-hw` on alioth —— mode 444，root 写入返回 EACCES），这是唯一可工作的路径；详见 [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md) 与 [`rust/uperf-config/src/freq_target.rs`](./rust/uperf-config/src/freq_target.rs) 中的解析顺序。
+CPU 调频器通过将每个 `cpufreq` policy 的 `scaling_governor` 切到 `userspace`、然后每 ~20 ms 通过 `scaling_setspeed` 发布下一个 OPP 目标来接管。在驱动层锁住 `scaling_max_freq` 的场景（例：`qcom-cpufreq-hw` on alioth —— mode 444，root 写入返回 EACCES），这是唯一可工作的路径；详见 [`docs/records/m5-cpu-governor.md`](./docs/records/m5-cpu-governor.md) 与 [`rust/uperf-config/src/freq_target.rs`](./rust/uperf-config/src/freq_target.rs) 中的解析顺序。
 
 ## 状态
 
 - **稳定**：上游基础参考（25 个 OPP 上与 printout 拟合误差 <0.0015）、能耗模型、PL1/PL2 池算术、scene → sysfs 写入流水线，以及基于 inotify 的 `cur_powermode.txt` / `perapp_powermode.txt` 热重载。
-- **守护（M9）**：主机侧已验证（`cargo test --release` 211 个测试；`sh scripts/test_watchdog_host.sh` 10 用例 / 60 条断言），alioth **真机验证**（`scripts/m9-device-verify.sh`，33 条断言：`/proc/<pid>/exe` 穿过 dfps 的 cmdline 改写、SIGKILL 后死手路径恢复真实已接管 daemon、孤儿 worker 被 SIGTERM 后自行 disarm、出厂 15 s 节奏下占单核 0.5%（缓存化 liveness 之前是 0.93–1.12%：存活判定走 `pid+start_ticks` 缓存，整机 `/proc` 扫描只在这份缓存失效时才付，六个采样只扫一次）），并完成 **装机 + 重启验收**（`scripts/m9-device-boot-verify.sh`，`ksud module install` + 重启后 23 条断言：KernelSU 的 `service.sh` 路径确实拉起看门狗且活过重启；`webui.sh restart` 把 owner 锁干净交接给新实例）。过程中发现并修掉五个**只有真机才暴露**的缺陷（扫描开销、进程名过滤器、无换行文件读取、`gave-up` 被后续采样擦除、以及重启后状态文件可能残留 `stopped` 而 daemon 仍在跑）。见 [`docs/m9-watchdog.md`](./docs/m9-watchdog.md) §5。
-- **日志上限（M10）**：daemon 自己轮转日志（每文件 4 MiB、保留 2 个），启动路径对超限备份直接丢弃（16 MiB）而不是去读它——改前实测：34 MB 的日志加 138 MB 的 `.bak` 堆在 `/sdcard`。见 [`docs/m10-log-cap.md`](./docs/m10-log-cap.md)。
+- **守护（M9）**：主机侧已验证（`cargo test --release` 211 个测试；`sh scripts/test_watchdog_host.sh` 10 用例 / 60 条断言），alioth **真机验证**（`scripts/m9-device-verify.sh`，33 条断言：`/proc/<pid>/exe` 穿过 dfps 的 cmdline 改写、SIGKILL 后死手路径恢复真实已接管 daemon、孤儿 worker 被 SIGTERM 后自行 disarm、出厂 15 s 节奏下占单核 0.5%（缓存化 liveness 之前是 0.93–1.12%：存活判定走 `pid+start_ticks` 缓存，整机 `/proc` 扫描只在这份缓存失效时才付，六个采样只扫一次）），并完成 **装机 + 重启验收**（`scripts/m9-device-boot-verify.sh`，`ksud module install` + 重启后 23 条断言：KernelSU 的 `service.sh` 路径确实拉起看门狗且活过重启；`webui.sh restart` 把 owner 锁干净交接给新实例）。过程中发现并修掉五个**只有真机才暴露**的缺陷（扫描开销、进程名过滤器、无换行文件读取、`gave-up` 被后续采样擦除、以及重启后状态文件可能残留 `stopped` 而 daemon 仍在跑）。见 [`docs/records/m9-watchdog.md`](./docs/records/m9-watchdog.md) §5。
+- **日志上限（M10）**：daemon 自己轮转日志（每文件 4 MiB、保留 2 个），启动路径对超限备份直接丢弃（16 MiB）而不是去读它——改前实测：34 MB 的日志加 138 MB 的 `.bak` 堆在 `/sdcard`。见 [`docs/records/m10-log-cap.md`](./docs/records/m10-log-cap.md)。
 - **尽力而为**：延迟平滑（每采样最多一步，除非 predict 触发 —— 上游描述的是连续共享延迟预算，离散近似无法做到逐节拍匹配），以及 guideCap / limitEfficiency 的容量裁剪表（不可直接从闭源二进制观测）。
 - **真机验证**：alioth（crDroid Android 16 / KernelSU Next 3.3.0）与 polaris（LineageOS 22.2 working；Android 16 / 4.19 内核 —— axion 配置 + `KERNEL_CLANG_TRIPLE`）。
 
@@ -638,7 +638,7 @@ CPU 调频器通过将每个 `cpufreq` policy 的 `scaling_governor` 切到 `use
 ## 致谢
 
 - 闭源的 Uperf v3 二进制、配置与平台脚本：[yinwanxi/Uperf-Game-Turbo](https://github.com/yinwanxi/Uperf-Game-Turbo)（`b13d54a`）。
-- SfAnalysis 注入源码来自 [yc9559/surfaceflinger-analysis](https://github.com/yc9559/surfaceflinger-analysis)；r2 静态逆向（`docs/m8-sfanalysis-reverse.md`）基于该项目 `dev-22.09.04` release 二进制完成。
+- SfAnalysis 注入源码来自 [yc9559/surfaceflinger-analysis](https://github.com/yc9559/surfaceflinger-analysis)；r2 静态逆向（`docs/records/m8-sfanalysis-reverse.md`）基于该项目 `dev-22.09.04` release 二进制完成。
 - dfps C++ 平台层，vendored 自 [cpp/dfps/](./cpp/dfps)（取自 [yc9559/dfps](https://github.com/yc9559/dfps)，Apache-2.0）；vendoring 规则见 `cpp/dfps/DFPS_VENDOR.md`。
 - 63 份平台配置由各自作者贡献，署名见每份配置的 `meta.author` 字段。
 

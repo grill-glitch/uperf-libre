@@ -174,7 +174,7 @@ print_info() {
 
 # The write path. The *frontend* decides whether a name is a preset of the loaded
 # config (it has the JSON); this only performs the write and reports what the file
-# actually contains afterwards, so a silent truncation (see docs/m6b-evidence.md) or
+# actually contains afterwards, so a silent truncation (see docs/records/m6b-evidence.md) or
 # a read-only filesystem cannot be reported as success.
 set_preset() {
     local want="$1"

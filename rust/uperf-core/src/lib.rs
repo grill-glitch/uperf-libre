@@ -21,7 +21,7 @@
 // Every `unsafe` in this crate is load-bearing: a libc/`extern "C"` call, a raw
 // pointer into a buffer the platform layer owns, or the binder mmap. None of them
 // is decorative, so a block that stops needing `unsafe` must fail the build
-// rather than linger (audit: `UNSAFE_AUDIT_REPORT.md`).
+// rather than linger (audit: `docs/audit/unsafe-audit-report.md`).
 #![deny(unused_unsafe)]
 
 pub mod cpu_task;

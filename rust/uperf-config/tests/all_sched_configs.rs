@@ -1,7 +1,7 @@
 //! AGENT.md §10.2 — the sched acceptance gate over *every* vendored config.
 //!
-//! Walks `docs/upstream-configs/` (the 38 configs from the upstream v3 release)
-//! and `docs/ugt-configs/` (the 63 UGT configs that are the shipping target) and
+//! Walks `docs/configs/upstream/` (the 38 configs from the upstream v3 release)
+//! and `docs/configs/ugt/` (the 63 UGT configs that are the shipping target) and
 //! asserts, for each `modules.sched`:
 //!
 //!   * the module parses into `SchedConfig`;
@@ -46,7 +46,7 @@ fn repo_root() -> PathBuf {
 
 fn config_files() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for dir in ["docs/upstream-configs", "docs/ugt-configs"] {
+    for dir in ["docs/configs/upstream", "docs/configs/ugt"] {
         let Ok(entries) = std::fs::read_dir(repo_root().join(dir)) else { continue };
         for e in entries.flatten() {
             let p = e.path();

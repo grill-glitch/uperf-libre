@@ -1,6 +1,6 @@
 //! Sysfs write planner.
 //!
-//! **Key finding (docs/m4-evidence.md §1)**: the paths are NOT hardcoded in the
+//! **Key finding (docs/records/m4-evidence.md §1)**: the paths are NOT hardcoded in the
 //! binary. `modules.sysfs.knob` is a `{knob_name: absolute_path}` table in the
 //! config:
 //!

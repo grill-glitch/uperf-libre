@@ -7,7 +7,7 @@
 //!   * `presets.<preset>` — flat map of `<scene>` → `{<mod>.<param>: <value>}`
 //!     where `<scene>` is `*` (default for this preset) or one of `idle / touch /
 //!     trigger / gesture / switch / junk` (the 6 SfHint values from
-//!     `docs/m1-static-reverse.md` §1.3). Cascade:
+//!     `docs/records/m1-static-reverse.md` §1.3). Cascade:
 //!
 //!     1. `presets[<mode>][<scene>]`
 //!     2. `presets[<mode>][*]`
@@ -322,7 +322,7 @@ impl Config {
     /// `modules.sysfs.knob` — the `{knob_name: absolute_path}` table.
     ///
     /// This is the ONLY place sysfs paths come from: the upstream binary has no
-    /// hardcoded paths at all (see `docs/m4-evidence.md` §1). Missing/empty
+    /// hardcoded paths at all (see `docs/records/m4-evidence.md` §1). Missing/empty
     /// table → empty map (all sysfs knobs then resolve to nothing).
     pub fn sysfs_knob_table(&self) -> std::collections::BTreeMap<String, String> {
         let mut out = std::collections::BTreeMap::new();

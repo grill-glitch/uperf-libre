@@ -76,7 +76,7 @@ Below is what the daemon does on every tick; the per-feature details are in
 - **CPU-frequency scaling via `userspace` governor + `scaling_setspeed`**. On
   alioth (`qcom-cpufreq-hw`, `scaling_max_freq` locked at the driver level)
   this is the only path that works; every policy is taken over per cluster.
-  See [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md).
+  See [`docs/records/m5-cpu-governor.md`](./docs/records/m5-cpu-governor.md).
 - **Energy-model-driven OPP selection**. The per-cluster power / cost curves
   fit the upstream printout to <0.0015 across 25 OPPs on three clusters; the
   marginal-cost budget then allocates the OPP table across clusters under a
@@ -100,7 +100,7 @@ Below is what the daemon does on every tick; the per-feature details are in
   governor in charge instead of a pinned frequency. Machine-readable state in
   `<USER_PATH>/uperf.state` (from the daemon) and
   `<USER_PATH>/uperf_watchdog.state` (from the watchdog); see
-  [`docs/m9-watchdog.md`](./docs/m9-watchdog.md).
+  [`docs/records/m9-watchdog.md`](./docs/records/m9-watchdog.md).
 - **Cluster affinity / dynamic-stune-style binding** — UI threads of the
   foreground app are moved to big cores; idle and background work is
   restricted from them.
@@ -151,7 +151,7 @@ A short list of the supported scenes; the full enumeration is in
   single byte 0..5) is byte-compatible with the upstream consumer. Vendor bytes
   are no longer shipped in the published module. See
   [`docs/spec/sfanalysis.md`](./docs/spec/sfanalysis.md) for the rewrite
-  boundary and `docs/m8-sfanalysis-reverse.md` for the static reverse.
+  boundary and `docs/records/m8-sfanalysis-reverse.md` for the static reverse.
   Real-device byte-sequence parity is the remaining acceptance step.
 - **APK install acceleration** is upstream-supported through a separate
   event; not ported.
@@ -293,7 +293,7 @@ The CPU governor takes over each `cpufreq` policy by switching its
 `scaling_setspeed` every ~20 ms. On devices that have locked
 `scaling_max_freq` at the driver level (e.g. `qcom-cpufreq-hw` on alioth —
 mode 444, root writes fail with EACCES), this is the only path that works;
-see [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md) and the
+see [`docs/records/m5-cpu-governor.md`](./docs/records/m5-cpu-governor.md) and the
 `freq_target` resolution order in
 [`rust/uperf-config/src/freq_target.rs`](./rust/uperf-config/src/freq_target.rs).
 
@@ -318,11 +318,11 @@ see [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md) and the
   lock over to a new instance). Five device-only defects were found and fixed on
   the way (the scan's cost, the process-name filter, a no-trailing-newline read, a
   sticky `gave-up`, and a status file that a restart could leave saying `stopped`
-  beside a running daemon). See [`docs/m9-watchdog.md`](./docs/m9-watchdog.md) §5.
+  beside a running daemon). See [`docs/records/m9-watchdog.md`](./docs/records/m9-watchdog.md) §5.
 - **Bounded logs (M10)**: the daemon rotates its own log (4 MiB per file, 2 rotated
   files) and the start path drops an oversized backup (16 MiB) instead of reading
   it — measured before this change: a 34 MB log plus a 138 MB `.bak` on
-  `/sdcard`. See [`docs/m10-log-cap.md`](./docs/m10-log-cap.md).
+  `/sdcard`. See [`docs/records/m10-log-cap.md`](./docs/records/m10-log-cap.md).
 - **Best-effort**: latency smoothing (one OPP per sample unless the
   predict branch fires — upstream describes a continuous shared latency
   budget whose discrete approximation we do not claim to match tick-for-tick),
@@ -347,7 +347,7 @@ warning set drifts.
   (`b13d54a`).
 - The SfAnalysis injection source at
   [yc9559/surfaceflinger-analysis](https://github.com/yc9559/surfaceflinger-analysis);
-  the static reverse (`docs/m8-sfanalysis-reverse.md`) is built from the
+  the static reverse (`docs/records/m8-sfanalysis-reverse.md`) is built from the
   `dev-22.09.04` release binary on that project.
 - The dfps C++ platform layer, vendored under
   [cpp/dfps/](./cpp/dfps) from [yc9559/dfps](https://github.com/yc9559/dfps)

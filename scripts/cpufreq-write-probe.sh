@@ -3,7 +3,7 @@
 # Is `scaling_max_freq` actually writable on this kernel?
 #
 # This decides whether the `userspace` takeover is *necessary*, which is the premise
-# the whole frequency design rests on: `docs/m7-evidence.md` §6 recorded EACCES for a
+# the whole frequency design rests on: `docs/records/m7-evidence.md` §6 recorded EACCES for a
 # different value on alioth, and the module's own `powercfg_once.sh` leaves the node at
 # mode 0444. Run it again after a kernel or ROM change (`sh <this> [policy]`).
 #
@@ -73,10 +73,10 @@ echo "   cur_freq=$(cat "$D/scaling_cur_freq" 2>/dev/null) governor=$(cat "$D/sc
 if [ "$diff_verdict" = rejected ]; then
     echo "   VERDICT: scaling_max_freq is driver read-only here -> the userspace"
     echo "            takeover (scaling_governor=userspace + scaling_setspeed) is the"
-    echo "            only frequency path, as docs/m7-evidence.md §6 recorded."
+    echo "            only frequency path, as docs/records/m7-evidence.md §6 recorded."
 else
     echo "   VERDICT: scaling_max_freq ACCEPTS a different value here -> the takeover is"
     echo "            NOT the only path; a min/max writer would work too (revisit the"
-    echo "            'takeover is the only option' premise in docs/m7-evidence.md §6)."
+    echo "            'takeover is the only option' premise in docs/records/m7-evidence.md §6)."
 fi
 echo PROBE_DONE

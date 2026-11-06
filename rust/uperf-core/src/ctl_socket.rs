@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 // The platform-specific address constructors. Both paths exist and were verified by
-// compile probe on this repo's two real targets (`UNSAFE_AUDIT_REPORT.md` §R-1):
+// compile probe on this repo's two real targets (`docs/audit/unsafe-audit-report.md` §R-1):
 // the host test target is Linux, the device is Android.
 #[cfg(target_os = "android")]
 use std::os::android::net::SocketAddrExt;
@@ -593,7 +593,7 @@ mod tests {
     /// leaks into every child the daemon spawns) and a link that carries bytes both
     /// ways. The byte-level agreement with the independent hand-built peer
     /// (`tools/ctl-listen`) is what the alioth e2e run demonstrates — see §R-1 of
-    /// `UNSAFE_AUDIT_REPORT.md`; this is the host-side half.
+    /// `docs/audit/unsafe-audit-report.md`; this is the host-side half.
     #[test]
     fn abstract_connect_works_and_the_fd_is_cloexec() {
         use std::os::fd::AsRawFd;

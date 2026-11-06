@@ -6,7 +6,7 @@
 //! and its worker to plain `uperf`, `pidof` does not match a zombie, and a
 //! `killall`-based teardown that matches the binary's filename kills only the
 //! supervisor and orphans the worker that owns the governor (see
-//! `docs/m6b-evidence.md` §9-§11 and `docs/m7-evidence.md` §1).
+//! `docs/records/m6b-evidence.md` §9-§11 and `docs/records/m7-evidence.md` §1).
 //!
 //! The module's watchdog (`magisk/script/uperf_watchdog.sh`) therefore decides
 //! liveness from `/proc` itself — it resolves each candidate's `exe`, which
@@ -167,7 +167,7 @@ fn read_trim(path: &str) -> String {
 /// status, falling back to a direct write when the rename does not stick.
 ///
 /// `/sdcard` is FUSE and a root `unlink` there can silently no-op on this device
-/// (docs/m6b-evidence.md §6), so `rename` is not assumed to work — but reporting
+/// (docs/records/m6b-evidence.md §6), so `rename` is not assumed to work — but reporting
 /// the state must not depend on it either.
 fn write_atomic(path: &Path, data: &[u8]) {
     let mut tmp = path.as_os_str().to_os_string();

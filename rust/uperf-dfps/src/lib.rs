@@ -5,14 +5,14 @@
 //! subtree uses, so "is this our code or theirs" is a fact of the build graph instead
 //! of a convention. `uperf-core` reaches it through `pub use uperf_dfps as dfps_rs;`.
 //!
-//! **Do not edit in uperf-libre.** Make changes here, then `git subtree pull` from
-//! uperf-libre (or `git subtree push` from dfps-rewrite to reverse-sync). See
-//! `docs/subtree-workflow.md` for the full recipe.
+//! **Do not edit in uperf-libre.** Make changes in grill-glitch/dfps-rewrite, then
+//! `git subtree pull` here (or `git subtree push` from there to reverse-sync).
 //!
-//! Round-trip verified: a change committed here, then `git subtree split` +
-//! push to `dfps-rs-split`, then `git subtree pull --prefix=rust/uperf-dfps
-//! dfps-rs dfps-rs-split` in uperf-libre, lands the change. See
-//! `docs/subtree-workflow.md` §Verification.
+//! Round-trip verified: a change committed in dfps-rewrite, then `git subtree split` +
+//! push to `dfps-rs-split`, then
+//! `git subtree pull --prefix=rust/uperf-dfps dfps-rs dfps-rs-split` in uperf-libre,
+//! lands the change. The reorganisation that made this a crate of its own moved the
+//! path from `rust/uperf-core/src/dfps_rs` to `rust/uperf-dfps`.
 //!
 //! Logging: the crate has no opinion about the sink — uperf installs one with
 //! [`set_logger`] at startup (its `log_msg`), and without one the lines are dropped.
