@@ -9,12 +9,13 @@
 //! `dfps_task::tests::resolve_rule_is_byte_equal_to_upstream` proves the
 //! pure rule-lookup logic is equivalent to upstream dynamic_fps.cpp.
 //!
-//! Design decisions (see .hermes/wayfinder/ticket-T04..T06 for the
-//! reasoning):
+//! Design decisions (the reasoning that produced them is the M1 static reverse,
+//! `docs/records/m1-static-reverse.md` §1-§2, plus the dfps rewrite snapshot in
+//! `docs/history/wayfinder-fog.md`):
 //!
-//! * State fields chosen per T04: HashMap + two Option<FpsRule> for the
+//! * State fields: HashMap + two Option<FpsRule> for the
 //!   special pkg names; `cur_hz: Option<i32>`; force flag as `Cell<bool>`.
-//! * `force=true` survives per T05 (3 callers: topapp switch, offscreen
+//! * `force=true` is kept (3 callers: topapp switch, offscreen
 //!   on/off-wake). The flag is folded into the closure passed to the heavy
 //!   worker so we don't need a module-level scratch field.
 //! * Notify path is `/sdcard/Android/yc/uperf/dfps_cur.txt` per T06.

@@ -9,3 +9,7 @@ __pycache__
 /webui/node_modules
 /webui/icons.js
 /magisk/webroot
+
+# Agent scratch/planning state (wayfinder tickets, session notes). Never a deliverable:
+# the conclusions belong in docs/, the reasoning in AGENT.md.
+/.hermes

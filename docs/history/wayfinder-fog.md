@@ -1,8 +1,9 @@
 # dfps-rs 重写 — wayfinder 状态
 
-> 本文件是 **charting 阶段**的初稿。**正式地图是
-> `.hermes/wayfinder/map.md`**（索引） + `.hermes/wayfinder/ticket-T*.md`
-> （每张票的细节）。下面保留一份"近期状态快照"作为下一会话的快速上手。
+> 本文件是 **charting 阶段**的初稿，也是那一轮规划唯一留下来的东西：当时的
+> `.hermes/wayfinder/`（一张 map + 六张 T04..T09 的问题票）已从仓库移除——那些票
+> 本身只是"待决问题"的陈述，结论落在代码、`docs/records/m1-static-reverse.md` 与
+> 本文里。下面保留一份"近期状态快照"作为下一会话的快速上手。
 
 ## 终点（见 map.md §Destination）
 
