@@ -1,16 +1,23 @@
-//! dfps-rs — dfps business logic, owned by dfps-rewrite, mounted into
-//! uperf-libre as a subtree at this exact path.
+//! dfps-rs — dfps business logic, owned by dfps-rewrite.
 //!
-//! **Do not edit in uperf-libre.** Make changes here, then
-//! `git subtree pull` from uperf-libre (or `git subtree push` from dfps-rewrite to
-//! reverse-sync). See `docs/subtree-workflow.md` in this repo for the full recipe.
+//! This is its **own crate** (`uperf-dfps`), mounted into uperf-libre as a subtree at
+//! `rust/uperf-dfps`. The crate boundary is deliberate: it is the same boundary the
+//! subtree uses, so "is this our code or theirs" is a fact of the build graph instead
+//! of a convention. `uperf-core` reaches it through `pub use uperf_dfps as dfps_rs;`.
+//!
+//! **Do not edit in uperf-libre.** Make changes here, then `git subtree pull` from
+//! uperf-libre (or `git subtree push` from dfps-rewrite to reverse-sync). See
+//! `docs/subtree-workflow.md` for the full recipe.
 //!
 //! Round-trip verified: a change committed here, then `git subtree split` +
-//! push to `dfps-rs-split`, then `git subtree pull --prefix=rust/uperf-core/src/dfps_rs
+//! push to `dfps-rs-split`, then `git subtree pull --prefix=rust/uperf-dfps
 //! dfps-rs dfps-rs-split` in uperf-libre, lands the change. See
 //! `docs/subtree-workflow.md` §Verification.
 //!
-//! Public surface (re-exported so uperf's `crate::dfps_rs::DfpsTask` etc.
+//! Logging: the crate has no opinion about the sink — uperf installs one with
+//! [`set_logger`] at startup (its `log_msg`), and without one the lines are dropped.
+//!
+//! Public surface (re-exported so uperf's `crate::DfpsTask` etc.
 //! still resolves one level deep):
 //!
 //! * [`DfpsTask`] — the state machine + dedupe.
@@ -19,12 +26,16 @@
 //! * [`OFFSCREEN_PKG`], [`UNIVERSAL_PKG`] — special pkg name constants.
 
 pub mod config;
+pub mod logger;
 pub mod notifier;
 pub mod scheduler;
 pub mod sys_settings;
 pub mod task;
 
 pub use config::{FpsRule, RuleTable, Tunables, OFFSCREEN_PKG, UNIVERSAL_PKG};
+pub use logger::set_logger;
+// Crate-internal alias for the four call sites that report to the host's log.
+pub(crate) use logger::log;
 pub use notifier::write_cur_hz;
 pub use scheduler::{DfpsScheduler, RealSink, RecordingSink, RefreshSink};
 pub use task::DfpsTask;

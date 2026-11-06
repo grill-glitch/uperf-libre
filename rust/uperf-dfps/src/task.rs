@@ -28,7 +28,7 @@
 //!   fork+exec through the C++ `ExecCmd` shim.
 //! * Wire `watch_task` so dfps.txt changes are picked up in <100ms.
 
-use crate::dfps_rs::config::{FpsRule, RuleTable, Tunables};
+use crate::config::{FpsRule, RuleTable, Tunables};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -114,7 +114,7 @@ impl DfpsTask {
         } else {
             &self.override_app
         };
-        if pkg == crate::dfps_rs::config::OFFSCREEN_PKG {
+        if pkg == crate::config::OFFSCREEN_PKG {
             return self.offscreen;
         }
         self.rules.get(pkg).copied().unwrap_or(self.universal)
@@ -123,7 +123,7 @@ impl DfpsTask {
     /// Run the dedupe gate and, if the new Hz differs, report the transition.
     ///
     /// Pure: no I/O. The caller (the scheduler) hands the returned transition
-    /// to its [`crate::dfps_rs::scheduler::RefreshSink`], which is the real
+    /// to its [`crate::scheduler::RefreshSink`], which is the real
     /// `settings put` + `dfps_cur.txt` writer in production and a recording
     /// stub in tests. That split is what lets the device smoke and the unit
     /// tests exercise different halves of the same rule.
@@ -297,7 +297,7 @@ impl DfpsTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dfps_rs::config::{FpsRule, RuleTable, UNIVERSAL_PKG};
+    use crate::config::{FpsRule, RuleTable, UNIVERSAL_PKG};
 
     fn sample_table() -> RuleTable {
         // Mirrors upstream dynamic_fps.cpp fixture from src/tests/runit.cpp.
@@ -347,7 +347,7 @@ com.other.app    30 90
         );
 
         // Case 4: override is "-" -> offscreen rule (pkg="-")
-        task.override_app = crate::dfps_rs::config::OFFSCREEN_PKG.into();
+        task.override_app = crate::config::OFFSCREEN_PKG.into();
         assert_eq!(
             task.debug_snapshot(),
             "cur_app=- rule=FpsRule { idle: 30, active: 60 } cur_hz=None active=false",

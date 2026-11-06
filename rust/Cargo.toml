@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "uperf-config",
+    "uperf-dfps",
     "uperf-core",
     "uperf-cli",
     "uperf-sfanalysis",

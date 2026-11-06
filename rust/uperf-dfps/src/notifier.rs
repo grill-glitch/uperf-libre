@@ -1,7 +1,7 @@
 //! Standalone notifier — write the current Hz to DFPS_NOTIFY_PATH.
 //!
 //! Split out from `task.rs` so the notifier module path stays flat
-//! (`crate::dfps_rs::notifier`) whether the crate is built standalone
+//! (`crate::notifier`) whether the crate is built standalone
 //! (in dfps-rewrite) or mounted as a subtree (in uperf-libre).
 
 use std::fs::OpenOptions;

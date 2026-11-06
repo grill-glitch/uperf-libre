@@ -102,7 +102,7 @@ copy of dfps.
 |---|---|
 | `source/main.cpp` | dfps' process supervisor. Reimplemented in `cpp/uperf/app_main.cpp`; the Rust daemon is the entry point now |
 | `source/dfps.{h,cpp}` | dfps' module assembly. Superseded by the Rust `orchestrator` + `dfps_rs` |
-| `source/modules/dynamic_fps.{h,cpp}` | dfps' only policy module (variable refresh rate). **Replaced by `dfps_rs`** (`rust/uperf-core/src/dfps_rs/`, mounted from grill-glitch/dfps-rewrite) — this is the rewrite's whole subject |
+| `source/modules/dynamic_fps.{h,cpp}` | dfps' only policy module (variable refresh rate). **Replaced by `dfps_rs`** (`rust/uperf-dfps/`, a crate of its own, mounted from grill-glitch/dfps-rewrite) — this is the rewrite's whole subject |
 | `magisk/**` | dfps' own Magisk packaging. Superseded by this repo's `magisk/`, and shipping a second module would be the "independent dfps module" the map rules out of scope |
 | `CMakeLists.txt`, `source/CMakeLists.txt` | Built the `dfps` executable from a `GLOB_RECURSE`, i.e. they existed only for the files above. Left in place they would re-glob the deleted sources if anyone ever added this directory as a subdirectory |
 

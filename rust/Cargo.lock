@@ -472,6 +472,15 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uperf-config",
+ "uperf-dfps",
+]
+
+[[package]]
+name = "uperf-dfps"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "parking_lot",
 ]
 
 [[package]]

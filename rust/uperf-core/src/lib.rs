@@ -27,7 +27,10 @@
 pub mod cpu_task;
 pub mod ctl_socket;
 pub mod daemon;
-pub mod dfps_rs;
+/// dfps business logic — its own crate (`uperf-dfps`), re-exported under the name the
+/// rest of this crate already uses. The subtree at `rust/uperf-dfps` and this crate are
+/// the same boundary.
+pub use uperf_dfps as dfps_rs;
 pub mod ffi;
 pub mod foreground;
 pub mod frame_state;

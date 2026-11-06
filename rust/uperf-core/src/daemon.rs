@@ -65,6 +65,9 @@ impl Daemon {
             dispatcher: None,
             tasks: Registry::new(),
         };
+        // dfps is its own crate and has no opinion about the log sink; install ours
+        // before its first line could be emitted.
+        crate::dfps_rs::set_logger(crate::log_msg);
         d.start_dfps();
         d.start_dispatcher();
         d.start_bridge_consumers();
@@ -119,9 +122,11 @@ impl Daemon {
             .and_then(|txt| crate::dfps_rs::config::RuleTable::parse(&txt).ok());
         match table {
             Some(t) => {
-                let u = t.universal;
-                let minus = t.offscreen;
-                let n = t.rules.len();
+                // Accessors, not fields: `RuleTable`'s internals stay inside `uperf-dfps`
+                // now that the boundary is a crate boundary.
+                let u = t.universal_rule();
+                let minus = t.offscreen_rule();
+                let n = t.rule_count();
                 let sched = crate::dfps_rs::DfpsScheduler::new(t);
                 crate::log_msg(&format!(
                     "Rust: dfps loaded ({} rules, universal={}/{}, offscreen={}/{})",

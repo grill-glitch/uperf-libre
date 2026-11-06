@@ -1,0 +1,14 @@
+[package]
+name = "uperf-dfps"
+version = "0.1.0"
+edition = "2021"
+description = "dfps business logic (dynamic refresh rate), shared with uperf-libre as a subtree"
+license = "Apache-2.0"
+publish = false
+
+# The crate boundary *is* the subtree boundary. Keep the dependency list minimal: this
+# code is synced with grill-glitch/dfps-rewrite, and every dependency here has to exist
+# there too.
+[dependencies]
+libc = "0.2"
+parking_lot = "0.12"

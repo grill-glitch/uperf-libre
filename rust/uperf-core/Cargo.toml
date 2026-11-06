@@ -17,6 +17,8 @@ thiserror = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 uperf-config = { path = "../uperf-config" }
+# dfps business logic, its own crate so the subtree boundary is a build boundary.
+uperf-dfps = { path = "../uperf-dfps" }
 
 [dev-dependencies]
 pretty_assertions = "1"

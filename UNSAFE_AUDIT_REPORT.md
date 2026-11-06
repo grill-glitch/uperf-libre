@@ -23,7 +23,7 @@ Working tree was clean before the audit and contains no unrelated edits after it
 | `rust/uperf-cli` | host-only parity tool | **none** |
 | `rust/uperf-core` | the Android `staticlib` linked into the C++ supervisor — the bulk of the project | yes |
 | `rust/uperf-sfanalysis` | `cdylib` injected into `surfaceflinger` (GOT/PLT rewriting + observer) | yes |
-| `rust/uperf-core/src/dfps_rs/` | **git subtree** from `grill-glitch/dfps-rewrite` ("do not edit here") | none |
+| `rust/uperf-dfps/` | **git subtree** from `grill-glitch/dfps-rewrite` ("do not edit here"); an own crate since the boundary became a build boundary | none |
 | `tools/{binder-probe,ctl-listen,uprobe-probe}` | three standalone device-harness crates (own `Cargo.lock`, not workspace members) | yes |
 | `cpp/` | vendored `dfps` platform layer, C++ (Apache-2.0) | n/a (no Rust) |
 | `helper/`, `magisk/`, `scripts/`, `webui/` | Java helper + shell/module packaging | n/a |

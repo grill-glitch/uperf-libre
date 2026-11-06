@@ -37,8 +37,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::dfps_rs::config::{FpsRule, RuleTable, OFFSCREEN_PKG, UNIVERSAL_PKG};
-use crate::dfps_rs::task::DfpsTask;
+use crate::config::{FpsRule, RuleTable, OFFSCREEN_PKG, UNIVERSAL_PKG};
+use crate::task::DfpsTask;
 
 /// Where an effective refresh-rate change lands, and where the brightness
 /// sample comes from. Production writes the SettingsProvider keys and
@@ -57,7 +57,7 @@ pub struct RealSink;
 
 impl RefreshSink for RealSink {
     fn on_switch(&self, from: Option<i32>, to: i32) {
-        crate::log_msg(&format!(
+        crate::log(&format!(
             "Dfps: switch {} -> {to} Hz",
             match from {
                 Some(p) => p.to_string(),
@@ -65,16 +65,16 @@ impl RefreshSink for RealSink {
             }
         ));
         // Order mirrors upstream: notify file, then the settings writes.
-        if let Err(e) = crate::dfps_rs::notifier::write_cur_hz(to) {
-            crate::log_msg(&format!("Dfps: notify write failed: {e}"));
+        if let Err(e) = crate::notifier::write_cur_hz(to) {
+            crate::log(&format!("Dfps: notify write failed: {e}"));
         }
-        if crate::dfps_rs::sys_settings::write_peak_refresh_rate(to) == 0 {
-            crate::log_msg("Dfps: settings put did not spawn (no /system/bin/cmd?)");
+        if crate::sys_settings::write_peak_refresh_rate(to) == 0 {
+            crate::log("Dfps: settings put did not spawn (no /system/bin/cmd?)");
         }
     }
 
     fn screen_brightness(&self) -> Option<i32> {
-        crate::dfps_rs::sys_settings::get_screen_brightness()
+        crate::sys_settings::get_screen_brightness()
     }
 }
 
@@ -276,7 +276,7 @@ impl DfpsScheduler {
     ///
     /// Returns `(rule_count, universal_rule)` on success.
     pub fn reload_from_text(&self, text: &str) -> Result<(usize, FpsRule), String> {
-        let table = crate::dfps_rs::parse_config(text).map_err(|e| e.to_string())?;
+        let table = crate::parse_config(text).map_err(|e| e.to_string())?;
         let n = table.rules.len();
         let universal = table.universal;
         self.reload(table);
@@ -384,7 +384,7 @@ fn timer_loop(inner: Arc<Inner>) {
         // Run due work first …
         let fired = DfpsScheduler { inner: Arc::clone(&inner) }.run_due(Instant::now());
         if fired > 0 {
-            crate::log_msg(&format!("Dfps: {fired} delayed transition(s) applied"));
+            crate::log(&format!("Dfps: {fired} delayed transition(s) applied"));
         }
         // … then compute the wait and sleep on the *same* lock, so an event
         // that arrives between the two cannot be lost.
