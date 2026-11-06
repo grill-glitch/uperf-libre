@@ -15,6 +15,16 @@ panic = "abort"
 strip = true
 overflow-checks = true   # AGENT.md §13: no panics, so check everything at runtime
 
+# `uperf-sfanalysis` is a cdylib injected into surfaceflinger by a third party, not the
+# daemon: it must NOT abort on a panic (that would take SurfaceFlinger down with it), so
+# it is built with its own profile. A `[profile.release]` inside a member's manifest is
+# ignored by cargo — which is what the comment in that manifest used to claim was in
+# effect. Build it with `cargo build -p uperf-sfanalysis --profile sfanalysis`.
+[profile.sfanalysis]
+inherits = "release"
+panic = "unwind"
+strip = true
+
 [profile.release-debug]
 inherits = "release"
 opt-level = "z"

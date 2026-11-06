@@ -19,6 +19,8 @@ crate-type = ["cdylib"]
 libc = "0.2"
 once_cell = "1"
 
-# Build profile: same as the uperf workspace — small, stripped, LTO.
-[profile.release]
-inherits = "workspace"
+# The build profile is NOT set here: cargo ignores `[profile.*]` in a non-root package
+# (and says so on every invocation). This crate is built with `--profile sfanalysis`,
+# defined in the workspace root: it inherits the release settings but keeps
+# `panic = "unwind"`, because this cdylib is injected into surfaceflinger and a panic
+# must not abort the host process. See the root `Cargo.toml`.

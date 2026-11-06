@@ -76,9 +76,13 @@ build_rust() {
 # closed-source `libsfanalysis.so` with our `libsfanalysis_rs.so`.
 # Documented in docs/spec/sfanalysis.md and AGENT.md §12.1.
 build_sfanalysis() {
-    echo ">>> Making libsfanalysis_rs.so (Rust cdylib, $ARM64_TARGET)"
-    (cd $BASEDIR/rust && cargo build -p uperf-sfanalysis --release --target $ARM64_TARGET)
-    local so="$BASEDIR/rust/target/$ARM64_TARGET/release/libsfanalysis_rs.so"
+    echo ">>> Making libsfanalysis_rs.so (Rust cdylib, $ARM64_TARGET, profile sfanalysis)"
+    # NOT --release: this library is injected into surfaceflinger, so it is built with
+    # the `sfanalysis` profile (release settings, but `panic = "unwind"` — with
+    # `panic = "abort"` a panic inside the library would abort SurfaceFlinger).
+    # See the workspace Cargo.toml.
+    (cd $BASEDIR/rust && cargo build -p uperf-sfanalysis --profile sfanalysis --target $ARM64_TARGET)
+    local so="$BASEDIR/rust/target/$ARM64_TARGET/sfanalysis/libsfanalysis_rs.so"
     [ -f "$so" ] || { echo " !! libsfanalysis_rs.so was not produced"; exit 1; }
     echo "    -> $so ($(stat -c %s "$so") bytes)"
 }
@@ -197,7 +201,7 @@ check_uperf() {
         exit 1
     fi
     local rs_so="$BASEDIR/magisk/bin/libsfanalysis_rs.so"
-    local rs_build="$BASEDIR/rust/target/$ARM64_TARGET/release/libsfanalysis_rs.so"
+    local rs_build="$BASEDIR/rust/target/$ARM64_TARGET/sfanalysis/libsfanalysis_rs.so"
     if [ ! -f "$rs_build" ]; then
         echo " !! libsfanalysis_rs.so was not built (run 'sh build.sh $BUILD_TYPE make')"
         exit 1
@@ -266,7 +270,9 @@ pack_uperf() {
     # closed-source `libsfanalysis.so`. The customization phase
     # (`magisk/customize.sh`) will `patchelf --add-needed` it onto
     # `/system/bin/surfaceflinger`.
-    local rs_so="$BASEDIR/rust/target/$ARM64_TARGET/release/libsfanalysis_rs.so"
+    # The `sfanalysis` profile's output — NOT `release/`, which would ship the
+    # panic=abort build of a library that is injected into surfaceflinger.
+    local rs_so="$BASEDIR/rust/target/$ARM64_TARGET/sfanalysis/libsfanalysis_rs.so"
     if [ -f "$rs_so" ]; then
         cp -f "$rs_so" $STAGE_DIR/bin/libsfanalysis_rs.so
         # Mirror into the in-tree magisk/bin so `check` can assert identity.
