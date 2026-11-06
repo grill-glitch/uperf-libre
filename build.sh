@@ -384,11 +384,27 @@ run_uperf() {
 install_module() {
     echo ">>> Pushing and installing uperf-magisk.zip"
     $ADB push $PKG_DIR/uperf-magisk.zip $REMOTE_DIR
-    $ADB shell su -c "magisk --install-module $REMOTE_DIR/uperf-magisk.zip"
+    # KernelSU/KernelSU-Next has no `magisk` binary; it installs modules with
+    # `ksud module install`. Pick the installer first, then run one plain command: the
+    # remote side gets a single `su -c '…'` argument, so nothing needs escaping here.
+    local remote_cmd="magisk --install-module $REMOTE_DIR/uperf-magisk.zip"
+    if $ADB shell "su -c 'command -v ksud'" >/dev/null 2>&1; then
+        remote_cmd="ksud module install $REMOTE_DIR/uperf-magisk.zip"
+    fi
+    $ADB shell "su -c '$remote_cmd'"
+    # Sync before the reboot. On f2fs (alioth: `fsync_mode=nobarrier`) an update staged
+    # into modules_update and rebooted straight away came up with every module file
+    # **all zero bytes at the right size** — metadata committed, data never flushed.
+    # The module then looks installed (same names, same sizes) and does nothing, and its
+    # service.sh cannot even start. One `sync` after the install prevents that window.
+    $ADB shell sync
 }
 
 reboot_device() {
     echo ">>> Rebooting device"
+    # Same reason as `install`: never reboot with module data still dirty in the page
+    # cache, or the update can come back as zero-filled files.
+    $ADB shell sync
     $ADB shell reboot
 }
 
