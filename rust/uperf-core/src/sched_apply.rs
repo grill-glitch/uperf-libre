@@ -10,7 +10,6 @@
 
 
 use std::io;
-use std::path::PathBuf;
 
 use uperf_config::SchedPolicy;
 
@@ -176,67 +175,10 @@ pub fn thread_sched(tid: i32) -> io::Result<(i32, i32)> {
 }
 
 /// A process and the threads under it, as seen through `/proc`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProcInfo {
-    pub pid: i32,
-    /// `cmdline`'s first argument (a package name for apps, a binary path for
-    /// native processes) — what the config's process regexes match against.
-    pub name: String,
-    pub threads: Vec<ThreadInfo>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ThreadInfo {
-    pub tid: i32,
-    pub is_main: bool,
-}
-
-/// Read a process's cmdline-derived name and its threads.
-pub fn read_proc(pid: i32) -> Option<ProcInfo> {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    // cmdline is NUL-separated; the first field is the executable/package.
-    let name = String::from_utf8_lossy(&raw)
-        .split('\0')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    if name.is_empty() {
-        return None; // kernel thread
-    }
-    // Thread *ids* only. Reading every thread's `comm` here cost one file read per
-    // thread per scan — ~3000 reads a second on this device, which measured at more
-    // than one full CPU core. Callers read `comm` lazily, via `comm_of`, and only
-    // for threads they have not already decided.
-    let mut threads = Vec::new();
-    let task_dir = PathBuf::from(format!("/proc/{pid}/task"));
-    for e in std::fs::read_dir(task_dir).ok()?.flatten() {
-        let Ok(tid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
-        threads.push(ThreadInfo { tid, is_main: tid == pid });
-    }
-    threads.sort_by_key(|t| t.tid);
-    Some(ProcInfo { pid, name, threads })
-}
-
-/// A thread's `comm` (`/proc/<pid>/task/<tid>/comm`), trimmed.
-pub fn comm_of(pid: i32, tid: i32) -> String {
-    std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm"))
-        .map(|s| s.trim_end_matches('\n').to_string())
-        .unwrap_or_default()
-}
-
-/// Enumerate every process that has a non-empty cmdline.
-pub fn list_procs() -> Vec<ProcInfo> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else { return out };
-    for e in entries.flatten() {
-        let Some(pid) = e.file_name().to_string_lossy().parse::<i32>().ok() else { continue };
-        if let Some(p) = read_proc(pid) {
-            out.push(p);
-        }
-    }
-    out.sort_by_key(|p| p.pid);
-    out
-}
+// The `/proc` walks live in `procfs` now: one implementation, shared with the uprobe
+// frame leg (and any future consumer). Re-exported so this module's callers and tests
+// keep one level of naming.
+pub use crate::procfs::{comm_of, list_procs, read_proc, ProcInfo, ThreadInfo};
 
 /// The launcher package, as `/HOME_PACKAGE/` resolves to it.
 ///

@@ -34,6 +34,7 @@ pub mod frame_state;
 pub mod hint;
 pub mod inotify;
 pub mod orchestrator;
+pub mod procfs;
 pub mod recorder;
 pub mod sched_apply;
 pub mod sched_task;

@@ -320,59 +320,25 @@ impl FrameCounter {
     }
 }
 
-/// The tids of a process, from `/proc/<pid>/task`.
+/// This leg reports into `frame_state`, which owns every leg's last reading and the
+/// ladder that decides which one is in effect.
+use crate::frame_state::publish_uprobe as set_state;
+
+// The `/proc` walks live in `procfs`; these are the u32 face the PMU needs (perf event
+// fds and tids), and they are thin on purpose — the parsing rules stay in one place.
 pub fn thread_ids(pid: u32) -> Vec<u32> {
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-        return out;
-    };
-    for e in rd.flatten() {
-        if let Some(t) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) {
-            out.push(t);
-        }
-    }
-    out.sort_unstable();
-    out
+    crate::procfs::thread_ids(pid as i32).into_iter().map(|t| t as u32).collect()
 }
 
 /// A thread's comm, for diagnostics.
 pub fn thread_name(tid: u32) -> String {
-    std::fs::read_to_string(format!("/proc/{tid}/comm"))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "?".into())
+    crate::procfs::comm_by_tid(tid as i32)
 }
 
 /// Pids whose `cmdline` is the package (or one of its `:remote` processes).
 pub fn pids_for_package(pkg: &str) -> Vec<u32> {
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir("/proc") else {
-        return out;
-    };
-    for e in rd.flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-        let Ok(cmd) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue;
-        };
-        let first = cmd.split(|&b| b == 0).next().unwrap_or(&[]);
-        let Ok(argv0) = std::str::from_utf8(first) else { continue };
-        if argv0 == pkg || argv0.starts_with(&format!("{pkg}:")) {
-            out.push(pid);
-        }
-    }
-    out.sort_unstable();
-    out
+    crate::procfs::pids_for_package(pkg).into_iter().map(|p| p as u32).collect()
 }
-
-// ---------------------------------------------------------------- shared state
-
-/// This leg reports into `frame_state`, which owns every leg's last reading and the
-/// ladder that decides which one is in effect — the uprobe does not publish to other
-/// legs directly, and nobody reaches into this module's globals any more.
-use crate::frame_state::publish_uprobe as set_state;
-
-// ---------------------------------------------------------------- daemon task
 
 /// Opt-in (`UPERF_SF_UPROBE=1`): the primary frame leg.
 pub struct UprobeTask {
