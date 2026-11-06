@@ -118,6 +118,11 @@ fn main() {
             continue;
         }
         let _ = conn.set_read_timeout(Some(std::time::Duration::from_millis(1000)));
+        // Ask for the daemon's state once the link is up: `STATUS` is the only command
+        // besides the keepalive, and this tool is its reference consumer.
+        let _ = conn.write_all(b"STATUS\n");
+        let _ = conn.flush();
+        println!("sent STATUS");
         while std::time::Instant::now() < deadline {
             line.clear();
             match rd.read_line(&mut line) {
@@ -131,6 +136,22 @@ fn main() {
                         let _ = conn.write_all(b"PONG\n");
                         let _ = conn.flush();
                         println!("pong");
+                    } else if t.starts_with("STATUS-BEGIN") {
+                        // Framed reply: the header carries the line count, the footer is
+                        // the terminator. Print the body so an e2e can grep it.
+                        println!("{t}");
+                        let want: usize = t
+                            .split_whitespace()
+                            .nth(1)
+                            .and_then(|n| n.parse().ok())
+                            .unwrap_or(0);
+                        for _ in 0..want {
+                            line.clear();
+                            if rd.read_line(&mut line).unwrap_or(0) == 0 {
+                                break;
+                            }
+                            println!("status: {}", line.trim_end());
+                        }
                     } else if !t.is_empty() {
                         println!("line: {t}");
                     }

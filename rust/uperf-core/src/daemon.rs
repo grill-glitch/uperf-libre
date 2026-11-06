@@ -317,6 +317,7 @@ impl Daemon {
         match crate::ctl_socket::CtlTask::spawn(
             &cfg_ctl,
             self.settings.ctl_token_file.clone(),
+            self.settings.status.as_ref().map(|t| t.path.clone()),
             |m: &str| crate::log_msg(m),
         ) {
             Some(t) => self.tasks.push(t),

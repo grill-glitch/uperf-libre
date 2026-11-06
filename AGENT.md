@@ -263,6 +263,18 @@ void uperf_bridge_set_thread_name(const char *name);
   与记录器此前的行为一致，只是从散落的 `set_last_fps(0.0)` 收敛到一处。
 * 状态文件字段由 `Published::render()` 一处生成，测试钉住 WebUI 解析的每个 key（含"缺失值渲染成 `-` 而不是 0"）。
 
+### 6.04 控制面（三条，各归各位）
+
+| 面 | 实现 | 谁在用 | 说明 |
+|---|---|---|---|
+| `webui.sh` 子命令 | `magisk/script/webui.sh`，输出 `key=value` | **WebUI 唯一后端**（`webui/ctl.js`）+ adb + 全部 e2e | KernelSU 的 WebUI 只能 `exec`，这条路无法替代 |
+| ctl socket | `rust/uperf-core/src/ctl_socket.rs`，反连 + token/version/pid 握手，命令集 `PING`/`PONG`/`STATUS` | `tools/ctl-listen`（参考消费者） | 同域对端（root/ksu）用；`STATUS` 回的是状态文件内容，好让两边不可能不一致 |
+| 状态文件 | `uperf.state` / `uperf_watchdog.state` / `uperf_frames.state` | 看门狗、`webui.sh`、WebUI | 只读视图；每个文件的写入方各只有一个 |
+
+* 状态文件的 `key=value` 读取在 shell 侧收敛成 **`libcommon.sh::state_get`**（`webui.sh` 里 12 处 `sed -n 's/^k=//p'` 全部换成它）。Rust 侧写入点是 `status.rs` 与 `frame_state::Published::render()`，所以字段改名只有两个写入点 + 一个 shell 读取点。
+* ctl socket 的 `handshake()` **必须复用连接上同一个 `BufReader`**：对端常在读到 `OK` 后立刻发下一条（`STATUS`），握手若自建 reader，那几条字节会留在它的缓冲区里随它一起被丢弃——这个缺陷是给这条控制面加第二个命令时才暴露的。
+* 不要在 `webui.sh` 里加 `stop`/`start`：模块的启停语义在 `libuperf.sh`（`uperf_start` / `uperf_stop`，含看门狗停止与 governor 恢复），`webui.sh restart` 已经是那套的入口。
+
 ### 6.1 运行时旋钮面（`Settings`）
 
 `uperf_rs_start` 在最外层调用 `Settings::from_env(config, log)`，派生出 `uperf.state` / `orig_governor.txt` /

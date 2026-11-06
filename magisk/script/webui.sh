@@ -113,32 +113,32 @@ print_status() {
     # watchdog reacts to exactly that); `watchdog.state=gave-up` means the restart
     # budget was spent and the platform governor is in charge on purpose.
     local dstate wstate wpid=""
-    dstate="$([ -f "$USER_PATH/uperf.state" ] && sed -n 's/^state=//p' "$USER_PATH/uperf.state" 2>/dev/null | head -n 1)"
-    wstate="$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^state=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
+    dstate="$(state_get $USER_PATH/uperf.state state)"
+    wstate="$(state_get $USER_PATH/uperf_watchdog.state state)"
     case "$wstate" in
     "" | stopped) ;;
     *) wpid="$(uperf_watchdog_pid)" ;;
     esac
     echo "daemon.state=$dstate"
-    echo "daemon.armed=$([ -f "$USER_PATH/uperf.state" ] && sed -n 's/^armed=//p' "$USER_PATH/uperf.state" 2>/dev/null | head -n 1)"
+    echo "daemon.armed=$(state_get $USER_PATH/uperf.state armed)"
     echo "watchdog.state=$wstate"
-    echo "watchdog.restarts=$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^restarts=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
+    echo "watchdog.restarts=$(state_get $USER_PATH/uperf_watchdog.state restarts)"
     echo "watchdog.pid=$wpid"
     # The frame source (M8) is a second thing that can be gone: `sf_state=injected` means
     # the mapping is ours, `healthy` that it was already there, `gave-up` that the failure
     # budget is spent. Only meaningful with `UPERF_SF_INJECT=1`; `off` otherwise.
-    echo "watchdog.sf_state=$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^sf_state=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
-    echo "watchdog.sf_injects=$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^sf_injects=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
-    echo "watchdog.sf_fails=$([ -f "$USER_PATH/uperf_watchdog.state" ] && sed -n 's/^sf_fails=//p' "$USER_PATH/uperf_watchdog.state" 2>/dev/null | head -n 1)"
+    echo "watchdog.sf_state=$(state_get $USER_PATH/uperf_watchdog.state sf_state)"
+    echo "watchdog.sf_injects=$(state_get $USER_PATH/uperf_watchdog.state sf_injects)"
+    echo "watchdog.sf_fails=$(state_get $USER_PATH/uperf_watchdog.state sf_fails)"
     # ⑤ the daemon's own frame source (opt-in `UPERF_SF_BINDER=1`): `source=hint` while
     # the injected library's hint is fresh, `source=fps` when the direct-binder leg had
     # to take over (that leg is not even polled while the hint is live).
     local frames="$USER_PATH/uperf_frames.state"
-    echo "frame.source=$([ -f "$frames" ] && sed -n 's/^source=//p' "$frames" 2>/dev/null | head -n 1)"
-    echo "frame.fps=$([ -f "$frames" ] && sed -n 's/^fps=//p' "$frames" 2>/dev/null | head -n 1)"
-    echo "frame.hint_age_ms=$([ -f "$frames" ] && sed -n 's/^hint_age_ms=//p' "$frames" 2>/dev/null | head -n 1)"
-    echo "frame.refresh_ns=$([ -f "$frames" ] && sed -n 's/^refresh_ns=//p' "$frames" 2>/dev/null | head -n 1)"
-    echo "frame.layer=$([ -f "$frames" ] && sed -n 's/^layer=//p' "$frames" 2>/dev/null | head -n 1)"
+    echo "frame.source=$(state_get "$frames" source)"
+    echo "frame.fps=$(state_get "$frames" fps)"
+    echo "frame.hint_age_ms=$(state_get "$frames" hint_age_ms)"
+    echo "frame.refresh_ns=$(state_get "$frames" refresh_ns)"
+    echo "frame.layer=$(state_get "$frames" layer)"
 
     local log="$USER_PATH/uperf_log.txt"
     echo "log.path=$log"

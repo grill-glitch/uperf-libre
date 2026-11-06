@@ -10,7 +10,10 @@
 //! * connect (abstract `@name` or a filesystem path),
 //! * send `HELLO v=<n> pid=<pid> uid=<uid> token=<hex>`,
 //! * require `OK v=<n>` back, and refuse a peer whose protocol version differs,
-//! * keep the link alive with `PING` / `PONG` so a dropped peer is noticed.
+//! * keep the link alive with `PING` / `PONG` so a dropped peer is noticed;
+//! * answer `STATUS` with the daemon's state (`state=`, `takeover=`, `armed=`, `pid=`,
+//!   `config=`), i.e. the same facts `webui.sh status` prints, without the peer having
+//!   to read a file it may not be able to read.
 //!
 //! No command set yet — that is the expensive half and it needs a consumer to design it
 //! against. Everything above the syscalls is pure and host-tested.
@@ -234,7 +237,16 @@ pub fn uid() -> u32 {
 }
 
 /// Send the hello and demand a matching `OK`. Returns the peer's version.
-pub fn handshake(stream: &mut UnixStream, token: &str) -> Result<u32, String> {
+///
+/// Takes the connection's `BufReader` rather than making its own: the peer may already
+/// have written the next line (a `STATUS` request, typically) while we were reading the
+/// ack, and a second reader would leave those bytes in the first one's buffer, i.e. drop
+/// them. One reader for the whole connection is the only shape that cannot do that.
+pub fn handshake(
+    stream: &mut UnixStream,
+    rd: &mut BufReader<UnixStream>,
+    token: &str,
+) -> Result<u32, String> {
     let hello = Hello {
         version: VERSION,
         pid: std::process::id(),
@@ -247,7 +259,6 @@ pub fn handshake(stream: &mut UnixStream, token: &str) -> Result<u32, String> {
     stream.flush().ok();
 
     let mut line = String::new();
-    let mut rd = BufReader::new(stream.try_clone().map_err(|e| format!("clone: {e}"))?);
     rd.read_line(&mut line).map_err(|e| format!("read ack: {e}"))?;
     match parse_reply(&line)? {
         Ack::Ok { version } if version == VERSION => Ok(version),
@@ -269,6 +280,7 @@ impl CtlTask {
     pub fn spawn<L>(
         cfg: &crate::settings::CtlCfg,
         token_file: Option<PathBuf>,
+        status_path: Option<PathBuf>,
         log: L,
     ) -> Option<CtlTask>
     where
@@ -298,10 +310,17 @@ impl CtlTask {
                                 log(&format!("Rust: ctl-socket: connected to {addr} (v{VERSION})"));
                                 prev_failed = false;
                             }
-                            match handshake(&mut s, &token) {
+                            let mut rd = match s.try_clone() {
+                                Ok(c) => BufReader::new(c),
+                                Err(e) => {
+                                    log(&format!("Rust: ctl-socket: clone failed: {e}"));
+                                    continue;
+                                }
+                            };
+                            match handshake(&mut s, &mut rd, &token) {
                                 Ok(v) => {
                                     log(&format!("Rust: ctl-socket: handshake ok, peer v{v}"));
-                                    if let Err(e) = serve(&mut s, &stop_thread, ping_ms, &log) {
+                                    if let Err(e) = serve(&mut s, rd, &stop_thread, ping_ms, status_path.as_deref(), &log) {
                                         log(&format!("Rust: ctl-socket: link ended: {e}"));
                                     }
                                 }
@@ -349,16 +368,62 @@ impl CtlTask {
 
 /// After the handshake, keep the link alive: the daemon *drives* the exchange by sending
 /// `PING` and requiring `PONG`, and it also answers a `PING` that arrives from the peer.
-/// That is the whole command set for now — enough to prove the channel is two-way and
-/// that a peer which stops answering is noticed instead of assumed healthy.
+/// The `STATUS` body: the daemon's status file, comments dropped, one `key=value` per
+/// line. Empty when the file is missing (the daemon may not have written it yet, and a
+/// peer asking early is not an error).
+///
+/// Reading the file rather than an in-memory snapshot is deliberate: the file is what
+/// every other reader (the watchdog, `webui.sh`, the WebUI) already trusts, and one
+/// source means the socket cannot disagree with them.
+fn status_body(path: Option<&std::path::Path>) -> Vec<String> {
+    let Some(path) = path else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Answer one `STATUS` request: `STATUS-BEGIN <n>`, n lines, `STATUS-END`.
+///
+/// Framed with a count *and* a terminator so a peer can read either way; the count is
+/// what makes a truncated transfer detectable.
+fn write_status(
+    stream: &mut UnixStream,
+    path: Option<&std::path::Path>,
+) -> Result<usize, String> {
+    let body = status_body(path);
+    stream
+        .write_all(format!("STATUS-BEGIN {}\n", body.len()).as_bytes())
+        .map_err(|e| format!("write status header: {e}"))?;
+    for line in &body {
+        stream
+            .write_all(format!("{line}\n").as_bytes())
+            .map_err(|e| format!("write status line: {e}"))?;
+    }
+    stream
+        .write_all(b"STATUS-END\n")
+        .map_err(|e| format!("write status footer: {e}"))?;
+    stream.flush().ok();
+    Ok(body.len())
+}
+
+/// The command set: `PING`/`PONG` keepalive plus `STATUS`. Everything else is logged and
+/// ignored, so an older peer that only speaks the keepalive keeps working.
 fn serve(
     stream: &mut UnixStream,
+    mut rd: BufReader<UnixStream>,
     stop: &Arc<AtomicBool>,
     ping_every: u64,
+    status_path: Option<&std::path::Path>,
     log: &impl Fn(&str),
 ) -> Result<(), String> {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-    let mut rd = BufReader::new(stream.try_clone().map_err(|e| format!("clone: {e}"))?);
+    // The reader comes from the handshake: it may already hold the peer's next line.
+    let _ = rd.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(500)));
     let mut pongs = 0u64;
     let mut unanswered = 0u32;
     let mut last_ping = std::time::Instant::now();
@@ -387,6 +452,11 @@ fn serve(
                 } else if l.eq_ignore_ascii_case("PING") {
                     stream.write_all(b"PONG\n").map_err(|e| format!("write pong: {e}"))?;
                     stream.flush().ok();
+                } else if l.eq_ignore_ascii_case("STATUS") {
+                    match write_status(stream, status_path) {
+                        Ok(n) => log(&format!("Rust: ctl-socket: status sent ({n} line(s))")),
+                        Err(e) => log(&format!("Rust: ctl-socket: status failed: {e}")),
+                    }
                 } else if !l.is_empty() {
                     log(&format!("Rust: ctl-socket: ignoring unsupported line {l:?}"));
                 }
@@ -588,7 +658,8 @@ mod tests {
             });
 
             let mut s = connect(&addr).expect("connect");
-            let got = handshake(&mut s, "abc123");
+            let mut rd = BufReader::new(s.try_clone().unwrap());
+            let got = handshake(&mut s, &mut rd, "abc123");
             let h = peer.join().unwrap();
             assert_eq!(h.uid, uid());
             assert_eq!(got.is_ok(), want_ok, "reply {reply:?} -> {got:?}");

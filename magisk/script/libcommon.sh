@@ -120,8 +120,22 @@ wait_until_login() {
 }
 
 ###############################
-# Log
+# key=value state files
 ###############################
+
+# Read one key from a `key=value` file (uperf.state / uperf_watchdog.state /
+# uperf_frames.state), or print nothing.
+#
+# One reader, because three scripts used to spell this out (`sed -n 's/^key=//p'`),
+# and the daemon writes the format from exactly one place (`status.rs` /
+# `frame_state::Published::render`). A field rename therefore has one shell site to
+# update, not twelve.
+#
+# $1:file  $2:key
+state_get() {
+    [ -f "$1" ] || return 0
+    sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1
+}
 
 # $1:content
 log() {
