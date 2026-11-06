@@ -20,8 +20,20 @@ BASEDIR="$(dirname $(readlink -f "$0"))"
 . $BASEDIR/libcommon.sh
 . $BASEDIR/libuperf.sh
 
-# create busybox symlinks
-$BIN_PATH/busybox/busybox --install -s $BIN_PATH/busybox
+# The module no longer ships a toolbox. Everything the scripts call must come from the
+# ROM (docs/records/shell-dependencies.md). A missing command is a silent no-op in the
+# middle of a tuning pass, so name it once at boot instead of letting it be noticed.
+uperf_check_shell_deps() {
+    local missing="" c
+    for c in awk sed grep cut tr sort head tail wc seq sleep usleep date find \
+             killall ps renice chrt taskset chattr chown readlink which sha256sum \
+             uname touch mkdir mv cp rm ls basename dirname cat chmod id kill; do
+        command -v "$c" >/dev/null 2>&1 || missing="$missing $c"
+    done
+    [ -z "$missing" ] && return 0
+    echo "uperf: missing shell command(s):$missing -- ROM toybox too old? tuning paths using them are no-ops" >>"$LOG_FILE"
+}
+uperf_check_shell_deps
 
 # support vtools
 cp -af $SCRIPT_PATH/vtools_powercfg.sh /data/powercfg.sh

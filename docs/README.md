@@ -6,7 +6,7 @@
 | 目录 | 内容 | 什么时候看 |
 |---|---|---|
 | [`spec/`](./spec/) | 契约与规格：`config-v3.md`（配置语义）、`sfanalysis.md`（SF 注入的边界/机制/缺口） | 改配置层或注入相关代码前 |
-| [`records/`](./records/) | 逐里程碑的设计与证据（`m0`..`m11`）、设备跑批日志（`m9-*-alioth.txt`、`cpufreq-probe-alioth.txt`）、`webui.md`、`busybox-applets.md`（shell 侧依赖清单）、`busybox-build/`（vendored busybox 的签名校验与可复现构建） | 想知道"这个结论是怎么来的" |
+| [`records/`](./records/) | 逐里程碑的设计与证据（`m0`..`m11`）、设备跑批日志（`m9-*-alioth.txt`、`cpufreq-probe-alioth.txt`）、`webui.md`、`shell-dependencies.md`（shell 侧依赖清单 + 支持的 ROM 下限） | 想知道"这个结论是怎么来的" |
 | [`history/`](./history/) | 项目史：`milestone-log.md`（原 `AGENT.md` §11 的里程碑表）、`device-findings.md`（设备/逆向事实全表）、`unknowns-resolved.md`（已解决的未知与事故）、`wayfinder-fog.md`（早期规划残留） | 想知道"为什么不再那样做" |
 | [`audit/`](./audit/) | `unsafe-audit-report.md`：全仓 `unsafe` 审计（含为什么 Miri 用不了） | 动 `unsafe` 前 |
 | [`research/`](./research/) | 外部调查：dfps 配置格式、SF 后门探针结论等 | 要对照上游行为时 |

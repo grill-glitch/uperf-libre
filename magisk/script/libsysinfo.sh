@@ -45,12 +45,11 @@ get_socname() {
     echo "$(cat "/sys/devices/soc0/machine"| tr '[A-Z]' '[a-z]')"
 }
 
-# ⑩ 32-bit coverage. Exactly three things here are arch-locked: bin/uperf (the daemon),
-# bin/busybox/busybox (statically linked, arm64) and bin/libsfanalysis_rs.so (loaded into
-# surfaceflinger). Everything else is shell or dex and arch-neutral. On a device whose
-# primary ABI is not arm64-v8a none of the three can exec -- and the injection target
-# would itself be 32-bit -- so the install is refused up front instead of appearing to
-# succeed and failing silently at boot.
+# ⑩ 32-bit coverage. Exactly two things here are arch-locked: bin/uperf (the daemon) and
+# bin/libsfanalysis_rs.so (loaded into surfaceflinger). Everything else is shell or dex and
+# arch-neutral. On a device whose primary ABI is not arm64-v8a neither can exec -- and the
+# injection target would itself be 32-bit -- so the install is refused up front instead of
+# appearing to succeed and failing silently at boot.
 #
 # `UPERF_FAKE_ABI` is a testing seam for exercising the refusal path on a 64-bit device,
 # in the same spirit as `UPERF_FAKE_ROOT`.
@@ -87,7 +86,6 @@ require_aarch64() {
     echo "! unsupported ABI: $(module_abi)"
     echo "  uperf-libre ships arm64-v8a binaries only:"
     echo "    bin/uperf               the daemon"
-    echo "    bin/busybox/busybox     statically linked, arm64"
     echo "    bin/libsfanalysis_rs.so loaded into surfaceflinger"
     echo "  None of them can exec on a 32-bit-only device, and the injection target"
     echo "  would be 32-bit too, so the install is refused rather than left to fail"

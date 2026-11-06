@@ -693,7 +693,7 @@ CPU 调频器通过将每个 `cpufreq` policy 的 `scaling_governor` 切到 `use
 
 本项目以 Apache-2.0 **按原样**分发，不提供任何明示或默示担保，包括对适销性或特定用途适用性的默示担保（Apache-2.0 §7-8）。安装脚本在改动任何东西之前会打印同样的声明。本项目与上游作者 Matt Yang（yc9559）、yinwanxi 没有隶属或背书关系。
 
-模块**不附带任何闭源第三方二进制**：zip 里仅有的非文本文件是本仓库自行构建的产物，以及在 [`NOTICE`](./NOTICE) 中声明的 GPL-2.0 Android busybox。
+模块**不附带任何第三方二进制**：zip 里的非文本文件全部是本仓库的构建产物（`bin/uperf`、`bin/libsfanalysis_rs.so`）。也不再自带工具箱——脚本直接用 ROM 的 toybox；它们依赖的 48 条命令、以及过老的 toybox 会缺哪些，见 [`docs/records/shell-dependencies.md`](./docs/records/shell-dependencies.md)。
 
 ## 许可证
 

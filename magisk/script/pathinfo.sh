@@ -24,5 +24,9 @@ FLAG_PATH="$MODULE_PATH/flag"
 USER_PATH="/sdcard/Android/yc/uperf"
 LOG_FILE="$USER_PATH/initsvc.log"
 
-# use private busybox
-PATH="$BIN_PATH/busybox:$PATH"
+# No private toolbox on PATH any more: the module used to prepend its bundled busybox
+# directory here, which shadowed the ROM's own applets (and once made `ps` lie about a
+# running daemon, docs/records/m7-evidence.md §7.3). Every command the scripts use is now
+# expected from the ROM; docs/records/shell-dependencies.md is the list, together with
+# what a too-old toybox would be missing and how that degrades.
+

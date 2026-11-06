@@ -1,17 +1,19 @@
-# Dependency inventory: what the shell side actually needs
+# Shell dependency inventory: what the scripts expect from the ROM
 
 The Rust daemon has no runtime dependencies beyond libc. The shell side does: 48 distinct
 external commands across `magisk/*.sh` and `magisk/script/*.sh`. This file is the list,
 generated from the scripts themselves (every command position: start of line, after
 `;`/`&&`/`||`/`|`/`(`, and inside `$(…)` or backticks), not from memory.
 
-Because `pathinfo.sh:27` puts `magisk/bin/busybox` at the front of `PATH`, each of these
-names resolves to **busybox first** and to `/system/bin` only if busybox lacks the applet.
-So busybox is the arbiter for every row below.
+The module used to ship BusyBox 1.38.0 in `magisk/bin/busybox/` and prepend it to `PATH`.
+That is gone: it cost 787 KB of the 1.9 MB zip, it shadowed the ROM's own applets (once
+making `ps` report a running daemon as `daemon.count=0` — `docs/records/m7-evidence.md`
+§7.3), and on the devices this module actually runs on it covered nothing: every command
+below resolves to `/system/bin` already. The scripts now use the ROM's toybox directly.
 
-## A. Resolved by busybox (37 applets)
+## A. Commands the scripts call (37)
 
-| applet | called from |
+| command | called from |
 |---|---|
 | `awk` | `script/libcgroup.sh`, `script/libuperf.sh`, `script/uperf_watchdog.sh`, `script/webui.sh` |
 | `basename` | `script/libuperf.sh`, `script/uperf_watchdog.sh`, `script/webui.sh` |
@@ -51,11 +53,10 @@ So busybox is the arbiter for every row below.
 | `wc` | `script/libsysinfo.sh`, `script/libuperf.sh`, `script/uperf_watchdog.sh`, `script/webui.sh` |
 | `which` | `script/powercfg_once.sh` |
 
-## B. Resolved by the ROM (11 commands)
+## B. Android platform tools (11)
 
-These are Android shell tools, not toolbox programs. They are called without a path, so
-they must exist on the device — every one of them is AOSP, and all were confirmed present
-on the test device (crDroid 16).
+Not toolbox programs: these are AOSP shell commands. They are called without a path, so
+they must exist on the device; all were confirmed present on the test device.
 
 | command | path on device | called from |
 |---|---|---|
@@ -71,22 +72,38 @@ on the test device (crDroid 16).
 | `stop` | `/system/bin/stop` | `script/libpowercfg.sh`, `script/powercfg_once.sh` |
 | `umount` | `/system/bin/umount` | `script/libcommon.sh`, `script/miui_migt.sh` |
 
-(`su`, `ksud`, `magisk` are invoked through the module's own helpers, not from these
-scripts' command positions.)
+## C. What floor this implies
 
-## What this list decides
+Verified on **alioth, crDroid 16, toybox 0.8.12**: all 37 in A are present in `/system/bin`,
+and the module runs with `magisk/bin/busybox` deleted outright — `webui.sh restart`
+returned `restart.ok=1`, the daemon came back, the watchdog came back
+(`state=running detail=supervisor + worker up`) and the governor returned to `schedutil`.
 
-1. **busybox must contain A, at minimum.** The shipped build has 314 applets, i.e. all of A
-   plus the rest of upstream's `defconfig` toolbox; see `busybox-build/README.md` for what is
-   in, what is out, and why. Applet *features* matter as much as applet presence —
-   `readlink -f` is what broke the watchdog during this work.
-2. **A is not strictly required today.** On the test device every applet in A also exists in
-   `/system/bin` (toybox), so busybox is not covering a missing tool there — it is pinning
-   behaviour across ROMs, which is where old or trimmed toybox would otherwise bite
-   (`chrt`, `taskset`, `renice` arrived in toybox only around Android 8–9, while this
-   module claims Android 6+; `sha256sum`, `seq`, `usleep`, `chattr` are not in old toolbox
-   builds at all).
-3. **The one deliberate mismatch is `ps`.** `libcgroup.sh` calls `ps -Ao pid,args`; toybox
-   accepts it, busybox needs `CONFIG_DESKTOP`. If `ps` were dropped from the build, the
-   call would silently fall through to toybox with different column widths — so `ps` stays
-   in and `CONFIG_DESKTOP=y` is part of the config.
+Below that floor the failure mode is **silent degradation, not an error**: the command is
+simply absent, `sh` prints `not found` to a log nobody reads, and the tuning step it
+belonged to quietly does nothing. The commands at risk on older toybox, and what stops
+working with each:
+
+| command | used by | if missing |
+|---|---|---|
+| `chrt`, `taskset`, `renice` | `libcgroup.sh` | RT priority / CPU affinity / nice are not applied — the thread just keeps whatever it had |
+| `ps -Ao pid,args` | `libcgroup.sh` | kswapd scan finds nothing, so the "don't preempt a reclaiming device" guard never triggers |
+| `chattr ±i` | `miui_migt.sh` | files that should be immutable stay writable |
+| `sha256sum` | `webui.sh` | WebUI asset verification silently passes |
+| `seq` | `platform_special.sh`, `powercfg_once.sh` | loop bodies iterate zero times |
+| `usleep 500` | `libpowercfg.sh` | the 500 µs settle after stopping perf-hal is skipped |
+| `awk` | `libcgroup.sh`, `libuperf.sh`, `uperf_watchdog.sh`, `webui.sh` | the widest blast radius: `awk` arrived in toybox late, and it parses `/proc` and state files |
+
+Because that is invisible at runtime, `initsvc.sh` now reports it once at boot:
+`uperf_check_shell_deps()` walks this list, and any missing command is written to
+`/sdcard/Android/yc/uperf/initsvc.log` as
+`uperf: missing shell command(s): … -- ROM toybox too old?`. That is the only place the
+module will tell you the platform it is on is below the supported floor.
+
+## D. Why `ps` is still spelled `/system/bin/ps`
+
+`webui.sh` sets `SYS_PS=/system/bin/ps` and falls back to `ps` only if that is not
+executable. The busybox `ps` that made this necessary is gone, but the explicit path stays:
+status output must not depend on whatever `PATH` resolves to, now or after some future
+toolbox decision. `libcgroup.sh` keeps calling plain `ps -Ao pid,args` because it wants
+whichever `ps` the ROM provides.

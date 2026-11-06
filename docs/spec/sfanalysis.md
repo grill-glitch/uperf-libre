@@ -153,10 +153,10 @@ $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf \
 ```bash
 # magisk/bin/ 下所有 .so 都必须能溯源到本仓库（无 vendor）
 find magisk/bin -name '*.so' | while read so; do
-    # 简化：vendor libsfanalysis.so 已被排除；其余 .so（libuperf_rs.so、
-    # busybox 等）都已在 AGENT.md §6 表中列出归属
+    # 简化：vendor libsfanalysis.so 已被排除；其余 .so（libuperf_rs.so）
+    # 的归属见 AGENT.md §6 表
     case "$(basename $so)" in
-        uperf|libuperf_rs.so|libsfanalysis_rs.so|busybox) ;;
+        uperf|libuperf_rs.so|libsfanalysis_rs.so) ;;
         *) abort "unknown .so in magisk/bin: $so" ;;
     esac
 done

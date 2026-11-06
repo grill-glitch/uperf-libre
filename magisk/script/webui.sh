@@ -49,11 +49,11 @@ PRESET_FILE="$USER_PATH/cur_powermode.txt"
 # value the daemon would have to reject.
 PRESET_LEGAL_EXTRA="auto"
 
-# `pathinfo.sh` prepends the module's private busybox to PATH, and
-# `busybox --install -s` declares a `ps` applet there — but that `ps` rejects
-# `-o PID,STAT,NAME` with "bad -o argument 'PID'", so a PATH-resolved `ps` prints
-# nothing and a running daemon reads as `daemon.count=0` (which also made
-# `restart.ok` report failure for a restart that worked). Always use the system `ps`.
+# Always use the system `ps`. The module used to ship a busybox whose `ps` rejected
+# `-o PID,STAT,NAME`, so a PATH-resolved `ps` printed nothing and a running daemon read
+# as `daemon.count=0` (which also made `restart.ok` report failure for a restart that
+# worked). The busybox is gone, but naming the binary keeps status independent of
+# whatever the ROM or a future PATH entry resolves to.
 SYS_PS=/system/bin/ps
 [ -x "$SYS_PS" ] || SYS_PS=ps
 

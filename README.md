@@ -368,9 +368,11 @@ merchantability or fitness for a particular purpose (Apache-2.0 §7-8). The inst
 prints the same notice before it changes anything. This project is not affiliated with,
 or endorsed by, Matt Yang (yc9559) or yinwanxi, the authors of the upstream projects.
 
-The module ships **no closed-source third-party binaries**: the only non-text files in
-the zip are our own build from this repository and the GPL-2.0 Android busybox declared
-in [`NOTICE`](./NOTICE).
+The module ships **no third-party binaries at all**: every non-text file in the zip is a
+build of this repository (`bin/uperf`, `bin/libsfanalysis_rs.so`). It carries no private
+toolbox either — the shell scripts use the ROM's own toybox, and
+[`docs/records/shell-dependencies.md`](./docs/records/shell-dependencies.md) lists the 48
+commands they expect and which of them a too-old toybox would be missing.
 
 ## License
 
