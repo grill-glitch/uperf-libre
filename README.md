@@ -302,8 +302,8 @@ see [`docs/m5-cpu-governor.md`](./docs/m5-cpu-governor.md) and the
   PL1/PL2 pool arithmetic, the scene → sysfs writer pipeline, and the
   inotify-based hot reload of `cur_powermode.txt` / `perapp_powermode.txt`.
 - **Supervision (M9)**: host-verified (`cargo test --release`, 283 tests across the workspace; and
-  `sh scripts/test_watchdog_host.sh`, 10 cases / 60 assertions against the real
-  script), **device-verified** on alioth (`scripts/m9-device-verify.sh`, 33
+  `sh scripts/test_watchdog_host.sh`, 109 assertions against the real script — it also
+  runs `sh -n` over every shipped script, which is what covers the `state_get` rewrite), **device-verified** on alioth (`scripts/m9-device-verify.sh`, 33
   assertions: `/proc/<pid>/exe` survives dfps' cmdline rewrite, the dead-man path
   restores a real armed daemon after SIGKILL, an orphaned worker disarms itself
   after the watchdog's SIGTERM, 0.5 % of one core at the shipped 15 s cadence
