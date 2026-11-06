@@ -420,6 +420,14 @@ touch   -> idle     : 超时或渲染结束
 
 优化要求（原版核心卖点）：**切换动作时与上一动作 diff，跳过相同值**（同 node 同值只写一次）。
 
+**执行侧现状（别再按"6 类写入器 + fd 缓存"描述）**：`WriterKind` 只是分类，真正落盘的两个 sink 是
+`CollectingSink`（只计划/只记日志）与 `UnderRootSink`（`UPERF_FAKE_ROOT` 下的离线执行）。生产路径上
+**没有**真实 sink：出厂配置 `modules.sysfs.enable=false`，且 `apply_pending` 在无 fake root 时只打
+`would-write`。所以 `WriterKind` 的语义必须由 sink 自己实现——`SysfsWrite::payload()` 已经按 kind
+渲染（`CgroupProcs` 一行一个 PID，其余单值），因为 `serialize_value` 把数组渲染成 `a,b,c`，那不是
+`cgroup.procs` 能接受的形式。做真实写入器的顺序：先 `RealSink`（fd 缓存 + 逐 kind + 写后回读），
+再打开配置开关，最后才是真机验证。
+
 ### 8.4 CPU 调频器（`config/README.md` 六步，逐条实现）
 
 1. 采样：有负载时 `baseSampleTime`、空载时 `baseSlackTime` 周期采样（数据源 `/proc/stat` + `/sys/.../scaling_cur_freq`）。

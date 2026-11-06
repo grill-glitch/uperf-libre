@@ -83,9 +83,11 @@ Below is what the daemon does on every tick; the per-feature details are in
   shared PL1/PL2 pool.
 - **Devfreq and LLCC boost** — `min_freq` / `max_freq` writes to DDR-bandwidth,
   L3-latency, CPU-LLCC-bandwidth, and the UFS devfreq governor.
-- **cgroup, cpuset, and devfreq knob writes** with dedup — repeated writes
-  with identical values are skipped to keep the daemon's own wakeup overhead
-  low.
+- **cgroup, cpuset, and devfreq knob writes**, classified by path shape into five
+  writer kinds (`CpusetCpus`, `CgroupProcs`, `Cpufreq`, `PerCpu`, `String`) and
+  rendered per kind — a `cgroup.procs` list goes one PID per line, everything else
+  is a single value. The knob table ships disabled (`"sysfs": {"enable": false}`) and
+  only the offline sink executes it today; see "Status" below.
 - **External watchdog + dead-man switch (M9)** — a shell supervisor started by
   `uperf_start` identifies the daemon from `/proc/<pid>/exe` (dfps renames both
   the supervisor and its worker to plain `uperf`, so names and pid files are
@@ -277,7 +279,7 @@ See [`AGENT.md`](./AGENT.md) for the full plan and acceptance criteria, and
 │  config   JSON parse + dot-key overrides + compat warnings   │
 │  switcher hint FSM + preset/perapp switching + duration      │
 │  profile  preset/scene → per-module parameter dispatch       │
-│  sysfs    6 writer kinds + dedup + fd cache                  │
+│  sysfs    5 writer kinds, per-kind payload (sink: offline)   │
 │  governor load sampling + energy model + PL1/PL2 pool + OPP │
 │  sched    context-scheduler rule engine (PCRE2-semantics ERE)│
 │  sf       sfanalysis.hint consumer + render-end / Hint EOF   │

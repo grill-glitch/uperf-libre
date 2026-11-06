@@ -19,11 +19,56 @@ use uperf_config::{Config, SysfsWrite as PlanWrite};
 
 use crate::hint::{HintDurations, HintState, SfHint};
 
-/// One planned sysfs write (concrete path + final value).
+/// One planned sysfs write (concrete path + final value + how the kernel wants it).
+///
+/// `kind` is `uperf-config`'s classification (`WriterKind`, inferred from the path by the
+/// planner). It is part of the write, not a decoration: `cgroup.procs` takes one PID per
+/// write and a cpufreq knob takes the number alone, so a sink that ignores the kind can
+/// be wrong the moment `modules.sysfs.enable` is turned on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SysfsWrite {
     pub path: String,
     pub value: String,
+    pub kind: uperf_config::WriterKind,
+}
+
+impl SysfsWrite {
+    /// A write with the kind inferred from the path — for callers that only know a path
+    /// and a value (the governor's secondary `freq_writes` path, tests).
+    pub fn new(path: impl Into<String>, value: impl Into<String>) -> Self {
+        let path = path.into();
+        let value = value.into();
+        let kind = uperf_config::WriterKind::from_path(&path);
+        Self { path, value, kind }
+    }
+
+    /// The lines this write puts on the wire.
+    ///
+    /// Only `CgroupProcs` differs: a PID list is written one PID per line, which is what
+    /// the kernel parses. Everything else is a single value. (`serialize_value` renders an
+    /// array as `a,b,c`, i.e. the shape the *plan* has, not the shape the kernel wants.)
+    pub fn payload(&self) -> String {
+        match self.kind {
+            uperf_config::WriterKind::CgroupProcs => {
+                let pids: Vec<&str> = self
+                    .value
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                if pids.is_empty() {
+                    String::new()
+                } else {
+                    let mut out = String::with_capacity(pids.len() * 7);
+                    for pid in pids {
+                        out.push_str(pid);
+                        out.push('\n');
+                    }
+                    out
+                }
+            }
+            _ => format!("{}\n", self.value),
+        }
+    }
 }
 
 /// Where writes go.
@@ -84,7 +129,7 @@ impl Sink for UnderRootSink {
             let _ = std::fs::create_dir_all(parent);
         }
         crate::sysfs_ledger::record_before_write(&mut self.ledger, &w.path, &target);
-        match std::fs::write(&target, format!("{}\n", w.value)) {
+        match std::fs::write(&target, w.payload()) {
             Ok(()) => self.written.push(w.clone()),
             Err(e) => self.failed.push((w.path.clone(), e.to_string())),
         }
@@ -230,10 +275,10 @@ impl Orchestrator {
 
     fn plan_current_scene(&mut self) {
         let Some(cfg) = self.cfg.as_ref() else {
-            self.pending.push(SysfsWrite {
-                path: format!("__hint_transition__{}", self.scene),
-                value: self.scene.clone(),
-            });
+            self.pending.push(SysfsWrite::new(
+                format!("__hint_transition__{}", self.scene),
+                self.scene.clone(),
+            ));
             return;
         };
         let planned: Vec<PlanWrite> = uperf_config::plan_for_config(cfg, &self.mode, &self.scene);
@@ -241,6 +286,7 @@ impl Orchestrator {
             self.pending.push(SysfsWrite {
                 path: w.path,
                 value: w.value,
+                kind: w.kind,
             });
         }
     }
@@ -415,20 +461,35 @@ mod tests {
         std::fs::write(&node, "before\n").unwrap();
         let ledger = crate::sysfs_ledger::SysfsLedger::load(dir.join("sysfs_orig.txt"));
         let mut sink = UnderRootSink::with_ledger(&dir, ledger);
-        sink.write(&SysfsWrite {
-            path: "/sys/module/x/param".into(),
-            value: "after".into(),
-        });
+        sink.write(&SysfsWrite::new("/sys/module/x/param", "after"));
         assert_eq!(std::fs::read_to_string(&node).unwrap(), "after\n");
         // A second write is not a second original.
-        sink.write(&SysfsWrite {
-            path: "/sys/module/x/param".into(),
-            value: "later".into(),
-        });
+        sink.write(&SysfsWrite::new("/sys/module/x/param", "later"));
         let written = std::fs::read_to_string(dir.join("sysfs_orig.txt")).unwrap();
         assert!(written.contains("/sys/module/x/param before"), "got: {written}");
         assert_eq!(written.matches("/sys/module/x/param").count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cgroup PID list is written one PID per line — the shape the kernel parses —
+    /// while every other kind writes its single value. This is why the write carries the
+    /// kind: `serialize_value` renders an array as `a,b,c`, which `cgroup.procs` rejects.
+    #[test]
+    fn cgroup_pid_lists_are_written_one_per_line() {
+        let cgroup = SysfsWrite::new("/dev/cpuset/top-app/cgroup.procs", "101,102,103");
+        assert_eq!(cgroup.payload(), "101\n102\n103\n");
+        assert_eq!(
+            cgroup.kind,
+            uperf_config::WriterKind::CgroupProcs,
+            "the path must classify itself"
+        );
+        // An empty list writes nothing at all rather than a blank line (a blank line
+        // would be "the empty PID", which the kernel rejects).
+        assert_eq!(SysfsWrite::new("/dev/cpuset/top-app/cgroup.procs", "").payload(), "");
+
+        let cpuset = SysfsWrite::new("/dev/cpuset/top-app/cpus", "0-3");
+        assert_eq!(cpuset.payload(), "0-3\n");
+        assert_eq!(cpuset.kind, uperf_config::WriterKind::CpusetCpus);
     }
 
     #[test]

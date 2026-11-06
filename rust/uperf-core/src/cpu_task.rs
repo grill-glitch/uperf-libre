@@ -384,7 +384,7 @@ impl CpuTask {
                                 .and_then(|t| t.path())
                                 .unwrap_or("")
                                 .to_string();
-                            SysfsWrite { path, value }
+                            SysfsWrite::new(path, value)
                         })
                         .filter(|w| !w.path.is_empty())
                         .collect();
