@@ -225,6 +225,13 @@ impl Orchestrator {
         }
     }
 
+    /// Whether this config allows the knob table to be written to live nodes
+    /// (`modules.sysfs.enable`). The daemon's executor refuses otherwise, so a config
+    /// that carries a knob table but leaves the module off cannot touch the kernel.
+    pub fn sysfs_enabled(&self) -> bool {
+        self.cfg.as_ref().map(|c| c.sysfs_enabled()).unwrap_or(false)
+    }
+
     pub fn mode(&self) -> &str {
         &self.mode
     }

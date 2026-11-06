@@ -420,13 +420,22 @@ touch   -> idle     : 超时或渲染结束
 
 优化要求（原版核心卖点）：**切换动作时与上一动作 diff，跳过相同值**（同 node 同值只写一次）。
 
-**执行侧现状（别再按"6 类写入器 + fd 缓存"描述）**：`WriterKind` 只是分类，真正落盘的两个 sink 是
-`CollectingSink`（只计划/只记日志）与 `UnderRootSink`（`UPERF_FAKE_ROOT` 下的离线执行）。生产路径上
-**没有**真实 sink：出厂配置 `modules.sysfs.enable=false`，且 `apply_pending` 在无 fake root 时只打
-`would-write`。所以 `WriterKind` 的语义必须由 sink 自己实现——`SysfsWrite::payload()` 已经按 kind
-渲染（`CgroupProcs` 一行一个 PID，其余单值），因为 `serialize_value` 把数组渲染成 `a,b,c`，那不是
-`cgroup.procs` 能接受的形式。做真实写入器的顺序：先 `RealSink`（fd 缓存 + 逐 kind + 写后回读），
-再打开配置开关，最后才是真机验证。
+**执行侧现状**：三个 sink，同一个 `Sink` trait。
+
+| sink | 何时用 | 行为 |
+|---|---|---|
+| `CollectingSink` | 测试 / 无落点 | 只收集 |
+| `UnderRootSink` | `UPERF_FAKE_ROOT` 设置时（离线校验、e2e） | 写到 fake root，带账本 |
+| `RealSink` | **`modules.sysfs.enable: true`** 且无 fake root | 写真节点：**fd 缓存**（sysfs 的 open 比 write 贵）、**去重**（值等于本 sink 上次写过的就跳过）、**先记账再写**、**写后回读**（被驱动钳制/忽略的计入 `ineffective`，不当成功）|
+
+出厂 63 份配置全是 `enable: false`，所以**默认行为不变**：没有真实写入。`apply_pending` 的决策是
+`fake_root` > `enable` > 只打 `would-write`，而 `enable` 由 `Orchestrator::sysfs_enabled()` 从配置读，
+sink 由 `Daemon` 持有（一个实例——fd 缓存与去重表就是靠"跨计划复用"才有意义），三个生产者
+（dispatcher / preset watcher / 帧源 hint 回调）共用它。
+
+`WriterKind` 的语义由 `SysfsWrite::payload()` 承担：`CgroupProcs` 一行一个 PID，其余单值——因为
+`serialize_value` 把数组渲染成 `a,b,c`，那不是 `cgroup.procs` 能接受的形式。真机验证见
+`scripts/realsink-device.sh`（knob 表指向 `/data/local/tmp` 的普通文件，代码路径是真的、落点是安全的）。
 
 ### 8.4 CPU 调频器（`config/README.md` 六步，逐条实现）
 

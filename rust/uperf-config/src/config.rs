@@ -250,6 +250,19 @@ impl Config {
             .and_then(|v| v.as_bool())
     }
 
+    /// `modules.sysfs.enable`. The shipped configs set it **false**, which is one of the
+    /// two gates that keep the knob table from writing on a real device (the other was
+    /// the missing real sink — see `uperf-core`'s `real_sink`). The daemon consults this
+    /// before it will touch a live node.
+    pub fn sysfs_enabled(&self) -> bool {
+        self.modules
+            .sysfs
+            .as_ref()
+            .and_then(|m| m.get("enable"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
     /// `modules.input.enable`. All 63 shipped configs set it true.
     pub fn input_enabled(&self) -> Option<bool> {
         self.modules

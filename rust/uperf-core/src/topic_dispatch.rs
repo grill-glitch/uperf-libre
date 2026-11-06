@@ -166,6 +166,7 @@ pub(crate) fn spawn(
     dfps: Option<crate::dfps_rs::DfpsScheduler>,
     foreground: Option<crate::foreground::ForegroundFile>,
     settings: crate::settings::Settings,
+    sink: Option<std::sync::Arc<parking_lot::Mutex<crate::real_sink::RealSink>>>,
 ) -> Dispatcher {
     let (tx, rx): (Sender<Event>, Receiver<Event>) = std::sync::mpsc::channel();
     // Install a clone so the FFI entry point can also send events. Replaces any
@@ -173,7 +174,7 @@ pub(crate) fn spawn(
     crate::ffi::install_dispatch_tx(tx.clone());
     let thread = thread::Builder::new()
         .name("uperf-rs".into())
-        .spawn(move || run(rx, orch, dfps, foreground, settings))
+        .spawn(move || run(rx, orch, dfps, foreground, settings, sink))
         .expect("spawn uperf-rs dispatcher");
     Dispatcher {
         _keep_alive: tx,
@@ -219,6 +220,7 @@ fn run(
     dfps: Option<crate::dfps_rs::DfpsScheduler>,
     mut foreground: Option<crate::foreground::ForegroundFile>,
     settings: crate::settings::Settings,
+    sink: Option<std::sync::Arc<parking_lot::Mutex<crate::real_sink::RealSink>>>,
 ) {
     // The wake interval comes from the one `Settings` snapshot: the foreground poll
     // when that source is armed, otherwise a full second — long enough to notice a
@@ -226,13 +228,13 @@ fn run(
     let tick = settings.dispatcher_tick();
     loop {
         match rx.recv_timeout(tick) {
-            Ok(ev) => handle(&ev, &orch, dfps.as_ref(), &settings),
+            Ok(ev) => handle(&ev, &orch, dfps.as_ref(), &settings, sink.as_deref()),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // The top-app file, if any. A stale/absent file yields nothing and
                 // the C++ monitor's own `topapp.pkgName` events carry on.
                 if let Some(f) = foreground.as_mut() {
                     if let Some(pkg) = f.poll() {
-                        handle(&Event::Topapp(pkg), &orch, dfps.as_ref(), &settings);
+                        handle(&Event::Topapp(pkg), &orch, dfps.as_ref(), &settings, sink.as_deref());
                     }
                 }
             }
@@ -249,6 +251,7 @@ fn handle(
     orch: &std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
     dfps: Option<&crate::dfps_rs::DfpsScheduler>,
     settings: &crate::settings::Settings,
+    sink: Option<&parking_lot::Mutex<crate::real_sink::RealSink>>,
 ) {
     write_event(ev);
 
@@ -256,7 +259,7 @@ fn handle(
         let mut g = orch.lock();
         g.on_event(ev);
     }
-    apply_pending(orch, settings);
+    apply_pending(orch, settings, sink);
 
     // Refresh-rate topics fan out to dfps-rs as a second subscriber
     // (T03: same process, no IPC). Ordering after the orchestrator is
@@ -289,12 +292,16 @@ fn route_dfps(ev: &Event, d: &crate::dfps_rs::DfpsScheduler) {
 pub(crate) fn apply_pending(
     orch: &std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
     settings: &crate::settings::Settings,
+    sink: Option<&parking_lot::Mutex<crate::real_sink::RealSink>>,
 ) -> (usize, usize) {
     let mut collected = crate::orchestrator::CollectingSink::default();
-    {
+    // One lock: the plan *and* the config flag that decides whether the plan may be
+    // written to live nodes come from the same orchestrator state.
+    let knobs_enabled = {
         let mut g = orch.lock();
         g.drain(&mut collected);
-    }
+        g.sysfs_enabled()
+    };
     if collected.writes.is_empty() {
         return (0, 0);
     }
@@ -324,6 +331,40 @@ pub(crate) fn apply_pending(
                 files.failed.len()
             ));
             (files.written.len(), files.failed.len())
+        }
+        // Live tree, and only when the config says the knob table is on. A config that
+        // ships `modules.sysfs.enable: false` (all 63 of them do) therefore cannot write a
+        // single kernel node, whatever its knob table contains.
+        None if knobs_enabled => {
+            let Some(sink) = sink else {
+                // No sink means the daemon was started without one; never silently
+                // claim a write.
+                for w in collected.writes {
+                    log_msg(&format!("Rust: would-write {} = {}", w.path, w.value));
+                }
+                return (0, 0);
+            };
+            // The sink lives in the daemon: its fd cache and its dedup map are what make
+            // a second identical scene switch free, so it must not be rebuilt per plan.
+            let mut files = sink.lock();
+            let (w0, f0, i0) = (files.written, files.failed.len(), files.ineffective.len());
+            for w in collected.writes {
+                files.write(&w);
+            }
+            for (path, err) in files.failed[f0..].iter() {
+                log_msg(&format!("Rust: sysfs write failed {path}: {err}"));
+            }
+            for (path, wrote, read) in files.ineffective[i0..].iter() {
+                log_msg(&format!(
+                    "Rust: sysfs write of {path}={wrote} read back as '{read}' (driver kept its value)"
+                ));
+            }
+            let (written, failed) = (files.written - w0, files.failed.len() - f0);
+            log_msg(&format!(
+                "Rust: sysfs real-write {written} ok, {failed} failed ({})",
+                files.summary()
+            ));
+            (written, failed)
         }
         None => {
             for w in collected.writes {
@@ -433,7 +474,7 @@ mod foreground_tick_tests {
             "balance",
         )));
         let settings = crate::settings::Settings::default();
-        let d = spawn(orch.clone(), None, fg, settings);
+        let d = spawn(orch.clone(), None, fg, settings, None);
         (orch, d)
     }
 

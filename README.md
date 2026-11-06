@@ -86,8 +86,10 @@ Below is what the daemon does on every tick; the per-feature details are in
 - **cgroup, cpuset, and devfreq knob writes**, classified by path shape into five
   writer kinds (`CpusetCpus`, `CgroupProcs`, `Cpufreq`, `PerCpu`, `String`) and
   rendered per kind — a `cgroup.procs` list goes one PID per line, everything else
-  is a single value. The knob table ships disabled (`"sysfs": {"enable": false}`) and
-  only the offline sink executes it today; see "Status" below.
+  is a single value. The live sink caches one fd per node, skips values already in
+  effect, records each node's original before the first write, and reads every write
+  back (a value the driver clamps is reported, not claimed). It runs only when a
+  config sets `"sysfs": {"enable": true}` — all shipped configs keep it `false`.
 - **External watchdog + dead-man switch (M9)** — a shell supervisor started by
   `uperf_start` identifies the daemon from `/proc/<pid>/exe` (dfps renames both
   the supervisor and its worker to plain `uperf`, so names and pid files are

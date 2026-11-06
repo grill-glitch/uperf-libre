@@ -48,6 +48,11 @@ pub struct Daemon {
     /// The event loop. Stopped first — it is the only thread that drains orchestrator
     /// plans into the sink, so it must not write while the rest is being torn down.
     dispatcher: Option<Dispatcher>,
+    /// The live-tree write sink, shared by every producer of a plan (the dispatcher, the
+    /// preset watcher, the frame leg's hint callback). One instance, because its fd cache
+    /// and its dedup map are exactly what make a repeated scene switch free.
+    /// `None` unless the config sets `modules.sysfs.enable`.
+    sink: Option<Arc<PMutex<crate::real_sink::RealSink>>>,
     tasks: Registry,
 }
 
@@ -56,6 +61,19 @@ impl Daemon {
     /// (`webui.sh`, the M9 harness and the device scripts grep for them).
     pub fn start(settings: Settings) -> Daemon {
         let (config, mode) = load_config_and_mode(&settings.config_path);
+        // The knob table is off in every shipped config; when a config turns it on, the
+        // daemon gets a real sink (and the ledger that lets the stop script undo it).
+        let sink = match config.as_ref() {
+            Some(c) if c.sysfs_enabled() => Some(Arc::new(PMutex::new(
+                crate::real_sink::RealSink::new(
+                    settings
+                        .sysfs_orig
+                        .clone()
+                        .map(crate::sysfs_ledger::SysfsLedger::load),
+                ),
+            ))),
+            _ => None,
+        };
         let mut d = Daemon {
             settings,
             config,
@@ -63,6 +81,7 @@ impl Daemon {
             orchestrator: None,
             dfps: None,
             dispatcher: None,
+            sink,
             tasks: Registry::new(),
         };
         // dfps is its own crate and has no opinion about the log sink; install ours
@@ -102,6 +121,11 @@ impl Daemon {
             crate::log_msg("Rust: cpu governor stopped (was idle, nothing to disarm)");
         }
         self.tasks.stop_all();
+        if let Some(sink) = self.sink.take() {
+            // Final tally: the sink outlives no thread that uses it.
+            let s = sink.lock();
+            crate::log_msg(&format!("Rust: sysfs sink at stop: {}", s.summary()));
+        }
         if let Some(dfps) = self.dfps.take() {
             dfps.stop();
         }
@@ -174,6 +198,7 @@ impl Daemon {
             self.dfps.clone(),
             foreground,
             self.settings.clone(),
+            self.sink.clone(),
         ));
         self.orchestrator = Some(orch);
 
@@ -286,10 +311,11 @@ impl Daemon {
             // because no event-bus message carries this one.
             let hint_orch = self.orchestrator.clone();
             let hint_settings = self.settings.clone();
+            let hint_sink = self.sink.clone();
             let on_hint = move |h: crate::hint::SfHint| {
                 let Some(o) = hint_orch.as_ref() else { return };
                 if o.lock().on_sf_hint(h) {
-                    crate::topic_dispatch::apply_pending(o, &hint_settings);
+                    crate::topic_dispatch::apply_pending(o, &hint_settings, hint_sink.as_deref());
                 }
             };
             let hint_path = self.settings.config_dir.as_ref().map(|d| d.join("sfanalysis.hint"));
@@ -368,6 +394,7 @@ impl Daemon {
             orch,
             self.dfps.clone(),
             &self.settings,
+            self.sink.clone(),
             |m: &str| crate::log_msg(m),
         ));
         crate::log_msg("Rust: preset/hint watcher started");

@@ -176,6 +176,7 @@ impl WatchTask {
         orch: Arc<PMutex<Orchestrator>>,
         dfps: Option<crate::dfps_rs::DfpsScheduler>,
         settings: &crate::settings::Settings,
+        sink: Option<Arc<PMutex<crate::real_sink::RealSink>>>,
         mut log: impl FnMut(&str) + Send + 'static,
     ) -> Self {
         // The thread owns its copy: `Settings` is fixed for the process lifetime.
@@ -225,7 +226,7 @@ impl WatchTask {
                     log(l);
                 }
                 if let Some(m) = mode {
-                    apply_mode(&orch, &m, &settings, &mut log);
+                    apply_mode(&orch, &m, &settings, sink.as_deref(), &mut log);
                 }
 
                 // ---- arm the watches ----------------------------------------
@@ -348,7 +349,7 @@ impl WatchTask {
                         log(l);
                     }
                     if let Some(m) = mode {
-                        apply_mode(&orch, &m, &settings, &mut log);
+                        apply_mode(&orch, &m, &settings, sink.as_deref(), &mut log);
                     }
                 }
             })
@@ -539,10 +540,11 @@ fn apply_mode(
     orch: &Arc<PMutex<Orchestrator>>,
     mode: &str,
     settings: &crate::settings::Settings,
+    sink: Option<&PMutex<crate::real_sink::RealSink>>,
     log: &mut impl FnMut(&str),
 ) {
     orch.lock().set_mode(mode);
-    let (written, failed) = crate::topic_dispatch::apply_pending(orch, settings);
+    let (written, failed) = crate::topic_dispatch::apply_pending(orch, settings, sink);
     log(&format!(
         "Rust: preset applied mode={mode} writes={written} failed={failed}"
     ));
