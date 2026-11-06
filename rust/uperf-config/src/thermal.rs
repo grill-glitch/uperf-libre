@@ -43,18 +43,33 @@ impl Default for ThermalPolicy {
 
 impl ThermalPolicy {
     /// Overridable so the numbers are not guesses baked into the binary.
+    ///
+    /// Kept for callers that have no `Settings` (the host-side experiments); the
+    /// daemon builds the policy from its one environment snapshot instead
+    /// (`uperf-core/src/settings.rs`), so nothing else reads these variables twice.
     pub fn from_env() -> Self {
+        Self::from_values(
+            env_f64("UPERF_THERMAL_THRESH_C"),
+            env_f64("UPERF_THERMAL_SPAN_C"),
+            env_f64("UPERF_THERMAL_FLOOR"),
+        )
+    }
+
+    /// Build from already-parsed overrides, applying the same clamps `from_env` did:
+    /// a span below 0.1 °C would divide the ramp by ~zero and a floor outside
+    /// (0.05, 1.0] would either switch the CPU off or not bound anything.
+    pub fn from_values(thresh_c: Option<f64>, span_c: Option<f64>, floor: Option<f64>) -> Self {
         let d = Self::default();
         Self {
-            thresh_c: env_f64("UPERF_THERMAL_THRESH_C", d.thresh_c),
-            span_c: env_f64("UPERF_THERMAL_SPAN_C", d.span_c).max(0.1),
-            floor: env_f64("UPERF_THERMAL_FLOOR", d.floor).clamp(0.05, 1.0),
+            thresh_c: thresh_c.unwrap_or(d.thresh_c),
+            span_c: span_c.unwrap_or(d.span_c).max(0.1),
+            floor: floor.unwrap_or(d.floor).clamp(0.05, 1.0),
         }
     }
 }
 
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(default)
+fn env_f64(key: &str) -> Option<f64> {
+    std::env::var(key).ok().and_then(|s| s.parse::<f64>().ok())
 }
 
 /// PL1 multiplier for a temperature: exactly `1.0` at or below the threshold, ramping

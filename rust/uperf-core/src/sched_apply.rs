@@ -248,7 +248,7 @@ pub fn list_procs() -> Vec<ProcInfo> {
 /// android.intent.category.HOME` returns `com.android.launcher3/.uioverrides.
 /// QuickstepLauncher` -> `com.android.launcher3`, matching the upstream log).
 pub fn resolve_home_package() -> Option<String> {
-    resolve_home_package_with(&mut |m| eprintln!("{m}"))
+    resolve_home_package_with(None, &mut |m| eprintln!("{m}"))
 }
 
 /// Same, with a log sink, and **never** returning an empty package.
@@ -259,12 +259,15 @@ pub fn resolve_home_package() -> Option<String> {
 /// process on the system*. The dry run caught it before it touched the kernel.
 /// An empty or whitespace-only result is therefore treated as a failure, and the
 /// failure is reported rather than swallowed.
-pub fn resolve_home_package_with(log: &mut dyn FnMut(&str)) -> Option<String> {
-    if let Ok(explicit) = std::env::var("UPERF_HOME_PACKAGE") {
-        let t = explicit.trim().to_string();
-        if !t.is_empty() {
-            return Some(t);
-        }
+pub fn resolve_home_package_with(
+    explicit: Option<&str>,
+    log: &mut dyn FnMut(&str),
+) -> Option<String> {
+    // The override is an argument (`Settings::home_package`), not process state: a
+    // blank value must fall through to the probe, which is what made the empty
+    // pattern bug possible in the first place.
+    if let Some(t) = explicit.map(str::trim).filter(|t| !t.is_empty()) {
+        return Some(t.to_string());
     }
     // `cmd` is at /system/bin/cmd; try the absolute path first because the
     // process may be started with a minimal PATH.
@@ -500,15 +503,15 @@ mod tests {
 
     #[test]
     fn resolves_via_the_explicit_override_when_set() {
-        std::env::set_var("UPERF_HOME_PACKAGE", "com.example.launcher");
         assert_eq!(
-            resolve_home_package_with(&mut |_| {}).as_deref(),
+            resolve_home_package_with(Some("com.example.launcher"), &mut |_| {}).as_deref(),
             Some("com.example.launcher")
         );
         // A blank override must fall through to the real resolver, not be used.
-        std::env::set_var("UPERF_HOME_PACKAGE", "   ");
-        assert_ne!(resolve_home_package_with(&mut |_| {}).as_deref(), Some("   "));
-        std::env::remove_var("UPERF_HOME_PACKAGE");
+        assert_ne!(
+            resolve_home_package_with(Some("   "), &mut |_| {}).as_deref(),
+            Some("   ")
+        );
     }
 
     #[test]

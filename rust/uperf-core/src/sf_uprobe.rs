@@ -401,31 +401,18 @@ pub struct UprobeTask {
 }
 
 impl UprobeTask {
-    pub fn enabled() -> bool {
-        matches!(
-            std::env::var("UPERF_SF_UPROBE").ok().as_deref(),
-            Some("1") | Some("true")
-        )
-    }
-
-    pub fn spawn<F, L>(top_app: F, log: L) -> Option<UprobeTask>
+    /// `cfg` is present only when the leg is armed (`UPERF_SF_UPROBE=1`), decided by
+    /// `Settings`; this function never reads the environment.
+    pub fn spawn<F, L>(cfg: &crate::settings::UprobeCfg, top_app: F, log: L) -> Option<UprobeTask>
     where
         F: Fn() -> Option<String> + Send + 'static,
         L: Fn(&str) + Send + 'static,
     {
-        if !Self::enabled() {
-            return None;
-        }
-        let lib = std::env::var("UPERF_SF_UPROBE_LIB").unwrap_or_else(|_| LIBGUI.to_string());
-        // `UPERF_SF_UPROBE_PID` pins the target process (also lets the leg be tested
-        // without the foreground reader); otherwise it follows the top app each tick.
-        let pinned_pid: Option<u32> = std::env::var("UPERF_SF_UPROBE_PID")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let window_ms = std::env::var("UPERF_SF_UPROBE_WINDOW_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1000);
+        let lib = cfg.lib.clone();
+        // A pinned pid also lets the leg be tested without the foreground reader;
+        // otherwise it follows the top app each tick.
+        let pinned_pid: Option<u32> = cfg.pid;
+        let window_ms = cfg.window_ms;
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();

@@ -176,9 +176,11 @@ impl WatchTask {
         plan: WatchPlan,
         orch: Arc<PMutex<Orchestrator>>,
         dfps: Option<crate::dfps_rs::DfpsScheduler>,
-        fake_root: Option<String>,
+        settings: &crate::settings::Settings,
         mut log: impl FnMut(&str) + Send + 'static,
     ) -> Self {
+        // The thread owns its copy: `Settings` is fixed for the process lifetime.
+        let settings = settings.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_child = stop.clone();
         let thread = std::thread::Builder::new()
@@ -224,7 +226,7 @@ impl WatchTask {
                     log(l);
                 }
                 if let Some(m) = mode {
-                    apply_mode(&orch, &m, fake_root.as_deref(), &mut log);
+                    apply_mode(&orch, &m, &settings, &mut log);
                 }
 
                 // ---- arm the watches ----------------------------------------
@@ -347,7 +349,7 @@ impl WatchTask {
                         log(l);
                     }
                     if let Some(m) = mode {
-                        apply_mode(&orch, &m, fake_root.as_deref(), &mut log);
+                        apply_mode(&orch, &m, &settings, &mut log);
                     }
                 }
             })
@@ -537,11 +539,11 @@ fn log_line(s: &str) {
 fn apply_mode(
     orch: &Arc<PMutex<Orchestrator>>,
     mode: &str,
-    fake_root: Option<&str>,
+    settings: &crate::settings::Settings,
     log: &mut impl FnMut(&str),
 ) {
     orch.lock().set_mode(mode);
-    let (written, failed) = crate::topic_dispatch::apply_pending(orch, fake_root);
+    let (written, failed) = crate::topic_dispatch::apply_pending(orch, settings);
     log(&format!(
         "Rust: preset applied mode={mode} writes={written} failed={failed}"
     ));

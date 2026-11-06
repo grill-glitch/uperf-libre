@@ -39,6 +39,11 @@ pub struct ScanReport {
     /// Threads examined — only counted for matched processes, so this is *not*
     /// bounded below by `procs_seen`.
     pub threads_seen: usize,
+    /// Threads this pass had **no decision cached** for, i.e. the only threads a
+    /// settled pass is allowed to touch. Exposed because a test cannot otherwise tell
+    /// "the cache worked" from "the process happened to have a stable thread set":
+    /// other tests in the binary spawn and exit threads between two scans.
+    pub first_seen: usize,
     pub affinity_changes: usize,
     pub policy_changes: usize,
     pub errors: usize,
@@ -59,6 +64,7 @@ impl ScanReport {
         self.procs_seen += o.procs_seen;
         self.procs_matched += o.procs_matched;
         self.threads_seen += o.threads_seen;
+        self.first_seen += o.first_seen;
         self.affinity_changes += o.affinity_changes;
         self.policy_changes += o.policy_changes;
         self.errors += o.errors;
@@ -81,14 +87,16 @@ pub struct SchedApplier {
 }
 
 impl SchedApplier {
-    pub fn new(planner: SchedPlanner) -> Self {
+    /// `dry_run` / `only` come from `Settings`, not from `std::env`: the applier is
+    /// the object the scanner tests construct, so its behaviour must be a parameter.
+    pub fn new(planner: SchedPlanner, dry_run: bool, only: Option<String>) -> Self {
         Self {
             planner,
             top_app: None,
             scene: "idle".to_string(),
             applied: HashMap::new(),
-            dry_run: std::env::var("UPERF_SCHED_DRY_RUN").map(|v| v == "1").unwrap_or(false),
-            only: std::env::var("UPERF_SCHED_ONLY").ok().filter(|s| !s.is_empty()),
+            dry_run,
+            only,
         }
     }
 
@@ -176,6 +184,7 @@ impl SchedApplier {
                 r.unchanged += 1;
                 continue;
             }
+            r.first_seen += 1;
             let comm = sched_apply::comm_of(p.pid, t.tid);
             let Some(d) = self.planner.decide(
                 &p.name,
@@ -291,6 +300,7 @@ impl SchedTask {
     /// Build the planner for `cfg`, resolving `/HOME_PACKAGE/` from the device.
     pub fn planner_for(
         cfg: &uperf_config::Config,
+        settings: &crate::settings::Settings,
         log: &mut dyn FnMut(&str),
     ) -> Option<SchedPlanner> {
         let modules = cfg.modules_map()?;
@@ -302,7 +312,7 @@ impl SchedTask {
         // On failure keep the *literal* token: substituting an empty package
         // would compile the launcher rule's pattern to "" and match every
         // process on the system (observed in the device dry run).
-        let home = sched_apply::resolve_home_package_with(log)
+        let home = sched_apply::resolve_home_package_with(settings.home_package.as_deref(), log)
             .unwrap_or_else(|| "/HOME_PACKAGE/".to_string());
         log(&format!("Rust: current home is '{home}'"));
         match SchedPlanner::new(sc, &home) {
@@ -325,16 +335,18 @@ impl SchedTask {
     /// Spawn the scan loop. `state` supplies `(scene, top_app, generation)` from
     /// the orchestrator, so the loop scans promptly when either moves and
     /// otherwise backs off.
-    pub fn spawn<S>(planner: SchedPlanner, state: S) -> Self
+    pub fn spawn<S>(planner: SchedPlanner, settings: &crate::settings::Settings, state: S) -> Self
     where
         S: Fn() -> (String, Option<String>, u64) + Send + 'static,
     {
+        let dry_run = settings.sched_dry_run;
+        let only = settings.sched_only.clone();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_child = stop.clone();
         let thread = std::thread::Builder::new()
             .name("uperf-sched".into())
             .spawn(move || {
-                let mut applier = SchedApplier::new(planner);
+                let mut applier = SchedApplier::new(planner, dry_run, only);
                 let mut seen_gen = u64::MAX; // first pass always scans
                 let mut idle_ticks: u32 = 0;
                 while !stop_child.load(std::sync::atomic::Ordering::Relaxed) {
@@ -432,7 +444,7 @@ mod tests {
     fn applier_for_self() -> SchedApplier {
         let name = self_name();
         let p = SchedPlanner::new(self_targeting_cfg(&name), "com.miui.home").unwrap();
-        SchedApplier::new(p)
+        SchedApplier::new(p, false, None)
     }
 
     #[test]
@@ -447,7 +459,7 @@ mod tests {
             "rules": [{ "name": "self", "regex": name, "pinned": false,
                         "rules": [ { "k": ".", "ac": "ui", "pc": "ui" } ] }]
         })).unwrap();
-        let mut a = SchedApplier::new(SchedPlanner::new(cfg, "com.miui.home").unwrap());
+        let mut a = SchedApplier::new(SchedPlanner::new(cfg, "com.miui.home").unwrap(), false, None);
         a.dry_run = true;
         a.only = Some(self_name());
         let r = a.scan();
@@ -485,7 +497,7 @@ mod tests {
             "rules": [{ "name": "self", "regex": self_name(), "pinned": false,
                         "rules": [ { "k": ".", "ac": "ui", "pc": "ui" } ] }]
         })).unwrap();
-        let mut a = SchedApplier::new(SchedPlanner::new(cfg, "com.miui.home").unwrap());
+        let mut a = SchedApplier::new(SchedPlanner::new(cfg, "com.miui.home").unwrap(), false, None);
         a.only = Some(self_name());
         if a.planner().anomalies().len() > 0 {
             // affinity[ui] has no "idle"/"touch"/"boost" in this synthetic cfg.
@@ -496,12 +508,29 @@ mod tests {
             first.policy_changes + first.affinity_changes >= 1,
             "first pass should have work to do: {first:?}"
         );
-        assert_eq!(
-            second.policy_changes + second.affinity_changes,
-            0,
-            "second pass must be a no-op: {second:?}"
+        // The cache's contract is "a thread is decided once" — not "a settled pass
+        // finds exactly zero work". Other tests in this binary keep spawning threads,
+        // and each thread this applier has never seen is legitimately fresh work (one
+        // matching rule covers *every* thread of the process). So the honest invariant
+        // is: every thread touched by a settled pass is one the cache had no decision
+        // for. If the cache were ever bypassed, `changes` would exceed `first_seen`.
+        // Each first-seen thread contributes at most one to *each* counter, so compare
+        // them separately: summing the two double-counts a thread that got both an
+        // affinity and a policy change.
+        assert!(
+            second.affinity_changes <= second.first_seen
+                && second.policy_changes <= second.first_seen,
+            "the second pass applied affinity/policy to {}/{} thread(s) but only {} \
+             were new to the cache: first={first:?} second={second:?}",
+            second.affinity_changes,
+            second.policy_changes,
+            second.first_seen
         );
-        assert!(second.unchanged >= first.unchanged);
+        assert!(
+            second.unchanged > 0 && second.first_seen < second.threads_seen,
+            "the cache never hit, so this test proves nothing (a bypassed cache would \
+             report every thread as first-seen): {second:?}"
+        );
         // Leave the harness thread tidy.
         let _ = sched_apply::set_sched(0, SchedPolicy::Normal { nice: 0 });
     }
@@ -536,7 +565,7 @@ mod tests {
             "initials": {}, "presets": {"balance": {"*": {}}}
         })).unwrap();
         let mut log = |_: &str| {};
-        assert!(SchedTask::planner_for(&cfg, &mut log).is_none());
+        assert!(SchedTask::planner_for(&cfg, &crate::settings::Settings::default(), &mut log).is_none());
         // ...and Some(..) once enabled.
         cfg = uperf_config::Config::from_value(serde_json::json!({
             "meta": {"name":"t","author":"t"},
@@ -548,8 +577,11 @@ mod tests {
                            "rules":[{"k":".","ac":"ui","pc":"ui"}]}]}},
             "initials": {}, "presets": {"balance": {"*": {}}}
         })).unwrap();
-        std::env::set_var("UPERF_HOME_PACKAGE", "com.miui.home");
-        assert!(SchedTask::planner_for(&cfg, &mut log).is_some());
+        let settings = crate::settings::Settings {
+            home_package: Some("com.miui.home".into()),
+            ..crate::settings::Settings::default()
+        };
+        assert!(SchedTask::planner_for(&cfg, &settings, &mut log).is_some());
     }
 
     #[test]
@@ -558,7 +590,7 @@ mod tests {
         let p = SchedPlanner::new(self_targeting_cfg(&name), "com.miui.home").unwrap();
         let gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let g2 = gen.clone();
-        let mut task = SchedTask::spawn(p, move || {
+        let mut task = SchedTask::spawn(p, &crate::settings::Settings::default(), move || {
             ("idle".to_string(), None, g2.load(std::sync::atomic::Ordering::Relaxed))
         });
         std::thread::sleep(std::time::Duration::from_millis(60));
@@ -583,8 +615,7 @@ mod tests {
         // kernel state changes at all.
         let name = self_name();
         let p = SchedPlanner::new(self_targeting_cfg(&name), "com.miui.home").unwrap();
-        let mut a = SchedApplier::new(p);
-        a.dry_run = true;
+        let mut a = SchedApplier::new(p, true, None);
         let r = a.scan();
         assert!(r.procs_seen > 5, "expected a populated /proc: {r:?}");
         assert!(

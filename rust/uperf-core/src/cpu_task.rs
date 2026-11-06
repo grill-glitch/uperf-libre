@@ -20,12 +20,10 @@ use uperf_config::{
     Governor,
 };
 
-/// Root under which sysfs writes are redirected for offline validation.
-fn fake_root() -> Option<String> {
-    std::env::var("UPERF_FAKE_ROOT").ok().filter(|s| !s.is_empty())
-}
+use crate::settings::Settings;
 
-/// Rewrite a sysfs path under `UPERF_FAKE_ROOT`, if set.
+/// Root under which sysfs writes are redirected for offline validation. Comes from
+/// the one `Settings` snapshot (never from `std::env` at the point of use).
 fn apply_root(path: &str, root: &Option<String>) -> String {
     match root {
         Some(r) => format!("{}{}", r.trim_end_matches('/'), path),
@@ -50,9 +48,18 @@ pub struct UserspaceWriter {
     /// Optional machine-readable status file (`uperf.state`, M9) and the config it
     /// describes. Written on arm/disarm only, never per tick.
     status: Option<crate::status::Target>,
+    /// Redirect writes under this root (`UPERF_FAKE_ROOT`), from `Settings`.
+    /// Held here rather than read from the environment at each write: a test can
+    /// point one writer at a scratch tree without touching process state.
+    root: Option<String>,
 }
 
 impl UserspaceWriter {
+    /// Redirect writes under `root` (offline validation / host tests).
+    pub fn root(&mut self, root: Option<String>) {
+        self.root = root;
+    }
+
     /// Where to record the governors we replaced, so the module's stop script can
     /// restore the truth even if this process is killed outright. Set from the
     /// config's directory; `None` disables the record.
@@ -110,7 +117,7 @@ impl UserspaceWriter {
     /// Switch every userspace cluster to the `userspace` governor, remembering
     /// what it was. Idempotent.
     pub fn arm(&mut self, targets: &[FreqTarget]) {
-        let root = fake_root();
+        let root = self.root.clone();
         for t in targets {
             let FreqTarget::Userspace { policy_dir } = t else { continue };
             if self.armed.iter().any(|(d, _)| d == policy_dir) {
@@ -152,7 +159,7 @@ impl UserspaceWriter {
 
     /// Write one cycle's targets. Returns the number of frequencies applied.
     pub fn apply(&self, targets: &[FreqTarget], freqs_khz: &[f64]) -> usize {
-        let root = fake_root();
+        let root = self.root.clone();
         let mut n = 0;
         for (t, f) in targets.iter().zip(freqs_khz.iter()) {
             let FreqTarget::Userspace { policy_dir } = t else { continue };
@@ -166,7 +173,7 @@ impl UserspaceWriter {
 
     /// Restore each policy's original governor (and thus kernel-driven scaling).
     pub fn disarm(&mut self) {
-        let root = fake_root();
+        let root = self.root.clone();
         for (dir, prev) in self.armed.drain(..) {
             if prev.is_empty() {
                 continue;
@@ -191,13 +198,36 @@ impl UserspaceWriter {
 
 use crate::orchestrator::{CollectingSink, Sink, SysfsWrite};
 
-/// `<config dir>/orig_governor.txt` — where the governors we replace are recorded.
-///
-/// The module's stop script reads the same path, so a SIGKILL (which no in-process
-/// handler can survive) still leaves enough information for something else to put
-/// the device back.
-fn state_file_for(_cfg: &Config) -> Option<std::path::PathBuf> {
-    std::env::var("UPERF_STATE_FILE").ok().filter(|s| !s.is_empty()).map(std::path::PathBuf::from)
+/// What the governor thread needs beyond the policy itself (paths, test seams,
+/// thermal bounds). One struct instead of six positional arguments, and every field
+/// comes from the process's single `Settings` snapshot.
+#[derive(Debug, Clone)]
+pub struct CpuRuntime {
+    /// `<config dir>/orig_governor.txt` — where the governors we replace are recorded.
+    /// The module's stop script reads the same path, so a SIGKILL (which no in-process
+    /// handler can survive) still leaves enough information for something else to put
+    /// the device back.
+    pub state_file: Option<std::path::PathBuf>,
+    pub status: Option<crate::status::Target>,
+    /// Redirect writes under this root instead of `/` (offline validation only).
+    pub fake_root: Option<String>,
+    /// `<config dir>/sysfs_orig.txt` — the write ledger, when there is one.
+    pub ledger: Option<std::path::PathBuf>,
+    pub thermal: uperf_config::thermal::ThermalPolicy,
+    pub thermal_root: std::path::PathBuf,
+}
+
+impl CpuRuntime {
+    pub fn from_settings(s: &Settings) -> Self {
+        Self {
+            state_file: s.state_file.clone(),
+            status: s.status.clone(),
+            fake_root: s.fake_root.clone(),
+            ledger: s.sysfs_orig.clone(),
+            thermal: s.thermal,
+            thermal_root: s.thermal_root.clone(),
+        }
+    }
 }
 
 /// OPP list for a cpufreq policy, in kHz.
@@ -261,8 +291,7 @@ impl CpuTask {
     pub fn spawn_with<F>(
         mut gov: Governor,
         targets: Vec<FreqTarget>,
-        state_file: Option<std::path::PathBuf>,
-        status: Option<crate::status::Target>,
+        rt: CpuRuntime,
         mut read_stat: F,
     ) -> Self
     where
@@ -276,8 +305,9 @@ impl CpuTask {
             .name("uperf-cpu".into())
             .spawn(move || {
                 let mut writer = writer_child.lock().expect("writer lock");
-                writer.state_file(state_file);
-                writer.status(status);
+                writer.state_file(rt.state_file.clone());
+                writer.status(rt.status.clone());
+                writer.root(rt.fake_root.clone());
                 writer.arm(&targets);
                 if writer.is_armed() {
                     log_line(&format!(
@@ -296,10 +326,9 @@ impl CpuTask {
                 // hot, ease the sustained power budget (PL1) — the OPP *points* are
                 // never chosen by temperature. Sampled at 1 Hz; the governor ticks far
                 // faster than any thermal zone moves.
-                let tpolicy = uperf_config::thermal::ThermalPolicy::from_env();
-                let troot = std::env::var("UPERF_THERMAL_ROOT")
-                    .unwrap_or_else(|_| "/sys/class/thermal".into());
-                let tzones = uperf_config::thermal::discover_cpu_zones(std::path::Path::new(&troot));
+                let tpolicy = rt.thermal;
+                let troot = rt.thermal_root.display().to_string();
+                let tzones = uperf_config::thermal::discover_cpu_zones(&rt.thermal_root);
                 match uperf_config::thermal::read_max_temp_c(&tzones) {
                     Some(t) => log_line(&format!(
                         "Rust: thermal {} zone(s) under {troot}, now {t:.1} C (thresh {:.0} C, floor x{:.2})",
@@ -361,16 +390,15 @@ impl CpuTask {
                         .filter(|w| !w.path.is_empty())
                         .collect();
                     if !writes.is_empty() {
-                        let root = fake_root();
-                        match root.as_deref() {
+                        match rt.fake_root.as_deref() {
                             Some(root) => {
-                                let mut sink =
-                                    match crate::sysfs_ledger::SysfsLedger::for_status() {
-                                        Some(l) => {
-                                            crate::orchestrator::UnderRootSink::with_ledger(root, l)
-                                        }
-                                        None => crate::orchestrator::UnderRootSink::new(root),
-                                    };
+                                let mut sink = match rt.ledger.clone() {
+                                    Some(p) => crate::orchestrator::UnderRootSink::with_ledger(
+                                        root,
+                                        crate::sysfs_ledger::SysfsLedger::load(p),
+                                    ),
+                                    None => crate::orchestrator::UnderRootSink::new(root),
+                                };
                                 for w in &writes {
                                     sink.write(w);
                                 }
@@ -417,13 +445,9 @@ impl CpuTask {
     /// eight CpufreqWriter strategies need a min-freq knob that the driver locks),
     /// so taking over preserves no upstream behaviour. The default is therefore to
     /// leave the platform's governor alone.
-    pub fn takeover_wanted() -> bool {
-        std::env::var("UPERF_CPU_GOVERNOR").map(|v| v == "1").unwrap_or(false)
-    }
-
     /// Production constructor: real OPPs + real `/proc/stat`.
-    pub fn spawn(cfg: &Config, mode: &str, scene: &str) -> Option<Self> {
-        if !Self::takeover_wanted() {
+    pub fn spawn(cfg: &Config, mode: &str, scene: &str, settings: &Settings) -> Option<Self> {
+        if !settings.cpu_governor {
             log_line(
                 "Rust: cpu governor idle (set UPERF_CPU_GOVERNOR=1 to take over frequency control)",
             );
@@ -440,8 +464,7 @@ impl CpuTask {
         Some(Self::spawn_with(
             gov,
             targets,
-            state_file_for(cfg),
-            crate::status::target(),
+            CpuRuntime::from_settings(settings),
             move || {
                 std::fs::read_to_string("/proc/stat")
                     .map(|t| parse_stat(&t, n_cpu))
@@ -524,17 +547,14 @@ extern "C" fn uperf_bridge_write_log(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// `UPERF_FAKE_ROOT` is process-wide, and these tests run in parallel: two of
-    /// them pointing it at different fake roots is a race, and the loser's writes
-    /// land in the other test's tree (observed: `original governor must be
-    /// restored` failing with `userspace`). Serialise every test that touches it.
-    static FAKE_ROOT_LOCK: Mutex<()> = Mutex::new(());
-
-    fn fake_root_guard() -> std::sync::MutexGuard<'static, ()> {
-        // A poisoned lock only means another test failed; the guard is still valid.
-        FAKE_ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    /// A writer pointed at a scratch tree. The redirect is per-writer state, so these
+    /// tests no longer share `UPERF_FAKE_ROOT` through the process environment — the
+    /// mutex that used to serialize them (`FAKE_ROOT_LOCK`) is gone with it.
+    fn scoped_writer(root: &std::path::Path) -> UserspaceWriter {
+        let mut w = UserspaceWriter::default();
+        w.root(Some(root.to_str().unwrap().to_string()));
+        w
     }
 
     #[test]
@@ -544,17 +564,15 @@ mod tests {
 
     #[test]
     fn userspace_writer_arms_applies_and_restores() {
-        let _guard = fake_root_guard();
         let tmp = std::env::temp_dir().join(format!("uperf_fake_{}", std::process::id()));
         let dir = tmp.join("sys/devices/system/cpu/cpufreq/policy0");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("scaling_governor"), "schedutil\n").unwrap();
 
-        std::env::set_var("UPERF_FAKE_ROOT", tmp.to_str().unwrap());
         let targets = vec![FreqTarget::Userspace {
             policy_dir: "/sys/devices/system/cpu/cpufreq/policy0".into(),
         }];
-        let mut w = UserspaceWriter::default();
+        let mut w = scoped_writer(&tmp);
         w.arm(&targets);
         assert!(w.is_armed());
         assert_eq!(
@@ -572,24 +590,21 @@ mod tests {
             "schedutil",
             "original governor must be restored"
         );
-        std::env::remove_var("UPERF_FAKE_ROOT");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn userspace_writer_reports_status_on_arm_and_disarm() {
-        let _guard = fake_root_guard();
         let tmp = std::env::temp_dir().join(format!("uperf_status_arm_{}", std::process::id()));
         let dir = tmp.join("sys/devices/system/cpu/cpufreq/policy4");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("scaling_governor"), "schedutil\n").unwrap();
         let status_path = tmp.join("uperf.state");
 
-        std::env::set_var("UPERF_FAKE_ROOT", tmp.to_str().unwrap());
         let targets = vec![FreqTarget::Userspace {
             policy_dir: "/sys/devices/system/cpu/cpufreq/policy4".into(),
         }];
-        let mut w = UserspaceWriter::default();
+        let mut w = scoped_writer(&tmp);
         w.status(Some(crate::status::Target {
             path: status_path.clone(),
             config: "/sdcard/Android/yc/uperf/uperf.json".into(),
@@ -610,7 +625,6 @@ mod tests {
         assert!(disarmed.contains("armed=0\n"), "{disarmed}");
         assert!(disarmed.contains("policies=\n"), "{disarmed}");
 
-        std::env::remove_var("UPERF_FAKE_ROOT");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -637,7 +651,7 @@ mod tests {
         // a `Userspace` target would switch the *host's* CPU governor.
         let _ = freq_targets(&cfg);
         let targets = vec![FreqTarget::None];
-        let mut task = CpuTask::spawn_with(gov, targets, None, None, || {
+        let mut task = CpuTask::spawn_with(gov, targets, CpuRuntime::from_settings(&Settings::default()), || {
             // escalating load so the governor has to move
             let mut j = uperf_config::CpuJiffies::default();
             j.busy = vec![50, 50];

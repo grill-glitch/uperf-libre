@@ -24,7 +24,6 @@
 //! publishes `topapp.pkgName` over the topic bridge, remains the fallback.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 /// A line whose timestamp is older than this is "no news" — the helper stopped
 /// writing (or died). Must comfortably exceed the helper's own poll interval.
@@ -123,37 +122,10 @@ pub fn monotonic_ms() -> u64 {
     (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
 }
 
-/// Build the source from the environment and the config directory.
-///
-/// * `UPERF_FOREGROUND=0` disables it entirely (the C++ monitor is then the only
-///   source, exactly as before this change).
-/// * `UPERF_FOREGROUND_FILE` overrides the path.
-/// * Otherwise it is `<config dir>/foreground.txt`, i.e. the module's `USER_PATH`.
-pub fn from_env(cfg_dir: Option<&Path>) -> Option<ForegroundFile> {
-    if matches!(
-        std::env::var("UPERF_FOREGROUND").ok().as_deref(),
-        Some("0") | Some("false")
-    ) {
-        return None;
-    }
-    let path = std::env::var_os("UPERF_FOREGROUND_FILE")
-        .map(PathBuf::from)
-        .or_else(|| cfg_dir.map(|d| d.join("foreground.txt")))?;
-    let max_age_ms = std::env::var("UPERF_FOREGROUND_MAX_AGE_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MAX_AGE_MS);
-    Some(ForegroundFile::new(path, max_age_ms))
-}
-
-/// The dispatcher's wake interval, from `UPERF_FOREGROUND_TICK_MS` (default 500).
-pub fn tick_from_env() -> Duration {
-    let ms = std::env::var("UPERF_FOREGROUND_TICK_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_TICK_MS);
-    Duration::from_millis(ms.max(50))
-}
+// The environment is parsed once, in `crate::settings`: this module is given the
+// path and the staleness bound, and the dispatcher is given the tick. That keeps a
+// single place that knows the variable names (`settings.rs`), which is also what the
+// host tests construct directly instead of mutating `environ`.
 
 #[cfg(test)]
 mod tests {

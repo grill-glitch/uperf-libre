@@ -41,16 +41,13 @@ pub struct Snapshot<'a> {
 
 /// The status file for a config path: `<config dir>/uperf.state`.
 ///
-/// `UPERF_STATUS_FILE` overrides it (host tests, offline parity). `None` when
-/// neither is available, in which case status reporting is simply skipped.
-pub fn path_for_config(config_path: &str) -> Option<PathBuf> {
-    // Empty means "not set": an env var present with a blank value must not
-    // produce a relative path or overwrite the real file.
-    let from_env = std::env::var("UPERF_STATUS_FILE")
-        .ok()
-        .filter(|s| !s.is_empty());
-    if let Some(p) = from_env {
-        return Some(PathBuf::from(p));
+/// `override_file` is `UPERF_STATUS_FILE` (host tests, offline parity), already
+/// parsed by `Settings`. Empty means "not set": a variable present with a blank value
+/// must not produce a relative path or overwrite the real file. `None` when neither
+/// is available, in which case status reporting is simply skipped.
+pub fn path_for(config_path: &str, override_file: Option<&Path>) -> Option<PathBuf> {
+    if let Some(p) = override_file {
+        return Some(p.to_path_buf());
     }
     Path::new(config_path)
         .parent()
@@ -63,17 +60,6 @@ pub fn path_for_config(config_path: &str) -> Option<PathBuf> {
 pub struct Target {
     pub path: PathBuf,
     pub config: String,
-}
-
-/// The [`Target`] for this process, from the environment.
-///
-/// `uperf_rs_start` seeds both (`UPERF_STATUS_FILE`, `UPERF_STATUS_CONFIG`) from
-/// the config path it was called with, which is what makes the status file land
-/// next to `orig_governor.txt` without threading a path through every caller.
-pub fn target() -> Option<Target> {
-    let config = std::env::var("UPERF_STATUS_CONFIG").unwrap_or_default();
-    let path = path_for_config(&config)?;
-    Some(Target { path, config })
 }
 
 /// Write the snapshot. Best effort: status reporting must never be a reason for
@@ -350,15 +336,14 @@ mod tests {
         let dir = tmp_dir("target");
         let cfg = dir.join("uperf.json");
         std::fs::write(&cfg, "{}").unwrap();
-        std::env::remove_var("UPERF_STATUS_FILE");
-        let got = path_for_config(cfg.to_str().unwrap()).unwrap();
+        // The override is an argument, not process state: this test no longer
+        // mutates `environ`, so it cannot race the other tests in this binary.
+        let got = path_for(cfg.to_str().unwrap(), None).unwrap();
         assert_eq!(got, dir.join("uperf.state"));
-        std::env::set_var("UPERF_STATUS_FILE", "/tmp/explicit.state");
         assert_eq!(
-            path_for_config(cfg.to_str().unwrap()).unwrap(),
+            path_for(cfg.to_str().unwrap(), Some(Path::new("/tmp/explicit.state"))).unwrap(),
             PathBuf::from("/tmp/explicit.state")
         );
-        std::env::remove_var("UPERF_STATUS_FILE");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

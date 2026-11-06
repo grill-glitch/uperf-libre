@@ -128,24 +128,6 @@ impl Recorder {
         }
     }
 
-    /// From the environment: `UPERF_RECORD=1`, `UPERF_RECORD_MIN_MS`,
-    /// `UPERF_RECORD_SAMPLE_MS`, store under the config dir.
-    pub fn from_env(cfg_dir: Option<&Path>) -> Recorder {
-        let enabled = matches!(
-            std::env::var("UPERF_RECORD").ok().as_deref(),
-            Some("1") | Some("true")
-        );
-        let min = std::env::var("UPERF_RECORD_MIN_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(MIN_SESSION_MS);
-        let every = std::env::var("UPERF_RECORD_SAMPLE_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1000);
-        Recorder::new(enabled, min, every, cfg_dir.map(|d| d.to_path_buf()))
-    }
-
     pub fn enabled(&self) -> bool {
         self.enabled
     }
@@ -270,23 +252,25 @@ pub struct RecorderTask {
 }
 
 impl RecorderTask {
-    pub fn enabled() -> bool {
-        matches!(std::env::var("UPERF_RECORD").ok().as_deref(), Some("1") | Some("true"))
-    }
-
-    pub fn spawn<F, L>(cfg_dir: Option<PathBuf>, state: F, log: L) -> Option<RecorderTask>
+    /// `cfg` is present only when recording is armed (`UPERF_RECORD=1`), decided by
+    /// `Settings`; this module reads no environment variable.
+    pub fn spawn<F, L>(
+        cfg: &crate::settings::RecordCfg,
+        cfg_dir: Option<PathBuf>,
+        state: F,
+        log: L,
+    ) -> Option<RecorderTask>
     where
         F: Fn() -> (Option<String>, String) + Send + 'static,
         L: Fn(&str) + Send + 'static,
     {
-        if !Self::enabled() {
-            return None;
-        }
-        let mut rec = Recorder::from_env(cfg_dir.as_deref());
-        let tick_ms = std::env::var("UPERF_RECORD_TICK_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1000);
+        let mut rec = Recorder::new(
+            true,
+            cfg.min_session_ms,
+            cfg.sample_ms,
+            cfg_dir.map(|d| d.to_path_buf()),
+        );
+        let tick_ms = cfg.tick_ms;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let handle = std::thread::Builder::new()

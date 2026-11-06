@@ -152,16 +152,6 @@ fn write_private(path: &Path, data: &str) {
     }
 }
 
-/// Where the token lives: `UPERF_CTL_TOKEN_FILE`, else `<config dir>/uperf.token`.
-pub fn token_path(cfg_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("UPERF_CTL_TOKEN_FILE") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
-    }
-    cfg_dir.map(|d| d.join("uperf.token"))
-}
-
 /// `@name` is an abstract socket (the Android `LocalSocket` idiom); anything else is a
 /// filesystem path. The distinction is in the address, so both are built here.
 ///
@@ -274,23 +264,20 @@ pub struct CtlTask {
 }
 
 impl CtlTask {
-    /// The configured socket address, or `None` when the feature is off.
-    pub fn socket_addr() -> Option<String> {
-        std::env::var("UPERF_CTL_SOCKET").ok().filter(|s| !s.is_empty())
-    }
-
-    pub fn spawn<L>(cfg_dir: Option<PathBuf>, log: L) -> Option<CtlTask>
+    /// `cfg` (and the token path) come from `Settings`; this module reads no
+    /// environment variable.
+    pub fn spawn<L>(
+        cfg: &crate::settings::CtlCfg,
+        token_file: Option<PathBuf>,
+        log: L,
+    ) -> Option<CtlTask>
     where
         L: Fn(&str) + Send + 'static,
     {
-        let addr = Self::socket_addr()?;
-        let retry_ms = std::env::var("UPERF_CTL_RETRY_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5000);
-        let token = token_path(cfg_dir.as_deref())
-            .as_deref()
-            .and_then(load_or_create_token);
+        let addr = cfg.addr.clone();
+        let retry_ms = cfg.retry_ms;
+        let ping_ms = cfg.ping_ms;
+        let token = token_file.as_deref().and_then(load_or_create_token);
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
@@ -314,7 +301,7 @@ impl CtlTask {
                             match handshake(&mut s, &token) {
                                 Ok(v) => {
                                     log(&format!("Rust: ctl-socket: handshake ok, peer v{v}"));
-                                    if let Err(e) = serve(&mut s, &stop_thread, &log) {
+                                    if let Err(e) = serve(&mut s, &stop_thread, ping_ms, &log) {
                                         log(&format!("Rust: ctl-socket: link ended: {e}"));
                                     }
                                 }
@@ -352,11 +339,12 @@ impl CtlTask {
 /// `PING` and requiring `PONG`, and it also answers a `PING` that arrives from the peer.
 /// That is the whole command set for now — enough to prove the channel is two-way and
 /// that a peer which stops answering is noticed instead of assumed healthy.
-fn serve(stream: &mut UnixStream, stop: &Arc<AtomicBool>, log: &impl Fn(&str)) -> Result<(), String> {
-    let ping_every = std::env::var("UPERF_CTL_PING_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(2000);
+fn serve(
+    stream: &mut UnixStream,
+    stop: &Arc<AtomicBool>,
+    ping_every: u64,
+    log: &impl Fn(&str),
+) -> Result<(), String> {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
     let mut rd = BufReader::new(stream.try_clone().map_err(|e| format!("clone: {e}"))?);
     let mut pongs = 0u64;

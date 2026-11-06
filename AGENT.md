@@ -220,6 +220,19 @@ void uperf_bridge_set_thread_name(const char *name);
 | `CpufreqWriter{Msm,Ppm,Epic}{Base,Fixed,Powersave}` + `Performance` | **Rust** | 平台差异（`/sys/kernel/msm_performance/...`、`/proc/ppm/policy/...`、`/dev/cluster{}_freq_{min,max}`）在 Rust 里用策略表表达 |
 | `libsfanalysis.so`（SF 注入库）→ `libsfanalysis_rs.so` | **Rust 重写** | 见 §12.1 / `docs/spec/sfanalysis.md`；M0..M7 阶段仍使用 vendor 件过渡，M8 起替换 |
 | 外置看门狗 / 状态文件（M9） | **shell + Rust** | `magisk/script/uperf_watchdog.sh`（进程外监督 + 死手恢复 + 预算内重启）、`rust/uperf-core/src/status.rs`（`uperf.state`）；见 §11 M9 与 `docs/m9-watchdog.md` |
+| 运行时旋钮（无上游对应物） | **Rust** | `rust/uperf-core/src/settings.rs`：全部 `UPERF_*` 环境变量在此**一次性**解析成 `Settings`，下游模块只接受参数，不再自己 `std::env::var`。新增旋钮只改这一处 + 传参，见 §13 |
+
+### 6.1 运行时旋钮面（`Settings`）
+
+`uperf_rs_start` 在最外层调用 `Settings::from_env(config, log)`，派生出 `uperf.state` / `orig_governor.txt` /
+`sysfs_orig.txt` / `uperf_frames.state` / `uperf.token` 的路径，然后**传值**给每个任务。
+
+* 不允许在模块内部读环境变量——那会让"这个 daemon 有哪些旋钮"无法回答，也让测试必须改进程环境。
+  `std::env::set_var` 在多线程进程里是对 `environ` 的数据竞争（Rust 2024 已标 `unsafe`），本项目的
+  `uperf_rs_start` 曾在 reload 时踩到这一点，现已改为纯派生。
+* 测试构造 `Settings` 直接注入（见 `cpu_task` 的 `scoped_writer`、`sched_task` 的 `Settings::default()`），
+  不再有"串行化 env 的全局锁"。
+* 仍留在环境里的：`sfanalysis` 注入库自己的 `UPERF_SFANALYSIS_*`（它是另一个 cdylib，不共享本 crate 的 Settings）。
 
 ---
 
@@ -674,6 +687,7 @@ libandroidfw 的 **ELF 头段**（maps 首条 r--p）而非 `.text`——真机 
 * Rust 2021；`#![deny(unsafe_op_in_unsafe_fn)]`；`unsafe` 只允许出现在 `ffi.rs` 与 syscall 包装层，每处必须有 `// SAFETY:` 说明。
 * 运行路径禁止 `unwrap/expect/panic`（`panic = "abort"` 也救不回被 abort 的整机性能控制器）。
 * 所有跨线程共享状态用 `Mutex`/`Arc`；禁止 `static mut`。
+* 环境变量只在 `settings.rs` 读一次；模块内出现 `std::env::var` 视为回归。
 * C++ 侧改动最小化，且改动必须记入 `cpp/dfps/DFPS_VENDOR.md`。
 * 提交信息英文、conventional（`feat(governor): ...`），按类别聚合；不提交构建产物（`/build` 已在 `.gitignore`，仍要确保 `magisk/bin/uperf` 的替换是有意为之）。
 

@@ -165,6 +165,7 @@ pub(crate) fn spawn(
     orch: std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
     dfps: Option<crate::dfps_rs::DfpsScheduler>,
     foreground: Option<crate::foreground::ForegroundFile>,
+    settings: crate::settings::Settings,
 ) -> Dispatcher {
     let (tx, rx): (Sender<Event>, Receiver<Event>) = std::sync::mpsc::channel();
     // Install a clone so the FFI entry point can also send events.
@@ -172,7 +173,7 @@ pub(crate) fn spawn(
     DISPATCH_TX.get_or_init(|| tx_for_ffi);
     let thread = thread::Builder::new()
         .name("uperf-rs".into())
-        .spawn(move || run(rx, orch, dfps, foreground))
+        .spawn(move || run(rx, orch, dfps, foreground, settings))
         .expect("spawn uperf-rs dispatcher");
     Dispatcher {
         _keep_alive: tx,
@@ -213,28 +214,21 @@ fn run(
     orch: std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
     dfps: Option<crate::dfps_rs::DfpsScheduler>,
     mut foreground: Option<crate::foreground::ForegroundFile>,
+    settings: crate::settings::Settings,
 ) {
-    // M4: writes go under a fake root so device validation never touches the
-    // real sysfs. Set `UPERF_FAKE_ROOT` to enable file emission (e.g.
-    // /data/local/tmp/uperf_fake); otherwise we only log the planned sequence.
-    let fake_root = std::env::var("UPERF_FAKE_ROOT").ok();
-    // Wake periodically to re-read the foreground file (④). The tick is bounded
-    // even when that source is disabled so a dropped sender is noticed promptly
-    // (the join path waits at most two seconds).
-    let tick = if foreground.is_some() {
-        crate::foreground::tick_from_env()
-    } else {
-        Duration::from_millis(1000)
-    };
+    // The wake interval comes from the one `Settings` snapshot: the foreground poll
+    // when that source is armed, otherwise a full second — long enough to notice a
+    // dropped sender promptly, since the join path waits at most two seconds.
+    let tick = settings.dispatcher_tick();
     loop {
         match rx.recv_timeout(tick) {
-            Ok(ev) => handle(&ev, &orch, dfps.as_ref(), fake_root.as_deref()),
+            Ok(ev) => handle(&ev, &orch, dfps.as_ref(), &settings),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // The top-app file, if any. A stale/absent file yields nothing and
                 // the C++ monitor's own `topapp.pkgName` events carry on.
                 if let Some(f) = foreground.as_mut() {
                     if let Some(pkg) = f.poll() {
-                        handle(&Event::Topapp(pkg), &orch, dfps.as_ref(), fake_root.as_deref());
+                        handle(&Event::Topapp(pkg), &orch, dfps.as_ref(), &settings);
                     }
                 }
             }
@@ -250,7 +244,7 @@ fn handle(
     ev: &Event,
     orch: &std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
     dfps: Option<&crate::dfps_rs::DfpsScheduler>,
-    fake_root: Option<&str>,
+    settings: &crate::settings::Settings,
 ) {
     write_event(ev);
 
@@ -258,7 +252,7 @@ fn handle(
         let mut g = orch.lock();
         g.on_event(ev);
     }
-    apply_pending(orch, fake_root);
+    apply_pending(orch, settings);
 
     // Refresh-rate topics fan out to dfps-rs as a second subscriber
     // (T03: same process, no IPC). Ordering after the orchestrator is
@@ -290,7 +284,7 @@ fn route_dfps(ev: &Event, d: &crate::dfps_rs::DfpsScheduler) {
 /// event. Returns `(written, failed)`.
 pub(crate) fn apply_pending(
     orch: &std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
-    fake_root: Option<&str>,
+    settings: &crate::settings::Settings,
 ) -> (usize, usize) {
     let mut collected = crate::orchestrator::CollectingSink::default();
     {
@@ -303,14 +297,17 @@ pub(crate) fn apply_pending(
     for w in &collected.writes {
         log_sysfs_write(w);
     }
-    match fake_root {
+    match settings.fake_root.as_deref() {
         Some(root) => {
             // Record what each knob held before we touch it, so a later stop (or the
             // watchdog's dead-man path) can put it back. Without a status target there
             // is nowhere to record, and we write without one rather than inventing a
             // location.
-            let mut files = match crate::sysfs_ledger::SysfsLedger::for_status() {
-                Some(l) => crate::orchestrator::UnderRootSink::with_ledger(root, l),
+            let mut files = match settings.sysfs_orig.clone() {
+                Some(p) => crate::orchestrator::UnderRootSink::with_ledger(
+                    root,
+                    crate::sysfs_ledger::SysfsLedger::load(p),
+                ),
                 None => crate::orchestrator::UnderRootSink::new(root),
             };
             for w in collected.writes {
@@ -439,7 +436,8 @@ mod foreground_tick_tests {
             HintDurations::default(),
             "balance",
         )));
-        let d = spawn(orch.clone(), None, fg);
+        let settings = crate::settings::Settings::default();
+        let d = spawn(orch.clone(), None, fg, settings);
         (orch, d)
     }
 

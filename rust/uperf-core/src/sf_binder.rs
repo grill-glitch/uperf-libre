@@ -684,17 +684,14 @@ fn write_state(path: &Path, lines: &str) {
     let _ = std::fs::write(path, lines);
 }
 
-fn env_ms(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(default)
-}
-
 impl FrameTask {
-    pub fn enabled() -> bool {
-        matches!(std::env::var("UPERF_SF_BINDER").ok().as_deref(), Some("1") | Some("true"))
-    }
-
+    /// `cfg` is present only when the leg is armed (`UPERF_SF_BINDER=1`), decided by
+    /// `Settings`. The two paths come from there too, so this module no longer knows
+    /// the names of any environment variable.
     pub fn spawn<F, L, H>(
-        cfg_dir: Option<std::path::PathBuf>,
+        cfg: &crate::settings::BinderCfg,
+        hint_path: Option<std::path::PathBuf>,
+        state_path: Option<std::path::PathBuf>,
         top_app: F,
         on_hint: H,
         log: L,
@@ -704,17 +701,10 @@ impl FrameTask {
         H: Fn(SfHint) + Send + 'static,
         L: Fn(&str) + Send + 'static,
     {
-        let tick_ms = env_ms("UPERF_SF_BINDER_TICK_MS", 1000);
-        let window_ms = env_ms("UPERF_SF_BINDER_WINDOW_MS", 1000);
-        let stale_ms = env_ms("UPERF_SF_BINDER_HINT_STALE_MS", 3000);
-        let pinned = std::env::var("UPERF_SF_BINDER_LAYER").ok().filter(|s| !s.is_empty());
-
-        let hint_path = cfg_dir.as_ref().map(|d| d.join("sfanalysis.hint"));
-        let state_path = std::env::var("UPERF_FRAMES_STATE")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(std::path::PathBuf::from)
-            .or_else(|| cfg_dir.as_ref().map(|d| d.join("uperf_frames.state")));
+        let tick_ms = cfg.tick_ms;
+        let window_ms = cfg.window_ms;
+        let stale_ms = cfg.hint_stale_ms;
+        let pinned = cfg.layer.clone();
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();

@@ -51,37 +51,6 @@ pub struct SysfsLedger {
 }
 
 impl SysfsLedger {
-    /// The ledger that belongs to a config path: `<config dir>/sysfs_orig.txt`, i.e.
-    /// beside `uperf.state`. `UPERF_SYSFS_ORIG` overrides it (host tests, offline
-    /// runs). `None` when neither is available, in which case recording is skipped
-    /// rather than written to an unknown location.
-    pub fn for_config(config_path: &str) -> Option<Self> {
-        let from_env = std::env::var("UPERF_SYSFS_ORIG")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let path = match from_env {
-            Some(p) => PathBuf::from(p),
-            None => Path::new(config_path)
-                .parent()
-                .filter(|dir| !dir.as_os_str().is_empty())?
-                .join("sysfs_orig.txt"),
-        };
-        Some(Self::load(path))
-    }
-
-    /// The ledger for this process's `USER_PATH`, taken from the status target
-    /// (`UPERF_STATUS_CONFIG` → `<config dir>/uperf.state`, so the ledger lands beside
-    /// `uperf.state` and `orig_governor.txt`). `None` when the target is unknown, in
-    /// which case the caller writes without recording rather than recording into an
-    /// unknown location.
-    pub fn for_status() -> Option<Self> {
-        let t = crate::status::target()?;
-        if t.config.is_empty() {
-            return None;
-        }
-        Self::for_config(&t.config)
-    }
-
     /// Load an existing ledger. An unreadable or absent file is an empty ledger: the
     /// next write records the originals it finds. An unparsable line is counted and
     /// dropped (see `corrupt`).
