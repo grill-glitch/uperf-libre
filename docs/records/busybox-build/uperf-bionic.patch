@@ -1,0 +1,70 @@
+--- a/include/platform.h
++++ b/include/platform.h
+@@ -551,7 +551,11 @@
+ #  undef HAVE_WAIT3
+ # endif
+ # undef HAVE_MEMPCPY
+-# undef HAVE_STRCHRNUL
++/* uperf-libre build patch: bionic has strchrnul() since API 24, and defining a second
++ * copy in libbb/platform.c fails the link with "duplicate symbol: strchrnul". */
++# if !defined(__ANDROID_API__) || __ANDROID_API__ < 24
++#  undef HAVE_STRCHRNUL
++# endif
+ # undef HAVE_STRVERSCMP
+ # undef HAVE_UNLOCKED_LINE_OPS
+ # undef HAVE_NET_ETHERNET_H
+--- a/libbb/missing_syscalls.c
++++ b/libbb/missing_syscalls.c
+@@ -10,6 +10,10 @@
+ #if defined(ANDROID) || defined(__ANDROID__)
+ /*# include <linux/timex.h> - for struct timex, but may collide with <time.h> */
+ # include <sys/syscall.h>
++/* uperf-libre build patch: bionic has provided getsid/sethostname/adjtimex since well
++ * before API 26, and defining them here duplicates the ones static libc.a links in
++ * ("duplicate symbol: getsid"). Keep the definitions only for older API levels. */
++# if !defined(__ANDROID_API__) || __ANDROID_API__ < 26
+ pid_t getsid(pid_t pid)
+ {
+ 	return syscall(__NR_getsid, pid);
+@@ -25,6 +29,7 @@
+ {
+ 	return syscall(__NR_adjtimex, buf);
+ }
++# endif
+ 
+ int pivot_root(const char *new_root, const char *put_old)
+ {
+--- a/libbb/yescrypt/alg-yescrypt-common.c
++++ b/libbb/yescrypt/alg-yescrypt-common.c
+@@ -1,3 +1,14 @@
++/* uperf-libre build patch: bionic has no explicit_bzero().
++ * Zeroing a buffer is what explicit_bzero compiles to on a libc without it, and these
++ * are yescrypt scratch buffers (busybox only reaches them from passwd/cryptpw, which
++ * this build does not enable). Applied by docs/records/busybox-build/build-busybox.sh. */
++#if defined(__ANDROID__)
++# include <string.h>
++# ifndef explicit_bzero
++#  define explicit_bzero(p, n) memset((p), 0, (n))
++# endif
++#endif
++
+ /*-
+  * Copyright 2013-2018 Alexander Peslyak
+  * All rights reserved.
+--- a/libbb/yescrypt/alg-yescrypt-kdf.c
++++ b/libbb/yescrypt/alg-yescrypt-kdf.c
+@@ -1,3 +1,14 @@
++/* uperf-libre build patch: bionic has no explicit_bzero().
++ * Zeroing a buffer is what explicit_bzero compiles to on a libc without it, and these
++ * are yescrypt scratch buffers (busybox only reaches them from passwd/cryptpw, which
++ * this build does not enable). Applied by docs/records/busybox-build/build-busybox.sh. */
++#if defined(__ANDROID__)
++# include <string.h>
++# ifndef explicit_bzero
++#  define explicit_bzero(p, n) memset((p), 0, (n))
++# endif
++#endif
++
+ /*-
+  * Copyright 2009 Colin Percival
+  * Copyright 2012-2018 Alexander Peslyak

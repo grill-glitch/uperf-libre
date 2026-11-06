@@ -270,6 +270,28 @@ check_uperf() {
     done
     echo "    scripts   : root = entry points only ($(echo $root_sh | wc -w) file(s)), libs in script/"
 
+    # The vendored busybox (§docs/records/busybox-build). It is tracked source, so a
+    # check here catches the two ways it goes wrong: someone swaps in a random binary,
+    # or a rebuild silently changes it. Both the provenance and the rebuild recipe are
+    # in docs/records/busybox-build/README.md; update BUSYBOX_SHA256 there and here
+    # together when the binary is legitimately replaced.
+    local bb="$BASEDIR/magisk/bin/busybox/busybox"
+    local BUSYBOX_SHA256=e2b7a98a7d8d0aa4e65d19ebbbce7d5e3bbb1a8dca0a7f73bc6579ed3e391dab
+    [ -f "$bb" ] || { echo " !! magisk/bin/busybox/busybox is missing"; exit 1; }
+    local bb_type bb_dyn bb_sum bb_banner
+    bb_type=$(LC_ALL=C $elf -hW "$bb" | awk '/Type:/{print $2}')
+    bb_dyn=$(LC_ALL=C $elf -dW "$bb" 2>&1 | grep -c NEEDED || true)
+    [ "$bb_type" = "EXEC" ] || { echo " !! busybox is not a static ET_EXEC image ($bb_type)"; exit 1; }
+    [ "$bb_dyn" -eq 0 ] || { echo " !! busybox links dynamic libraries, it must be static"; exit 1; }
+    bb_sum=$(sha256sum "$bb" | cut -d' ' -f1)
+    [ "$bb_sum" = "$BUSYBOX_SHA256" ] || {
+        echo " !! busybox sha256 is $bb_sum, expected $BUSYBOX_SHA256"
+        echo "    if this is a deliberate rebuild: docs/records/busybox-build/build-busybox.sh --install"
+        exit 1
+    }
+    bb_banner=$(LC_ALL=C strings -a "$bb" | grep -m1 -oE 'BusyBox v[0-9]+\.[0-9]+\.[0-9]+ \([^)]*\)' || true)
+    echo "    busybox   : ${bb_banner:-?} ($(stat -c %s "$bb") bytes, static, sha256 ok)"
+
     echo "    -> OK"
 }
 

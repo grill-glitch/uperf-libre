@@ -10,7 +10,7 @@ This project incorporates components from the projects listed below. The origina
 3.	PhilipHazel/pcre2 version 10.39 (https://github.com/PhilipHazel/pcre2)
 4.	eliaskosunen/scnlib version 0.4.0 (https://github.com/eliaskosunen/scnlib)
 5.	gabime/spdlog version 1.9.2 (https://github.com/gabime/spdlog)
-6.	osm0sis/android-busybox-ndk 1.31.1 (https://github.com/osm0sis/android-busybox-ndk)
+6.	busybox 1.38.0 (https://busybox.net) — GPL-2.0; built from the signed upstream release by this project, see docs/records/busybox-build/
 7.	material-components/material-web (@material/web) version 2.5.0 (https://github.com/material-components/material-web)
 8.	google/material-design-icons (@material-symbols/svg-400) version 0.40.2 (https://github.com/google/material-design-icons)
 9.	lit/lit version 3.3.3 (https://github.com/lit/lit) — bundled dependency of @material/web
@@ -438,8 +438,18 @@ and users must comply to its license: https://github.com/fmtlib/fmt/blob/master/
 =========================================
 END OF gabime/spdlog NOTICES AND INFORMATION
 
-%% osm0sis/android-busybox-ndk NOTICES AND INFORMATION BEGIN HERE
+%% busybox 1.38.0 NOTICES AND INFORMATION BEGIN HERE
 =========================================
+--- Provenance of the shipped binary
+
+`magisk/bin/busybox/busybox` is a static aarch64 build of upstream BusyBox 1.38.0,
+built by this project (not a third-party prebuilt). The corresponding source is
+`busybox-1.38.0.tar.bz2` from https://busybox.net/downloads/ — signed by Denys
+Vlasenko, sha256 34f9ea6ff8636f2c9241153b9114eefa9e65674a45318ae1ef95bb5f31c53bb2 —
+plus the bionic-portability patch in docs/records/busybox-build/uperf-bionic.patch.
+docs/records/busybox-build/build-busybox.sh reproduces the shipped binary bit for bit
+from those two inputs.
+
 --- A note on GPL versions
 
 BusyBox is distributed under version 2 of the General Public License (included
@@ -789,7 +799,7 @@ consider it more useful to permit linking proprietary applications with the
 library.  If this is what you want to do, use the GNU Library General
 Public License instead of this License.
 =========================================
-END OF osm0sis/android-busybox-ndk NOTICES AND INFORMATION
+END OF busybox 1.38.0 NOTICES AND INFORMATION
 
 =========================================================================
 ADDITIONS FOR THE RUST REWRITE (this repository)
