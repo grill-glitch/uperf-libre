@@ -237,6 +237,13 @@ void uperf_bridge_set_thread_name(const char *name);
   原先是无界 `join()`，一个卡住的线程就能把停机路径（也就是 disarm 路径）挂死。
 * 事件通道的 sender 现在可替换：再次 start 时旧 receiver 已死，`OnceLock` 会让其后所有事件静默丢进死通道。
 
+### 6.02 停机信号（`signals.rs`）
+
+* 停机信号（SIGTERM / SIGINT / SIGUSR1）在 worker 里**先屏蔽再起线程**（`cpp/uperf/app_main.cpp::BlockTerminationSignals`，在 fork 的子进程分支里、`StartPlatform()` 之前），由一个 `sigwait` 线程在**普通线程上下文**里调用 `uperf_rs_stop()`，然后 `_exit(0)`。全部线程继承屏蔽字，所以第二次投递不会打断正在进行的停机（这正是 `killall uperf` 过去把停机路径在同一线程上跑两遍、撞死非重入日志锁的形状）。
+* **禁止在信号处理器里调用 `uperf_rs_stop()`**：它 join 线程、取 `parking_lot`/`std` 锁、分配内存、写状态文件、走 spdlog，全都不是 async-signal-safe。信号可能落在正持有这些锁的线程上——dispatcher 里 C++ spdlog sink 锁没有 `try_lock` 版本；cpu task 里 `CpuTask::stop` 超时回退会在同一线程再取 `writer` 锁。任一种都让进程不退、governor 留在 `userspace`。
+* 监听线程只在 daemon 已放进槽位**之后**启动：否则启动途中来信号会 `_exit` 在「governor 已 arm、daemon 未发布」的窗口里。
+* `Dispatcher::join_timeout` 必须先 `ffi::clear_dispatch_tx()`：FFI 槽位持有 sender，只 drop `_keep_alive` 时 receiver 永远收不到 `Disconnected`，线程会白等满 2 s 预算（真机实测：`caught signal` 与 `task 'cpu' stopped` 相差 2 s）。
+
 ### 6.1 运行时旋钮面（`Settings`）
 
 `uperf_rs_start` 在最外层调用 `Settings::from_env(config, log)`，派生出 `uperf.state` / `orig_governor.txt` /

@@ -30,6 +30,7 @@
 // (cpp/include/uperf_rs.h).
 
 #include <getopt.h>
+#include <pthread.h>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -192,59 +193,54 @@ static void AppMain(void) {
 
 // ---------------------------------------------------------------- supervisor (dfps)
 
-static void AppSigHandler(int sig) {
-    // Block the shutdown signals for the duration of the handler.
-    //
-    // Without this the handler re-enters: `killall uperf` delivers SIGTERM to the
-    // daemon AND the worker at the same time, and the daemon's own handler then
-    // also sends SIGUSR1 to the worker. Two concurrent runs of the shutdown path
-    // fight over the same non-reentrant log mutex (Rust's global line buffer and
-    // spdlog's sink lock), deadlock, and the process never exits — leaving the CPU
-    // governor armed in `userspace` mode. Observed on device: `killall uperf` left
-    // two processes alive with `governors: userspace userspace userspace`.
+// ---------------------------------------------------------------- teardown signals
+
+// The worker does NOT install a handler for the teardown signals, and that is the
+// fix, not an omission.
+//
+// The handler used to call `uperf_rs_stop()` directly. That function joins threads,
+// takes mutexes, allocates, writes the status file and logs through spdlog — none of
+// it async-signal-safe — and a signal can land on the very thread that already holds
+// one of those locks. Two live ways to hang: on the dispatcher, where the C++ spdlog
+// sink lock (no `try_lock` variant) is taken again by the handler's own log line; and
+// on the cpu task, where `CpuTask::stop`'s timeout fallback calls `writer.lock()` on
+// the thread that was interrupted inside the writer's critical section. Both end with
+// the process alive and every policy still in `userspace`.
+//
+// Instead the worker blocks the three signals *before it creates any thread*
+// (`BlockTerminationSignals`, called from the fork's child branch, before
+// `StartPlatform()`), so every thread made afterwards — the vendored listeners
+// included — inherits the mask. Rust then runs one `sigwait(3)` thread
+// (`rust/uperf-core/src/signals.rs`) that performs the stop in ordinary thread
+// context and `_exit(0)`s.
+//
+// The daemon (supervisor) is unchanged: it still handles SIGTERM/SIGINT/SIGCHLD and
+// forwards `TERM_SIG` to the worker, which is now picked up by the `sigwait` thread.
+// Keeping the signals blocked in the worker also means a second delivery cannot
+// re-enter a stop that is already running — the old shape, where `killall uperf` ran
+// the teardown twice on one thread against a non-reentrant log mutex, cannot recur.
+static void BlockTerminationSignals(void) {
     sigset_t block;
     sigemptyset(&block);
     sigaddset(&block, TERM_SIG);
     sigaddset(&block, SIGTERM);
     sigaddset(&block, SIGINT);
-    sigprocmask(SIG_BLOCK, &block, nullptr);
-
-    switch (sig) {
-        case TERM_SIG:
-        case SIGTERM:
-        case SIGINT:
-            // Stop the Rust engine before exiting. The CPU governor runs in
-            // "userspace" mode, i.e. it has taken frequency scaling away from the
-            // kernel; if we exit without uperf_rs_stop() the policies stay pinned
-            // to the last published frequency forever. uperf_rs_stop() disarms
-            // them.
-            //
-            // SIGTERM/SIGINT must be handled here, not only TERM_SIG: the worker
-            // inherits the *daemon's* SIGTERM handler (SetSigHandler only replaced
-            // TERM_SIG), and the daemon's handler just exits — so a plain
-            // `killall uperf`, which is exactly what the module's own
-            // `uperf_stop()` does, killed the worker without disarming the
-            // governor. uperf_rs_stop() is idempotent, so a daemon-then-worker
-            // sequence is fine.
-            uperf_rs_stop();
-            exit(EXIT_SUCCESS);
-        default:
-            exit(EXIT_FAILURE);
+    if (pthread_sigmask(SIG_BLOCK, &block, nullptr) != 0) {
+        // Without the mask the Rust listener never sees a signal (`sigwait` only
+        // returns for blocked signals) and the worker would be unkillable except by
+        // SIGKILL. Say so loudly: the operator needs to know a SIGTERM will not stop
+        // it cleanly.
+        SPDLOG_ERROR("Failed to block the teardown signals; the worker will not stop cleanly");
     }
-}
-
-static void SetSigHandler(void) {
-    signal(TERM_SIG, AppSigHandler);
-    // Replace the inherited daemon handler: a direct SIGTERM to a worker (e.g.
-    // `killall uperf`) must run the same cleanup, not the supervisor's exit path.
-    signal(SIGTERM, AppSigHandler);
-    signal(SIGINT, AppSigHandler);
 }
 
 static void StartNewApp(void) {
     new_pid = fork();
     if (new_pid == 0) {
-        SetSigHandler();
+        // Before anything in this process creates a thread: the mask is inherited by
+        // every thread made afterwards, which is the whole point (see the teardown
+        // signals section above).
+        BlockTerminationSignals();
         AppMain();
     }
 

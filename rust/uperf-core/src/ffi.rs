@@ -93,6 +93,15 @@ pub(crate) fn install_dispatch_tx(tx: Sender<Event>) {
     *dispatch_slot().lock() = Some(tx);
 }
 
+/// Drop the installed sender. The dispatcher's `join_timeout` needs this: the receiver
+/// only sees `Disconnected` once *every* sender is gone, and since the slot holds one
+/// for the FFI entry point, a stop that skipped this step waited out the whole 2 s
+/// join budget and detached a thread that was perfectly able to exit (measured on
+/// device: `caught signal` at :39, `task 'cpu' stopped` at :41).
+pub(crate) fn clear_dispatch_tx() {
+    *dispatch_slot().lock() = None;
+}
+
 /// Forward one event to the dispatcher, if one is running.
 pub(crate) fn send_event(ev: Event) {
     let guard = dispatch_slot().lock();

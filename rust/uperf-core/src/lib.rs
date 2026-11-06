@@ -38,6 +38,7 @@ pub mod sched_apply;
 pub mod sched_task;
 pub mod settings;
 pub mod sf_binder;
+pub mod signals;
 pub mod sf_uprobe;
 pub mod shutdown;
 pub mod startup_lines;
@@ -176,6 +177,14 @@ pub(crate) unsafe extern "C" fn uperf_rs_start(
     let log_path_shown = settings.log_path.clone();
     let loaded = settings.config_dir.is_some();
     *daemon_slot().lock() = Some(Daemon::start(settings));
+
+    // Only now, with a daemon in the slot: a signal that arrived during startup stayed
+    // pending (the worker blocks the teardown set before creating any thread), so it is
+    // delivered to the listener below and handled with the daemon fully built. Starting
+    // the listener first would let a signal interrupt `Daemon::start` between arming the
+    // governor and publishing the daemon, and `_exit` there would leave the policies in
+    // `userspace`.
+    signals::spawn_termination_listener();
 
     log_msg(&format!(
         "uperf_rs_start: cfg={cfg_path} log={log_path_shown} (daemon started, config_dir_known={loaded})"

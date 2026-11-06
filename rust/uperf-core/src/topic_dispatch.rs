@@ -191,6 +191,10 @@ pub(crate) struct Dispatcher {
 
 impl Dispatcher {
     pub(crate) fn join_timeout(&mut self, d: Duration) {
+        // Every sender must go: the FFI one lives in `ffi::DISPATCH_TX`, so dropping
+        // only this one leaves the receiver connected and the thread parked in
+        // `recv_timeout` until the whole budget is spent.
+        crate::ffi::clear_dispatch_tx();
         drop(std::mem::replace(&mut self._keep_alive, dummy_sender()));
         let start = Instant::now();
         if let Some(t) = self.thread.take() {
