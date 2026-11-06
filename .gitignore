@@ -13,3 +13,9 @@ __pycache__
 # Agent scratch/planning state (wayfinder tickets, session notes). Never a deliverable:
 # the conclusions belong in docs/, the reasoning in AGENT.md.
 /.hermes
+
+# Built module binaries. They are products of `build.sh pack`, identical to the build
+# output; tracking them put a 2.1 MB blob and a 300 KB cdylib in the repository on every
+# rebuild. Third-party `magisk/bin/busybox/busybox` is NOT here — it cannot be built.
+/magisk/bin/uperf
+/magisk/bin/libsfanalysis_rs.so

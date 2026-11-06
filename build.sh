@@ -153,18 +153,32 @@ check_uperf() {
     # in magisk/bin/uperf (which is what this project exists to replace), and a
     # stale copy left behind by an earlier build. Upstream's dev-22.09.04 is
     # 1461512 bytes; this build is not.
+    # The module binary is a **build product**, not tracked source (2.1 MB of binary in
+    # git is what `git filter-repo` had to purge from this repository's history). What
+    # must hold: whatever copy exists — the staged module tree that gets zipped, or a
+    # local `magisk/bin/uperf` left by `pack` — equals *this* build, and no copy of the
+    # vendor binary comes back. A missing tree copy is normal in a fresh clone.
     local module_bin="$BASEDIR/magisk/bin/uperf"
-    if [ -f "$module_bin" ]; then
-        if ! cmp -s "$module_bin" "$bin"; then
-            echo " !! magisk/bin/uperf differs from the built binary"
-            echo "    module: $(stat -c %s "$module_bin") bytes"
+    local staged_bin="$STAGE_DIR/bin/uperf"
+    local checked=0
+    for candidate in "$module_bin" "$staged_bin"; do
+        [ -f "$candidate" ] || continue
+        checked=$((checked + 1))
+        if ! cmp -s "$candidate" "$bin"; then
+            echo " !! ${candidate#$BASEDIR/} differs from the built binary"
+            echo "    module: $(stat -c %s "$candidate") bytes"
             echo "    build : $sz bytes"
             echo "    fix   : sh build.sh $BUILD_TYPE pack"
             exit 1
         fi
-        echo "    module bin: magisk/bin/uperf matches this build"
+    done
+    if [ "$checked" -gt 0 ]; then
+        echo "    module bin: $checked copy/copies match this build (staged: $([ -f "$staged_bin" ] && echo yes || echo no))"
     else
-        echo " !! magisk/bin/uperf is missing; run 'sh build.sh $BUILD_TYPE pack'"
+        echo "    module bin: none staged yet (run 'sh build.sh $BUILD_TYPE pack' to product the module zip)"
+    fi
+    if [ -f "$module_bin" ] && [ "$(stat -c %s "$module_bin")" = "1461512" ]; then
+        echo " !! magisk/bin/uperf has the size of the upstream close-source binary"
         exit 1
     fi
     [ "$sz" -lt 3145728 ] || { echo " !! binary too large (> 3 MiB)"; exit 1; }
@@ -274,9 +288,9 @@ pack_uperf() {
     # panic=abort build of a library that is injected into surfaceflinger.
     local rs_so="$BASEDIR/rust/target/$ARM64_TARGET/sfanalysis/libsfanalysis_rs.so"
     if [ -f "$rs_so" ]; then
+        # Only into the staging tree that gets zipped. `magisk/bin/` stays free of built
+        # artifacts (see .gitignore); `check` asserts on the staged copy.
         cp -f "$rs_so" $STAGE_DIR/bin/libsfanalysis_rs.so
-        # Mirror into the in-tree magisk/bin so `check` can assert identity.
-        cp -f "$rs_so" $BASEDIR/magisk/bin/libsfanalysis_rs.so
         echo "    -> bin/libsfanalysis_rs.so ($(stat -c %s "$rs_so") bytes)"
     fi
     cp -f $BASEDIR/LICENSE $BASEDIR/NOTICE $STAGE_DIR/
@@ -288,9 +302,9 @@ pack_uperf() {
     # (`zip -FS` would also sync, but deleting is unambiguous.)
     rm -f $PKG_DIR/uperf-magisk.zip
     (cd $STAGE_DIR && zip -q -9 -r $PKG_DIR/uperf-magisk.zip .)
-    # Also refresh the in-tree copy, so the repository never carries the
-    # closed-source upstream binary and `check` can assert the two agree.
-    cp -f $BINARY $BASEDIR/magisk/bin/uperf
+    # Nothing is mirrored into magisk/bin/: the module binary is a build product and the
+    # staged tree is the only place it needs to exist. (It used to live there as tracked
+    # source, which is why the vendor 1,461,512-byte binary could hide in plain sight.)
     echo "    -> $PKG_DIR/uperf-magisk.zip ($(stat -c %s $PKG_DIR/uperf-magisk.zip) bytes)"
     echo "    -> magisk/bin/uperf refreshed from $BINARY"
 }
