@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::ffi::DISPATCH_TX;
+
 use crate::orchestrator::Sink;
 
 // ---------------------------------------------------------------------------
@@ -168,9 +168,9 @@ pub(crate) fn spawn(
     settings: crate::settings::Settings,
 ) -> Dispatcher {
     let (tx, rx): (Sender<Event>, Receiver<Event>) = std::sync::mpsc::channel();
-    // Install a clone so the FFI entry point can also send events.
-    let tx_for_ffi = tx.clone();
-    DISPATCH_TX.get_or_init(|| tx_for_ffi);
+    // Install a clone so the FFI entry point can also send events. Replaces any
+    // previous generation's sender: its receiver died with that dispatcher.
+    crate::ffi::install_dispatch_tx(tx.clone());
     let thread = thread::Builder::new()
         .name("uperf-rs".into())
         .spawn(move || run(rx, orch, dfps, foreground, settings))
@@ -182,9 +182,9 @@ pub(crate) fn spawn(
 }
 
 pub(crate) struct Dispatcher {
-    /// Keep this sender alive until `join_timeout` is called. The cloned sender
-    /// in `DISPATCH_TX` keeps the FFI entry point usable; once both are dropped
-    /// the receiver hits `RecvError` and the thread exits.
+    /// Keep this sender alive until `join_timeout` is called. The cloned sender in
+    /// `ffi::DISPATCH_TX` keeps the FFI entry point usable; once both are dropped the
+    /// receiver hits `RecvError` and the thread exits.
     _keep_alive: Sender<Event>,
     thread: Option<JoinHandle<()>>,
 }

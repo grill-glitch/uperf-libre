@@ -327,11 +327,23 @@ impl CtlTask {
         Some(CtlTask { stop, handle: Some(handle) })
     }
 
+    /// Bounded, like every other task: an unbounded join here can block the whole
+    /// stop path (this thread may be parked in a read that never returns), and the
+    /// stop path is what disarms the CPU governor.
     pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        let Some(handle) = self.handle.take() else { return };
+        if !crate::shutdown::stop_and_join(
+            &self.stop,
+            handle,
+            crate::shutdown::STOP_TIMEOUT,
+            || {},
+        ) {
+            crate::log_msg("Rust: task did not stop in time, detached");
         }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.handle.is_some()
     }
 }
 

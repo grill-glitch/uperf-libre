@@ -1,14 +1,16 @@
 //! uperf-core — the Rust half of the rewrite (AGENT.md §3, §5).
 //!
-//! M1+M2+M3+M4:
-//!   * C ABI bridge + topic event dispatcher (`topic_dispatch`, `ffi`).
-//!   * Hint state machine (`hint`) — `SfHint` enum values 0..5 derived from the
-//!     upstream binary's two parallel jump tables (`docs/m1-static-reverse.md`
-//!     §1.3).
-//!   * Sysfs writer dispatch (`sysfs`) — SoC-specific per-cluster paths
-//!     extracted from upstream's real device fd trace.
-//!   * Orchestrator (`orchestrator`) — events → hint FSM → scene transition →
-//!     sysfs write sequence (M4; `Sink` trait + `CollectingSink` test double).
+//! Layering, outermost first:
+//!
+//! * **FFI entry points** (this file): the four `extern "C"` functions the vendored
+//!   C++ platform calls. They translate C pointers into Rust values and hand off;
+//!   they hold no policy.
+//! * [`settings`] — the run's knobs, parsed from the environment **once**, here at
+//!   the edge.
+//! * [`daemon`] — which subsystems exist, and in what order they start and stop.
+//! * [`task`] — the lifecycle contract the daemon's registry is built on.
+//! * the task modules themselves (`cpu_task`, `sched_task`, `watch_task`, …) and
+//!   [`orchestrator`] (hint FSM → scene → sysfs plan).
 //!
 //! Lifetime rules (AGENT.md §5.1):
 //!   * `data` passed to `on_event` is valid ONLY for the duration of the call.
@@ -24,35 +26,36 @@
 
 pub mod cpu_task;
 pub mod ctl_socket;
+pub mod daemon;
 pub mod dfps_rs;
 pub mod ffi;
 pub mod foreground;
-pub mod inotify;
-pub mod sched_apply;
-pub mod sched_task;
-pub mod sf_binder;
-pub mod sf_uprobe;
-pub mod status;
-pub mod startup_lines;
-pub mod shutdown;
-pub mod watch_task;
 pub mod hint;
+pub mod inotify;
 pub mod orchestrator;
 pub mod recorder;
+pub mod sched_apply;
+pub mod sched_task;
 pub mod settings;
+pub mod sf_binder;
+pub mod sf_uprobe;
+pub mod shutdown;
+pub mod startup_lines;
+pub mod status;
 pub mod sysfs;
 pub mod sysfs_ledger;
+pub mod task;
 pub mod topic_dispatch;
+pub mod watch_task;
 
 use std::ffi::CStr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex as PMutex;
 
-use ffi::{Bridge, BRIDGE, DISPATCH_TX, TOPICS};
-use orchestrator::Orchestrator;
-use topic_dispatch::Dispatcher;
+use daemon::Daemon;
+use ffi::{Bridge, BRIDGE};
 
 /// Single-line log buffer shared by the dispatcher + ad-hoc log helpers.
 static LOG_BUF: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
@@ -80,9 +83,7 @@ pub(crate) unsafe extern "C" fn uperf_rs_on_event(
     };
 
     if let Some(ev) = topic_dispatch::Event::parse(topic, payload) {
-        if let Some(tx) = DISPATCH_TX.get() {
-            let _ = tx.send(ev);
-        }
+        ffi::send_event(ev);
     }
 }
 
@@ -145,11 +146,13 @@ pub(crate) unsafe extern "C" fn uperf_rs_start(
     // function used to make to publish derived paths: writing `environ` while the
     // previous generation's threads are still alive is exactly the data race Rust
     // 2024 marks `set_var` unsafe for.
-    let settings = crate::settings::Settings::from_env(
-        &cfg.to_string_lossy(),
-        &log.to_string_lossy(),
-    );
+    let settings = settings::Settings::from_env(&cfg.to_string_lossy(), &log.to_string_lossy());
     *settings_slot().lock() = Some(settings.clone());
+
+    // A re-start must not leave the previous generation running beside the new one.
+    // This used to be eight `slot.lock().take().stop()` blocks in a hand-maintained
+    // order; `Daemon::stop` owns that now.
+    stop_existing_daemon();
 
     // Machine-readable status (`uperf.state`, M9). The module's watchdog establishes
     // liveness from /proc itself — both our processes are renamed to `uperf`, so the
@@ -158,9 +161,9 @@ pub(crate) unsafe extern "C" fn uperf_rs_start(
     // stale `state=running` with no live process is the documented signature of a kill
     // (which no in-process path survives).
     if let Some(target) = settings.status.as_ref() {
-        crate::status::write(
+        status::write(
             &target.path,
-            &crate::status::Snapshot {
+            &status::Snapshot {
                 state: "running",
                 takeover: settings.cpu_governor,
                 armed: &[],
@@ -168,301 +171,14 @@ pub(crate) unsafe extern "C" fn uperf_rs_start(
             },
         );
     }
-    let (loaded_cfg, mode) = load_config_and_mode(&settings.config_path);
 
-    // Criterion 2 (AGENT.md §1): the config identity and the knob writability
-    // warnings, verbatim. Emitted without the `Rust:` prefix the rewrite's own
-    // diagnostics carry, so they are greppable against an upstream log.
-    if let Some(c) = loaded_cfg.as_ref() {
-        let (name, author) = c.meta_ident();
-        log_msg(&crate::startup_lines::config_line(&name, &author));
-        for line in crate::startup_lines::knob_warnings(&c.sysfs_knob_table(), &crate::startup_lines::real_probe())
-        {
-            log_msg(&line);
-        }
-    }
-
-    // Apply `modules.log.level` (upstream's LogLevelSwitcher). Every shipped
-    // config sets "info"; the logger used to be hardcoded to debug.
-    if let Some(level) = loaded_cfg.as_ref().and_then(|c| c.log_level()) {
-        if let Ok(lv) = std::ffi::CString::new(level.clone()) {
-            // SAFETY: NUL-terminated, read only for the duration of the call.
-            unsafe { crate::ffi::uperf_bridge_set_log_level(lv.as_ptr()) };
-        }
-    }
-    let has_cfg = loaded_cfg.is_some();
-    let cfg_for_governor = loaded_cfg.clone();
-
-    // dfps-rs (mounted from grill-glitch/dfps-rewrite as a subtree at
-    // rust/uperf-core/src/dfps_rs/). Built BEFORE the dispatcher so the
-    // dispatcher can route the five dfps topics into it from the first event.
-    // A missing/broken dfps.txt disables dfps and logs once — uperf itself
-    // still starts.
-    let dfps = {
-        let dfps_path = settings.config_dir.as_ref().map(|d| d.join("dfps.txt"));
-        let table = dfps_path
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|txt| crate::dfps_rs::config::RuleTable::parse(&txt).ok());
-        match table {
-            Some(t) => {
-                let u = t.universal;
-                let minus = t.offscreen;
-                let n = t.rules.len();
-                let sched = crate::dfps_rs::DfpsScheduler::new(t);
-                log_msg(&format!(
-                    "Rust: dfps loaded ({} rules, universal={}/{}, offscreen={}/{})",
-                    n, u.idle, u.active, minus.idle, minus.active
-                ));
-                sched.spawn();
-                log_msg("Rust: dfps timer thread started");
-                let _ = DFPS_SCHED.set(sched.clone());
-                Some(sched)
-            }
-            None => {
-                log_msg(&format!(
-                    "Rust: dfps disabled (no usable '{}')",
-                    dfps_path
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(no config dir)".into())
-                ));
-                None
-            }
-        }
-    };
-
-    {
-        // Queue item ④: the top-app source. The helper's file lives beside the
-        // config (the module's USER_PATH); when it is fresh it drives
-        // `topapp.pkgName`, and the vendored C++ monitor stays the fallback.
-        let foreground = settings.foreground_source();
-        match foreground.as_ref() {
-            Some(f) => log_msg(&format!(
-                "Rust: foreground helper file source = {} (max_age {} ms)",
-                f.path().display(),
-                f.max_age_ms()
-            )),
-            None => log_msg("Rust: foreground helper file source disabled; C++ topapp monitor only"),
-        }
-
-        let mut guard = dispatcher_slot().lock();
-        if let Some(mut prev) = guard.take() {
-            prev.join_timeout(std::time::Duration::from_secs(2));
-        }
-        let orch = match loaded_cfg {
-            Some(c) => Orchestrator::with_config(c, &mode),
-            None => Orchestrator::new(hint::HintDurations::default(), &mode),
-        };
-        let orch = Arc::new(PMutex::new(orch));
-        let _ = ORCHESTRATOR.set(orch.clone());
-        *guard = Some(topic_dispatch::spawn(orch, dfps.clone(), foreground, settings.clone()));
-    }
-
-    let bridge = match BRIDGE.get() {
-        Some(b) => b,
-        None => return 1,
-    };
-    for topic in TOPICS.iter() {
-        bridge.subscribe(topic);
-    }
-
-    // Apply `modules.input.*` to the vendored InputListener. This is the one place
-    // the rewrite reaches into a vendored module, because dfps hardcodes these
-    // three thresholds while uperf reads them (README lines 96-98) — 62 of the 63
-    // configs ask for swipeThd 3x the hardcoded value.
-    if let Some(c) = cfg_for_governor.as_ref() {
-        if c.input_enabled() == Some(false) {
-            log_msg(
-                "Rust: modules.input.enable=false is not honoured (the listener is started by the \
-                 platform layer before the config is parsed)",
-            );
-        }
-        if let Some((swipe, gx, gy)) = c.input_thresholds() {
-            // SAFETY: plain scalars across the C ABI.
-            unsafe { crate::ffi::uperf_bridge_set_input_thresholds(swipe, gx, gy) };
-        }
-    }
-
-    // `modules.atrace.enable` -> open the ftrace trace_marker and toggle the
-    // markers emitted by the vendored ATRACE_* instrumentation.
-    if let Some(c) = cfg_for_governor.as_ref() {
-        if let Some(on) = c.atrace_enabled() {
-            // SAFETY: plain scalar across the C ABI.
-            unsafe { crate::ffi::uperf_bridge_set_atrace(on) };
-        }
-    }
-
-    // Start the userspace CPU governor: samples /proc/stat, runs the power-model
-    // loop and publishes per-cluster frequency targets.
-    if let Some(c) = cfg_for_governor.as_ref() {
-        {
-            let mut guard = cpu_task_slot().lock();
-            if let Some(mut prev) = guard.take() {
-                prev.stop();
-            }
-            *guard = cpu_task::CpuTask::spawn(c, &mode, "idle", &settings);
-        }
-        log_msg("Rust: cpu governor started");
-    }
-
-    // Start the context scheduler (modules.sched): it resolves each process
-    // through the config's rules and applies affinity / SCHED class per thread.
-    if let Some(c) = cfg_for_governor.as_ref() {
-        if c.modules_map().is_some() {
-            let mut log_fn = |m: &str| log_msg(m);
-            if let Some(planner) = sched_task::SchedTask::planner_for(c, &settings, &mut log_fn) {
-                let Some(orch) = ORCHESTRATOR.get().cloned() else {
-                    log_msg("Rust: context scheduler skipped (no orchestrator)");
-                    return 0;
-                };
-                let state = move || {
-                    let g = orch.lock();
-                    (g.current_scene().to_string(), g.top_app().map(str::to_string), g.generation())
-                };
-                let mut guard = sched_task_slot().lock();
-                if let Some(mut prev) = guard.take() {
-                    prev.stop();
-                }
-                *guard = Some(sched_task::SchedTask::spawn(planner, &settings, state));
-                log_msg("Rust: context scheduler started");
-            }
-        }
-    }
-
-    // (dfps-rs is set up above, before the dispatcher, so events route into it
-    // from the first message.)
-
-    // ⑪ (user-appended): the AppOpt FPS **primary** leg — a uprobe on the target app's own
-    // `libgui.so` `queueBuffer`, one probe per thread, so only *that* app's frames are
-    // counted (opt-in `UPERF_SF_UPROBE=1`). While its probe is healthy the ⑤ binder leg
-    // stands down; see `sf_uprobe` and `docs/m11-11-ebpf-uprobe-frame-leg.md`.
-    if let Some(cfg_uprobe) = settings.sf_uprobe.as_ref() {
-        let orch = ORCHESTRATOR.get().cloned();
-        let top = move || orch.as_ref().and_then(|o| o.lock().top_app().map(str::to_string));
-        let mut guard = sf_uprobe_slot().lock();
-        if let Some(mut prev) = guard.take() {
-            prev.stop();
-        }
-        match sf_uprobe::UprobeTask::spawn(cfg_uprobe, top, |m: &str| log_msg(m)) {
-            Some(t) => {
-                log_msg("Rust: sf-uprobe frame source started");
-                *guard = Some(t);
-            }
-            None => log_msg("Rust: sf-uprobe frame source could not start"),
-        }
-    }
-
-    // ⑤: the direct-binder SurfaceFlinger frame source (opt-in
-    // `UPERF_SF_BINDER=1`). The degraded leg for when the M8 injection library is
-    // not there: read SF's `--latency` over binder instead of spawning dumpsys.
-    if let Some(cfg_binder) = settings.sf_binder.as_ref() {
-        let orch = ORCHESTRATOR.get().cloned();
-        let state = move || orch.as_ref().and_then(|o| o.lock().top_app().map(str::to_string));
-        // The degraded leg's one honest assertion: nothing drawn in the window means
-        // the UI is idle. It goes through the same entry the injected hint uses
-        // (`Orchestrator::on_sf_hint`), and the queued scene writes are drained here
-        // because no event-bus message carries this one.
-        let hint_orch = ORCHESTRATOR.get().cloned();
-        let hint_settings = settings.clone();
-        let on_hint = move |h: hint::SfHint| {
-            let Some(o) = hint_orch.as_ref() else { return };
-            if o.lock().on_sf_hint(h) {
-                crate::topic_dispatch::apply_pending(o, &hint_settings);
-            }
-        };
-        let hint_path = settings.config_dir.as_ref().map(|d| d.join("sfanalysis.hint"));
-        let mut guard = sf_binder_slot().lock();
-        if let Some(mut prev) = guard.take() {
-            prev.stop();
-        }
-        match crate::sf_binder::FrameTask::spawn(
-            cfg_binder,
-            hint_path,
-            settings.frames_state.clone(),
-            state,
-            on_hint,
-            |m: &str| log_msg(m),
-        ) {
-            Some(t) => {
-                log_msg("Rust: sf-binder frame source started");
-                *guard = Some(t);
-            }
-            None => log_msg("Rust: sf-binder frame source could not start"),
-        }
-    }
-
-
-    // ⑦ control-plane socket (opt-in `UPERF_CTL_SOCKET`, e.g. `@uperf-ctl`). The daemon
-    // connects out and performs the token/version/pid handshake; with no socket
-    // configured this is a no-op.
-    if let Some(cfg_ctl) = settings.ctl.as_ref() {
-        let mut guard = ctl_slot().lock();
-        if let Some(mut prev) = guard.take() {
-            prev.stop();
-        }
-        match crate::ctl_socket::CtlTask::spawn(
-            cfg_ctl,
-            settings.ctl_token_file.clone(),
-            |m: &str| log_msg(m),
-        ) {
-            Some(t) => *guard = Some(t),
-            None => log_msg("Rust: ctl-socket task could not start"),
-        }
-    }
-
-    // ⑧ recording channel (opt-in `UPERF_RECORD=1`): per-app sessions under
-    // `<USER_PATH>/history/`, kept only past the ≥3 min rule, DEFLATE-compressed,
-    // deduped by pkg+epoch.
-    if let Some(cfg_record) = settings.record.as_ref() {
-        let orch = ORCHESTRATOR.get().cloned();
-        let state = move || match orch.as_ref() {
-            Some(o) => {
-                let g = o.lock();
-                (
-                    g.top_app().map(str::to_string),
-                    g.current_scene().to_string(),
-                )
-            }
-            None => (None, "idle".to_string()),
-        };
-        let mut guard = recorder_slot().lock();
-        if let Some(mut prev) = guard.take() {
-            prev.stop();
-        }
-        match crate::recorder::RecorderTask::spawn(
-            cfg_record,
-            settings.config_dir.clone(),
-            state,
-            |m: &str| log_msg(m),
-        ) {
-            Some(t) => *guard = Some(t),
-            None => log_msg("Rust: recorder task could not start"),
-        }
-    }
-
-    // Start the file watcher: cur_powermode.txt / perapp_powermode.txt preset
-    // switching and the single-byte sfanalysis.hint feed.
-    if let Some(c) = cfg_for_governor.as_ref() {
-        if let Some(orch) = ORCHESTRATOR.get().cloned() {
-            let plan = watch_task::WatchPlan::from_config(c, std::path::Path::new(&settings.config_path));
-            let mut guard = watch_task_slot().lock();
-            if let Some(mut prev) = guard.take() {
-                prev.stop();
-            }
-            *guard = Some(watch_task::WatchTask::spawn(
-                plan,
-                orch,
-                dfps.clone(),
-                &settings,
-                |m: &str| log_msg(m),
-            ));
-            log_msg("Rust: preset/hint watcher started");
-        }
-    }
+    let cfg_path = settings.config_path.clone();
+    let log_path_shown = settings.log_path.clone();
+    let loaded = settings.config_dir.is_some();
+    *daemon_slot().lock() = Some(Daemon::start(settings));
 
     log_msg(&format!(
-        "uperf_rs_start: cfg={} log={} (M4 orchestrator+governor+sched+watch, mode={}, config_loaded={})",
-        settings.config_path, settings.log_path, mode, has_cfg
+        "uperf_rs_start: cfg={cfg_path} log={log_path_shown} (daemon started, config_dir_known={loaded})"
     ));
     0
 }
@@ -471,7 +187,7 @@ pub(crate) unsafe extern "C" fn uperf_rs_start(
 pub(crate) extern "C" fn uperf_rs_reload() {
     log_msg("uperf_rs_reload: re-subscribing");
     if let Some(bridge) = BRIDGE.get() {
-        for topic in TOPICS.iter() {
+        for topic in ffi::TOPICS.iter() {
             bridge.subscribe(topic);
         }
     }
@@ -479,57 +195,8 @@ pub(crate) extern "C" fn uperf_rs_reload() {
 
 #[no_mangle]
 pub(crate) extern "C" fn uperf_rs_stop() {
-    let mut guard = dispatcher_slot().lock();
-    if let Some(mut prev) = guard.take() {
-        prev.join_timeout(std::time::Duration::from_secs(2));
-    }
-    {
-        let mut guard = cpu_task_slot().lock();
-        if let Some(mut t) = guard.take() {
-            t.stop();
-        }
-    }
-    {
-        let mut guard = sched_task_slot().lock();
-        if let Some(mut t) = guard.take() {
-            t.stop();
-        }
-    }
-    {
-        let mut guard = watch_task_slot().lock();
-        if let Some(mut t) = guard.take() {
-            t.stop();
-        }
-    }
-    {
-        let mut guard = sf_uprobe_slot().lock();
-        if let Some(mut t) = guard.take() {
-            t.stop();
-        }
-    }
-    {
-        let mut guard = sf_binder_slot().lock();
-        if let Some(mut t) = guard.take() {
-            t.stop();
-        }
-    }
-    {
-        let mut guard = ctl_slot().lock();
-        if let Some(mut t) = guard.take() {
-            t.stop();
-        }
-    }
-    {
-        let mut guard = recorder_slot().lock();
-        if let Some(mut t) = guard.take() {
-            t.stop();
-        }
-    }
-    // Stop the dfps timer thread. The scheduler itself stays in its OnceLock;
-    // `uperf_rs_start` on a reload replaces the dispatcher's clone.
-    if let Some(s) = DFPS_SCHED.get() {
-        s.stop();
-    }
+    stop_existing_daemon();
+
     // Report the clean stop. Every governor is restored by now (the cpu task's own
     // disarm, or the stop-path fallback in `CpuTask::stop`), so from here on a
     // status file still saying `state=running` means the daemon was killed rather
@@ -538,9 +205,9 @@ pub(crate) extern "C" fn uperf_rs_stop() {
     if let Some(target) = settings.as_ref().and_then(|s| s.status.as_ref()) {
         // Ownership-checked: after a fast restart this write may belong to the
         // previous worker and must not overwrite the new one's `running`.
-        crate::status::write_if_owner(
+        status::write_if_owner(
             &target.path,
-            &crate::status::Snapshot {
+            &status::Snapshot {
                 state: "stopped",
                 takeover: settings.as_ref().is_some_and(|s| s.cpu_governor),
                 armed: &[],
@@ -551,101 +218,36 @@ pub(crate) extern "C" fn uperf_rs_stop() {
     log_msg("uperf_rs_stop: dispatcher joined");
 }
 
+/// Take the daemon out of its slot and stop it.
+///
+/// Idempotent, and safe from any thread: the C++ supervisor can deliver a second
+/// signal while the first stop is still winding down, and the second call must not
+/// deadlock behind the first (the slot lock is only held for the take).
+fn stop_existing_daemon() {
+    if let Some(mut daemon) = daemon_slot().lock().take() {
+        daemon.stop();
+    }
+}
+
 /// The run's knob snapshot, holding the last `uperf_rs_start`. A slot rather than a
 /// constant because `uperf_rs_stop` has no arguments and must still know where the
 /// status file is; `parking_lot::Mutex` keeps the read cheap on the stop path.
-static SETTINGS: OnceLock<PMutex<Option<crate::settings::Settings>>> = OnceLock::new();
+static SETTINGS: OnceLock<PMutex<Option<settings::Settings>>> = OnceLock::new();
 
-fn settings_slot() -> &'static PMutex<Option<crate::settings::Settings>> {
+fn settings_slot() -> &'static PMutex<Option<settings::Settings>> {
     SETTINGS.get_or_init(|| PMutex::new(None))
 }
 
-static DISPATCHER: OnceLock<PMutex<Option<Dispatcher>>> = OnceLock::new();
-static ORCHESTRATOR: OnceLock<Arc<PMutex<Orchestrator>>> = OnceLock::new();
-static CPU_TASK: OnceLock<PMutex<Option<cpu_task::CpuTask>>> = OnceLock::new();
-static SCHED_TASK: OnceLock<PMutex<Option<sched_task::SchedTask>>> = OnceLock::new();
-static WATCH_TASK: OnceLock<PMutex<Option<watch_task::WatchTask>>> = OnceLock::new();
-/// ⑤ direct-binder frame source (opt-in). Held so `uperf_rs_stop` stops its thread.
-static SF_BINDER_TASK: OnceLock<PMutex<Option<sf_binder::FrameTask>>> = OnceLock::new();
-/// ⑦ control-plane socket (opt-in `UPERF_CTL_SOCKET`).
-static CTL_TASK: OnceLock<PMutex<Option<ctl_socket::CtlTask>>> = OnceLock::new();
-/// ⑧ recording channel (opt-in `UPERF_RECORD=1`).
-static RECORDER_TASK: OnceLock<PMutex<Option<recorder::RecorderTask>>> = OnceLock::new();
-/// dfps-rs scheduler, mounted from grill-glitch/dfps-rewrite as a subtree at
-/// `rust/uperf-core/src/dfps_rs/`. Held so `uperf_rs_stop` can stop its timer
-/// thread; the dispatcher holds its own clone.
-static DFPS_SCHED: OnceLock<crate::dfps_rs::DfpsScheduler> = OnceLock::new();
+/// The live daemon: every task, the orchestrator, the dfps scheduler and the
+/// dispatcher. One slot, so "what is running" has exactly one owner — the eight
+/// per-subsystem slots this replaces could (and did) disagree after a re-start.
+static DAEMON: OnceLock<PMutex<Option<Daemon>>> = OnceLock::new();
 
-fn watch_task_slot() -> &'static PMutex<Option<watch_task::WatchTask>> {
-    WATCH_TASK.get_or_init(|| PMutex::new(None))
+fn daemon_slot() -> &'static PMutex<Option<Daemon>> {
+    DAEMON.get_or_init(|| PMutex::new(None))
 }
 
-/// ⑪ uprobe frame leg (opt-in `UPERF_SF_UPROBE=1`).
-static SF_UPROBE_TASK: OnceLock<PMutex<Option<sf_uprobe::UprobeTask>>> = OnceLock::new();
-
-fn sf_uprobe_slot() -> &'static PMutex<Option<sf_uprobe::UprobeTask>> {
-    SF_UPROBE_TASK.get_or_init(|| PMutex::new(None))
-}
-
-fn sf_binder_slot() -> &'static PMutex<Option<sf_binder::FrameTask>> {
-    SF_BINDER_TASK.get_or_init(|| PMutex::new(None))
-}
-
-fn ctl_slot() -> &'static PMutex<Option<ctl_socket::CtlTask>> {
-    CTL_TASK.get_or_init(|| PMutex::new(None))
-}
-
-fn recorder_slot() -> &'static PMutex<Option<recorder::RecorderTask>> {
-    RECORDER_TASK.get_or_init(|| PMutex::new(None))
-}
-
-fn sched_task_slot() -> &'static PMutex<Option<sched_task::SchedTask>> {
-    SCHED_TASK.get_or_init(|| PMutex::new(None))
-}
-
-fn cpu_task_slot() -> &'static PMutex<Option<cpu_task::CpuTask>> {
-    CPU_TASK.get_or_init(|| PMutex::new(None))
-}
-
-/// Read + parse the config and derive the initial preset.
-///
-/// Mode comes from `modules.switcher.switchInode` (default
-/// `/sdcard/Android/yc/uperf/cur_powermode.txt`), matching upstream's
-/// `Preset inode -> '<mode>'` startup behaviour.
-fn load_config_and_mode(cfg_path: &str) -> (Option<uperf_config::Config>, String) {
-    let text = match std::fs::read_to_string(cfg_path) {
-        Ok(t) => t,
-        Err(e) => {
-            log_msg(&format!("Rust: cannot read config '{cfg_path}': {e}"));
-            return (None, "balance".into());
-        }
-    };
-    let cfg = match uperf_config::Config::from_slice(text.as_bytes()) {
-        Ok(c) => c,
-        Err(e) => {
-            log_msg(&format!("Rust: config parse failed: {e}"));
-            return (None, "balance".into());
-        }
-    };
-    let inode = cfg
-        .modules_map()
-        .and_then(|m| m.get("switcher"))
-        .and_then(|s| s.get("switchInode"))
-        .and_then(|p| p.as_str())
-        .unwrap_or("/sdcard/Android/yc/uperf/cur_powermode.txt");
-    let mode = std::fs::read_to_string(inode)
-        .map(|s| s.trim().to_string())
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "balance".into());
-    (Some(cfg), mode)
-}
-
-fn dispatcher_slot() -> &'static PMutex<Option<Dispatcher>> {
-    DISPATCHER.get_or_init(|| PMutex::new(None))
-}
-
-fn log_msg(s: &str) {
+pub(crate) fn log_msg(s: &str) {
     // `try_lock`, not `lock`: this is on the shutdown path, and a signal handler
     // can re-enter that path (SIGTERM plus the supervisor's SIGUSR1). A plain
     // `lock()` deadlocks against itself there and the process never exits,
@@ -665,6 +267,7 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
 #[cfg(test)]
 mod shutdown_reentrancy_tests {
     use super::*;

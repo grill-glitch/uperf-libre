@@ -221,6 +221,21 @@ void uperf_bridge_set_thread_name(const char *name);
 | `libsfanalysis.so`（SF 注入库）→ `libsfanalysis_rs.so` | **Rust 重写** | 见 §12.1 / `docs/spec/sfanalysis.md`；M0..M7 阶段仍使用 vendor 件过渡，M8 起替换 |
 | 外置看门狗 / 状态文件（M9） | **shell + Rust** | `magisk/script/uperf_watchdog.sh`（进程外监督 + 死手恢复 + 预算内重启）、`rust/uperf-core/src/status.rs`（`uperf.state`）；见 §11 M9 与 `docs/m9-watchdog.md` |
 | 运行时旋钮（无上游对应物） | **Rust** | `rust/uperf-core/src/settings.rs`：全部 `UPERF_*` 环境变量在此**一次性**解析成 `Settings`，下游模块只接受参数，不再自己 `std::env::var`。新增旋钮只改这一处 + 传参，见 §13 |
+| 守护进程装配 / 任务生命周期（无上游对应物） | **Rust** | `rust/uperf-core/src/daemon.rs`（谁存在、按什么顺序起停）、`task.rs`（`Task` trait + `Registry`）。停止顺序由注册顺序推导（逆序），**唯一例外**是 CPU governor 按名字先停：userspace 接管是唯一不可由进程内恢复的状态 |
+
+### 6.0 任务生命周期（`Task` / `Registry` / `Daemon`）
+
+新增一路数据源，以前要改五处（static、slot 访问器、start 块、stop 块、任务文件），而 stop 列表是手写的、
+编译器不管——漏一个就是线程活着而 daemon 宣称 `state=stopped`，CPU governor 留在 `userspace`
+（本项目唯一不可自恢复的状态）。现在：
+
+* 任务实现 `Task`（`name` / `stop` / `is_running`），注册进 `Registry`；`stop_all` 按**逆序**停，
+  每步 `is_running()` 断言并把 `task '<name>' stopped` 写进日志（泄漏可见）。
+* `Daemon` 独占 `Settings` / orchestrator / dfps / dispatcher / `Registry`；`uperf_rs_start` 只负责
+  解析 Settings、写 `uperf.state`、`Daemon::start`。新增子系统 = `daemon.rs` 里一个 stage 函数 + 一次 `push`。
+* 所有 stop 一律走 `shutdown::stop_and_join`（有界 join）。`recorder`/`ctl`/`sf-uprobe`/`sf-binder`
+  原先是无界 `join()`，一个卡住的线程就能把停机路径（也就是 disarm 路径）挂死。
+* 事件通道的 sender 现在可替换：再次 start 时旧 receiver 已死，`OnceLock` 会让其后所有事件静默丢进死通道。
 
 ### 6.1 运行时旋钮面（`Settings`）
 
