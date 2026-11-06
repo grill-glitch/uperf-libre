@@ -58,7 +58,12 @@ echo "== watchdog =="
 sed -n '1,6p' $U/uperf_watchdog.state 2>/dev/null | sed 's/^/  /'
 
 echo "== binary identity =="
-echo "  md5 $(md5sum $M/bin/uperf | cut -d' ' -f1) (build d54690cfc05b2d3803da42a0364649fb)"
+# Compared against the manifest, not a hash typed into this script: the hardcoded value
+# went stale on the second build and made a correct install look wrong.
+want=$(awk '$2=="bin/uperf"{print $1}' $MAN)
+got=$(md5sum $M/bin/uperf | cut -d' ' -f1)
+echo "  md5 $(echo "$got" | cut -c1-12)… want $(echo "$want" | cut -c1-12)… (from the zip manifest)"
+[ "$got" = "$want" ] || bad "bin/uperf does not match the zip"
 
 echo "== config =="
 ls -l $U/uperf.json $U/uperf.json.bak $U/uperf.json.default 2>/dev/null | sed 's/^/  /'
