@@ -9,7 +9,9 @@
 :root {
     --top-inset: var(--window-inset-top, 0px);
     --bottom-inset: var(--window-inset-bottom, 0px);
-    --md-focus-ring-color: #00000000;
+    /* Was fully transparent, which removed the keyboard-focus indicator for every
+     * @material/web component. Map it to the accent colour instead. */
+    --md-focus-ring-color: var(--md-sys-color-primary);
 
     --md-sys-color-primary: var(--primary, #6750A4);
     --md-sys-color-on-primary: var(--onPrimary, #FFFFFF);
@@ -18,10 +20,11 @@
     --md-sys-color-secondary: var(--secondary, #625B71);
     --md-sys-color-on-secondary: var(--onSecondary, #FFFFFF);
     --md-sys-color-secondary-container: var(--secondaryContainer, #E8DEF8);
-    --md-sys-color-on-secondary-container: var(--on-secondaryContainer, #4A4458);
+    --md-sys-color-on-secondary-container: var(--onSecondaryContainer, #4A4458);
     --md-sys-color-tertiary: var(--tertiary, #7D5260);
     --md-sys-color-tertiary-container: var(--tertiaryContainer, #FFD8E4);
     --md-sys-color-on-tertiary-container: var(--onTertiaryContainer, #633B48);
+    --md-sys-color-on-tertiary: var(--onTertiary, #FFFFFF);
     --md-sys-color-error: var(--error, #B3261E);
     --md-sys-color-on-error: var(--onError, #FFFFFF);
     --md-sys-color-error-container: var(--errorContainer, #F9DEDC);
@@ -56,7 +59,7 @@
            unreadable. Values are the Material 3 dark baseline. */
         --md-sys-color-on-secondary: var(--onSecondary, #332D41);
         --md-sys-color-secondary-container: var(--secondaryContainer, #4A4458);
-        --md-sys-color-on-secondary-container: var(--on-secondaryContainer, #E8DEF8);
+        --md-sys-color-on-secondary-container: var(--onSecondaryContainer, #E8DEF8);
         --md-sys-color-tertiary: var(--tertiary, #EFB8C8);
         --md-sys-color-tertiary-container: var(--tertiaryContainer, #633B48);
         --md-sys-color-on-tertiary-container: var(--onTertiaryContainer, #FFD8E4);

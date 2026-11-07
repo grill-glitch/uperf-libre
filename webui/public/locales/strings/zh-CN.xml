@@ -23,10 +23,10 @@
     <string name="state_unknown">读取中…</string>
     <string name="state_running">运行中</string>
     <string name="state_stopped">未运行</string>
-    <string name="state_running_detail">pids {pids} · {uptime}</string>
+    <string name="state_running_detail">pids {pids} · 开机 {uptime}</string>
     <string name="section_presets">预设</string>
     <string name="state_stopped_detail">uperf daemon 未在运行</string>
-    <string name="stat_uptime">运行时长</string>
+    <string name="stat_uptime">开机时长</string>
     <string name="stat_pids">守护 PID</string>
     <string name="stat_armed">已接管集群</string>
 
@@ -35,14 +35,14 @@
     <string name="badge_governor_off">未接管调频器</string>
     <string name="badge_info_title">CPU 调频器</string>
     <string name="badge_info_what">「接管」指本模块把每个 CPU policy 的 scaling_governor 换成 userspace，并每周期下发目标频点。不接管时由系统自己的 governor（本机是 schedutil）决定频点。</string>
-    <string name="badge_info_off">当前未接管，这是默认行为：本机 scaling_max_freq 在驱动层就是只读的，所以调频只能走 userspace 全权接管——收益不抵风险，需要显式设置 UPERF_CPU_GOVERNOR=1 才开启。</string>
+    <string name="badge_info_off">当前未接管，调频由平台 governor 负责。uperf 也可以整体接管（UPERF_CPU_GOVERNOR=1），影响面更大，因此默认关闭。</string>
     <string name="badge_info_on">当前已接管。daemon 停止或被杀死时，看门狗会把 governor 还原成接管前记录的值。</string>
     <string name="badge_info_policies">此刻各 policy 的 governor：{policies}</string>
     <string name="badge_info_recorded">接管前记录的原值：{recorded}</string>
 
     <!-- sections -->
     <string name="section_current_config">当前配置</string>
-    <string name="section_supervision">守护</string>
+    <string name="section_supervision">进程监督</string>
     <string name="section_device">设备</string>
     <string name="section_module">模块</string>
     <string name="section_device_module">设备与模块</string>
@@ -71,13 +71,13 @@
     <string name="label_platform">平台层</string>
     <string name="label_license">协议</string>
     <string name="value_unsupported">不支持</string>
-    <string name="attr_text">策略引擎用 Rust 重写，平台层复用 dfps 的 C++。uperf 作者 Matt Yang（yc9559）；dfps 同作者（Apache-2.0，已 vendored）。</string>
+    <string name="attr_text">策略引擎用 Rust 重写，平台层复用 dfps 的 C++。uperf 作者 Matt Yang（yc9559）；dfps 同作者（Apache-2.0，第三方源码已内置）。</string>
 
     <!-- supervision -->
     <string name="label_watchdog_state">看门狗</string>
     <string name="label_watchdog_pid">看门狗 PID</string>
     <string name="label_watchdog_restarts">本次开机重启次数</string>
-    <string name="label_daemon_claim">守护进程自报</string>
+    <string name="label_daemon_claim">守护进程状态文件</string>
     <string name="daemon_claim_killed">已被杀（状态文件是陈旧的）</string>
     <string name="label_frame_source">帧源</string>
     <string name="label_frame_injected">注入次数</string>
@@ -89,7 +89,7 @@
     <string name="state_starting">启动中</string>
     <string name="state_recovering">恢复中</string>
     <string name="state_restarting">重启中</string>
-    <string name="state_restarted">已重启</string>
+    <string name="state_unhealthy">异常</string>
     <string name="state_restart_failed">重启失败</string>
     <string name="state_restored">已恢复</string>
     <string name="state_gave_up">已放弃</string>
@@ -136,7 +136,7 @@
     <string name="dfps_edit_title">{pkg} 的规则</string>
     <string name="dfps_add_title">添加一条规则</string>
     <string name="dfps_note_edit">下次评估规则时生效。规则文件会被整体重写。</string>
-    <string name="dfps_note_add">`*` 表示所有应用，`-` 表示熄屏状态，其余按包名处理。</string>
+    <string name="dfps_note_add">* 表示所有应用，- 表示熄屏状态，其余按包名处理。</string>
     <string name="dfps_field_pkg">包名（*、- 或 com.example.app）</string>
     <string name="dfps_field_idle">待机 Hz</string>
     <string name="dfps_field_active">活动 Hz</string>
@@ -146,6 +146,7 @@
     <!-- log -->
     <string name="log_fullscreen">全屏</string>
     <string name="log_exit_fullscreen">退出全屏</string>
+    <string name="button_exit">退出 WebUI</string>
     <string name="log_wrap">自动换行</string>
     <string name="log_copy">复制到剪贴板</string>
     <string name="log_export">导出为文件</string>

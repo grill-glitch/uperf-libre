@@ -25,13 +25,29 @@ html, body {
     color: var(--md-sys-color-on-background);
     font-family: Roboto, system-ui, -apple-system, "Noto Sans SC", sans-serif;
     -webkit-tap-highlight-color: transparent;
-    overscroll-behavior: none;
+    /* `contain` stops scroll chaining when .content reaches its end; `none` on body/html
+       did not, because they are not the scroller. */
+    overscroll-behavior: contain;
 }
-body.log-open { overflow: hidden; }
+/* The real scroller is `.content` (overflow-y: auto), not body/html: locking the body did
+   nothing for touch/overscroll behind the open log. */
+body.log-open .content { overflow: hidden; }
 
 /* Elements carrying `unresolved` are hidden until the module sets up, which avoids a
    flash of unstyled markup before the first paint. */
 [unresolved] { visibility: hidden; }
+/* Shown when the module script never started (see the inline fallback in index.html). */
+.boot-error {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 12px 16px;
+    background: var(--md-sys-color-error-container);
+    color: var(--md-sys-color-on-error-container);
+    font-size: 14px;
+    z-index: 100;
+}
 /* `hidden` has to win over the component display rules below (`.badge`, `.stat-row`). */
 [hidden] { display: none !important; }
 
@@ -61,6 +77,7 @@ body.log-open { overflow: hidden; }
 .layout {
     display: flex;
     flex-direction: column;
+    height: 100vh;
     height: 100dvh;
     padding-top: var(--top-inset);
 }
@@ -98,7 +115,7 @@ md-icon-button.hidden { display: none; }
 .content {
     flex: 1 1 auto;
     overflow-y: auto;
-    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
 }
 .page { display: none; }
 .page.active { display: block; }

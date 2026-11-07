@@ -63,9 +63,11 @@ for (const name of Object.keys(ICONS)) {
             'utf8',
         );
         const m = svg.match(/viewBox="([^"]+)"/);
-        const d = svg.match(/<path d="([^"]+)"/);
-        if (!m || !d) throw new Error('unexpected svg shape');
-        out.set(name, { viewBox: m[1], d: d[1] });
+        // Every path, and `d` not necessarily first: a glyph with two <path> children was
+        // truncated to one, and an attribute before `d` was reported as an unexpected shape.
+        const ds = [...svg.matchAll(/<path[^>]*\sd="([^"]+)"/g)].map((p) => p[1]);
+        if (!m || !ds.length) throw new Error('unexpected svg shape');
+        out.set(name, { viewBox: m[1], d: ds.join('') });
     } catch (e) {
         missing.push(`${name} (${e.message})`);
     }
@@ -98,7 +100,9 @@ const SCAN_CALLS = ['__icon', 'icon', 'glyph', 'setGlyph'];
 // literals ('node_modules', 'utf8', …) would otherwise be reported as unlisted
 // icon names. Nothing under tools/ renders an icon.
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', '.git', 'tools']);
-const GENERATED = 'icons.js';
+// Absolute path of the file this script writes: comparing basenames excluded *any* file named
+// icons.js anywhere in the tree, letting its icon literals escape the unknown-icon check.
+const GENERATED = join(root, 'icons.js');
 
 function* sourceFiles(dir) {
     for (const entry of readdirSync(dir)) {
@@ -106,7 +110,7 @@ function* sourceFiles(dir) {
         const full = join(dir, entry);
         if (statSync(full).isDirectory()) {
             yield* sourceFiles(full);
-        } else if (SCAN_EXT.has(extname(entry)) && entry !== GENERATED) {
+        } else if (SCAN_EXT.has(extname(entry)) && full !== GENERATED) {
             yield full;
         }
     }
@@ -165,7 +169,9 @@ for (const file of sourceFiles(root)) {
     const where = relative(root, file);
     for (const fn of SCAN_CALLS) {
         for (const args of callArgs(text, fn)) {
-            for (const [, lit] of firstArg(args).matchAll(/'([a-z_0-9]+)'/g)) note(lit, `${where}:${fn}`);
+            // Accept single/double/backtick quotes: a `icon("home")` call was silently skipped
+            // and never validated against ICONS.
+            for (const [, lit] of firstArg(args).matchAll(/['"`]([a-z_0-9]+)['"`]/g)) note(lit, `${where}:${fn}`);
         }
     }
     for (const [, lit] of text.matchAll(/data-icon="([a-z_0-9]+)"/g)) note(lit, `${where}:data-icon`);
@@ -197,7 +203,7 @@ writeFileSync(
     `export const ICONS = {\n${body}\n};\n\n` +
     `/** An inline <svg> string for \`name\`, sized by the surrounding CSS. */\n` +
     `export function icon(name) {\n` +
-    `    const g = ICONS[name];\n` +
+    `    const g = Object.hasOwn(ICONS, name) ? ICONS[name] : null;\n` +
     `    if (!g) throw new Error('unknown icon: ' + name);\n` +
     `    return \`<svg xmlns="http://www.w3.org/2000/svg" viewBox="\${g.viewBox}" fill="currentColor"><path d="\${g.d}"/></svg>\`;\n` +
     `}\n`,

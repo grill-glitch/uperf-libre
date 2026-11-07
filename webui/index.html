@@ -5,19 +5,38 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Uperf</title>
     <!-- The manager serves these two files; every variable they define is also given a
-         literal fallback in theme.css, so the page is still correct with no network. -->
-    <link rel="stylesheet" href="https://mui.kernelsu.org/internal/insets.css">
-    <link rel="stylesheet" href="https://mui.kernelsu.org/internal/colors.css">
+         literal fallback in theme.css, so the page is still correct with no network.
+         Loaded non-blocking: as plain render-blocking links a slow/unreachable CDN stalled
+         first paint until the network timeout, which made the local fallback useless. -->
+    <link rel="stylesheet" href="https://mui.kernelsu.org/internal/insets.css" media="print" onload="this.media='all'">
+    <link rel="stylesheet" href="https://mui.kernelsu.org/internal/colors.css" media="print" onload="this.media='all'">
     <link rel="stylesheet" href="theme.css">
     <link rel="stylesheet" href="styles.css">
     <script src="index.js" type="module"></script>
+    <script>
+        // `[unresolved]` hides the layout until the module script clears it. If that script
+        // fails to load or parse (404 after an update, a WebView without ES modules, an error
+        // before DOMContentLoaded), the app used to sit on the splash forever with no message.
+        window.setTimeout(function () {
+            if (document.querySelector('[unresolved]')) {
+                document.querySelectorAll('[unresolved]').forEach(function (el) {
+                    el.removeAttribute('unresolved');
+                });
+                var note = document.createElement('div');
+                note.className = 'boot-error';
+                note.textContent = 'UI failed to start: check the module log.';
+                document.body.appendChild(note);
+            }
+        }, 5000);
+    </script>
+    <noscript><div class="boot-error">This page needs JavaScript.</div></noscript>
 </head>
 <body>
     <div id="splash" class="splash"><div class="splash-mark" id="splash-mark"></div></div>
 
     <div class="layout" unresolved>
         <div class="top-bar">
-            <md-icon-button id="back-btn" aria-label="exit" class="hidden"><md-icon id="back-icon"></md-icon></md-icon-button>
+            <md-icon-button id="back-btn" aria-label="exit" data-i18n-title="button_exit" class="hidden"><md-icon id="back-icon"></md-icon></md-icon-button>
             <div class="title" id="title">Uperf</div>
             <!-- One action, but it says what it acts on: the label is re-set per tab
                  (route.js) so "refresh" is never a guess about its scope. -->
@@ -67,7 +86,7 @@
 
                     <!-- Static hardware facts are reference material: collapsed by
                          default so the fold belongs to what changes. -->
-                    <button class="disclosure" id="device-toggle" aria-expanded="false" aria-controls="device-body">
+                    <button type="button" class="disclosure" id="device-toggle" aria-expanded="false" aria-controls="device-body">
                         <md-ripple></md-ripple>
                         <md-icon class="glyph s20 dim" id="device-toggle-icon"></md-icon>
                         <span id="device-toggle-label"></span>
@@ -175,16 +194,16 @@
             </div>
         </div>
 
-        <div class="bottom-bar">
-            <div class="bottom-bar-item" id="home" selected>
+        <div class="bottom-bar" role="tablist" aria-label="Sections">
+            <div class="bottom-bar-item" id="home" role="tab" tabindex="0" aria-selected="true" selected>
                 <md-icon class="bottom-icon" data-icon="home"></md-icon>
                 <div class="bottom-bar-item-text" data-i18n="tab_home">Home</div>
             </div>
-            <div class="bottom-bar-item" id="mode">
+            <div class="bottom-bar-item" id="mode" role="tab" tabindex="-1" aria-selected="false">
                 <md-icon class="bottom-icon" data-icon="tune"></md-icon>
                 <div class="bottom-bar-item-text" data-i18n="tab_mode">Mode</div>
             </div>
-            <div class="bottom-bar-item" id="dfps">
+            <div class="bottom-bar-item" id="dfps" role="tab" tabindex="-1" aria-selected="false">
                 <md-icon class="bottom-icon" data-icon="speed"></md-icon>
                 <div class="bottom-bar-item-text" data-i18n="tab_dfps">Refresh rate</div>
             </div>
@@ -227,10 +246,10 @@
                 </div>
                 <div class="dialog-row">
                     <div class="dialog-field">
-                        <md-outlined-text-field id="field-idle" type="number" inputmode="numeric" data-i18n-label="dfps_field_idle"></md-outlined-text-field>
+                        <md-outlined-text-field id="field-idle" type="number" inputmode="numeric" min="1" max="240" step="1" aria-describedby="field-note" data-i18n-label="dfps_field_idle"></md-outlined-text-field>
                     </div>
                     <div class="dialog-field">
-                        <md-outlined-text-field id="field-active" type="number" inputmode="numeric" data-i18n-label="dfps_field_active"></md-outlined-text-field>
+                        <md-outlined-text-field id="field-active" type="number" inputmode="numeric" min="1" max="240" step="1" aria-describedby="field-note" data-i18n-label="dfps_field_active"></md-outlined-text-field>
                     </div>
                 </div>
                 <div class="dialog-note" id="field-note"></div>

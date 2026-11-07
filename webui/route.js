@@ -32,21 +32,29 @@ export function currentTab() {
 /** Shows one page and keeps the bottom bar (and the refresh label) in sync. */
 export function switchTo(tab) {
     const page = PAGES[tab];
-    if (!page) return;
+    if (!page) return false;
     activeTab = tab;
 
     for (const el of document.querySelectorAll('.page')) {
         el.classList.toggle('active', el.id === page.id);
     }
-    document.getElementById('title').textContent = page.title();
+    const title = document.getElementById('title');
+    if (title) title.textContent = page.title();
 
     const refresh = document.getElementById('refresh-label');
     if (refresh) refresh.textContent = getString(REFRESH_LABEL[tab]);
 
     for (const item of document.querySelectorAll('.bottom-bar-item')) {
-        item.toggleAttribute('selected', item.id === tab);
+        const isActive = item.id === tab;
+        item.toggleAttribute('selected', isActive);
+        // The bar is a tablist now: keep the ARIA state and the roving tabindex in sync, or a
+        // screen reader announces the wrong tab and keyboard users can tab to a hidden one.
+        item.setAttribute('aria-selected', String(isActive));
+        item.tabIndex = isActive ? 0 : -1;
     }
-    document.getElementById('content').scrollTop = 0;
+    const content = document.getElementById('content');
+    if (content) content.scrollTop = 0;
+    return true;
 }
 
 /** The manager provides `ksu.exit()`; only show the button when it can work. */
@@ -55,6 +63,7 @@ function setupExitButton() {
         ? () => window.ksu.exit()
         : (typeof window.webui?.exit === 'function' ? () => window.webui.exit() : null);
     const button = document.getElementById('back-btn');
+    if (!button) return;
     if (!exit) {
         button.classList.add('hidden');
         button.onclick = null;
@@ -70,10 +79,19 @@ function setupExitButton() {
 /** `onSwitch` runs on every tab change, so a page can load lazily. */
 export function setupRoute(onSwitch) {
     for (const item of document.querySelectorAll('.bottom-bar-item')) {
-        item.addEventListener('click', () => {
+        const activate = () => {
             if (item.id === activeTab) return;
-            switchTo(item.id);
-            onSwitch?.(item.id);
+            // `switchTo` reports whether the tab exists: `onSwitch` must not fire for a tab
+            // that never became active.
+            if (switchTo(item.id)) onSwitch?.(item.id);
+        };
+        item.addEventListener('click', activate);
+        // Space/Enter, now that the items are role=tab (not real buttons).
+        item.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Enter' || ev.key === ' ') {
+                ev.preventDefault();
+                activate();
+            }
         });
     }
     setupExitButton();

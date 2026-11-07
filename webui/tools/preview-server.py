@@ -78,6 +78,12 @@ def capture(serial, out_dir):
         print(f"  captured {name} ({len(text)} bytes)")
 
 
+def js(value):
+    """JSON for embedding inside a <script> block: `</` would terminate the block early, so
+    a log/config value containing `</script>` could inject markup."""
+    return json.dumps(value).replace("</", "<\\/")
+
+
 def build_bridge(payloads):
     def read(name):
         path = os.path.join(payloads, name)
@@ -102,7 +108,7 @@ def build_bridge(payloads):
     script = """
 <script>
 (function(){
-  var STATE = { preset: %(preset)s, userPath: %(user_path)s, rules: %(rules)s };
+  var STATE = { preset: %(preset)s, userPath: %(user_path)s };
   window.__PREVIEW_LOG = [];
   // The dump is captured verbatim; only `preset.current` is re-derived per call, so a
   // preset write shows up in the next read — the property the page depends on.
@@ -149,7 +155,10 @@ def build_bridge(payloads):
     exec: function(cmd, opts, cb){
       if (typeof opts === 'function') { cb = opts; }
       var r = reply(cmd);
-      setTimeout(function(){ if (typeof window[cb] === 'function') window[cb](r.n, r.o, r.e); }, 0);
+      setTimeout(function(){
+        if (typeof cb === 'function') { cb(r.n, r.o, r.e); return; }
+        if (typeof window[cb] === 'function') { window[cb](r.n, r.o, r.e); }
+      }, 0);
     },
     toast: function(m){ window.__PREVIEW_LOG.push('TOAST: ' + m); console.log('TOAST: ' + m); },
     fullScreen: function(){},
@@ -159,15 +168,14 @@ def build_bridge(payloads):
 })();
 </script>
 """ % {
-        "preset": json.dumps(preset),
-        "user_path": json.dumps(user_path),
-        "rules": json.dumps([p for p in dfps_info.split("rules=")[-1].split("|") if p]),
-        "all": json.dumps(all_text),
-        "log100": json.dumps(log100),
-        "log500": json.dumps(log500),
-        "config": json.dumps(config),
-        "dfps_status": json.dumps(dfps_status.strip() + "\n"),
-        "dfps_info": json.dumps(dfps_info.strip() + "\n"),
+        "preset": js(preset),
+        "user_path": js(user_path),
+        "all": js(all_text),
+        "log100": js(log100),
+        "log500": js(log500),
+        "config": js(config),
+        "dfps_status": js(dfps_status.strip() + "\n"),
+        "dfps_info": js(dfps_info.strip() + "\n"),
     }
     return script.encode()
 
@@ -183,17 +191,28 @@ def make_handler(dist, bridge):
         def send_head(self):
             path = self.translate_path(self.path)
             if os.path.isdir(path):
-                path = os.path.join(path, "index.html")
+                # Either entry point: this preview claims to support both.
+                for name in ("index.html", "index.txt"):
+                    candidate = os.path.join(path, name)
+                    if os.path.isfile(candidate):
+                        path = candidate
+                        break
+                else:
+                    path = os.path.join(path, "index.html")
             if not os.path.isfile(path):
                 self.send_error(404)
                 return None
             with open(path, "rb") as fh:
                 data = fh.read()
             # The manager may serve either entry point, so both get the bridge.
-            if os.path.basename(path) in ("index.html", "index.txt"):
+            injected = os.path.basename(path) in ("index.html", "index.txt")
+            if injected:
                 data = data.replace(b"</head>", bridge + b"</head>", 1)
             self.send_response(200)
-            self.send_header("Content-Type", self.guess_type(path))
+            # `guess_type("index.txt")` is text/plain: the injected page would be shown as
+            # source code instead of rendered HTML.
+            ctype = "text/html; charset=utf-8" if injected else self.guess_type(path)
+            self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -215,7 +234,10 @@ def main():
 
     if args.capture:
         capture(args.serial, args.payloads)
-    if not os.path.isfile(os.path.join(args.dist, "index.html")):
+    # Either entry point counts; `index.txt` is also handled by the handler above.
+    if not any(
+        os.path.isfile(os.path.join(args.dist, name)) for name in ("index.html", "index.txt")
+    ):
         sys.exit(f"preview-server: no built WebUI at {args.dist}; run `npm run build` in webui/")
 
     bridge = build_bridge(args.payloads)

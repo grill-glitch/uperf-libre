@@ -41,15 +41,28 @@ function pickLanguage(preferred) {
     if (preferred && AVAILABLE.includes(preferred)) return preferred;
     const saved = storedLanguage();
     if (saved && AVAILABLE.includes(saved)) return saved;
-    const nav = (navigator.language || 'en').toLowerCase();
+    // `navigator` may be absent (worker/SSR/test) and `navigator.language` is not guaranteed
+    // to be a string.
+    const nav = String(globalThis.navigator?.language || 'en').toLowerCase();
     return nav.startsWith('zh') ? 'zh-CN' : 'en';
 }
 
 export async function loadTranslations(preferred) {
     const code = pickLanguage(preferred);
     const res = await fetch(`./locales/strings/${code}.xml`);
-    if (!res.ok) throw new Error(`locale ${code}: HTTP ${res.status}`);
+    if (!res.ok) {
+        if (code === 'en') throw new Error(`locale ${code}: HTTP ${res.status}`);
+        // Any other locale falls back to the source language instead of leaving the UI on
+        // the previous one (or on raw keys) with an unhandled rejection.
+        return loadTranslations('en');
+    }
     const doc = new DOMParser().parseFromString(await res.text(), 'application/xml');
+    // parseFromString does not throw on malformed XML: it returns a document with a
+    // <parsererror>. Without this check a truncated locale file produced an empty table
+    // that was then committed, and the whole UI rendered raw keys.
+    if (doc.querySelector('parsererror')) {
+        throw new Error(`locale ${code}: malformed XML`);
+    }
     const table = {};
     for (const node of doc.querySelectorAll('string')) {
         table[node.getAttribute('name')] = node.textContent;
@@ -64,9 +77,10 @@ export async function loadTranslations(preferred) {
 export function getString(key, params) {
     let text = strings[key] ?? key;
     if (params) {
-        for (const [name, value] of Object.entries(params)) {
-            text = text.split(`{${name}}`).join(String(value));
-        }
+        // One pass: substituting sequentially let a value that itself contains a
+        // placeholder token be expanded by a later iteration.
+        text = text.replace(/\{([A-Za-z0-9_]+)\}/g, (match, name) =>
+            params[name] !== undefined ? String(params[name]) : match);
     }
     return text;
 }
@@ -74,7 +88,9 @@ export function getString(key, params) {
 /** Fills every element that carries `data-i18n` (and the attribute variants). */
 export function applyStaticTranslations(root = document) {
     for (const el of root.querySelectorAll('[data-i18n]')) {
-        el.textContent = getString(el.dataset.i18n);
+        // `textContent =` replaces every child node: only safe while the element's whole
+        // content is the label (an icon+label control must use `data-i18n-title`).
+        if (el.childElementCount === 0) el.textContent = getString(el.dataset.i18n);
     }
     // Icon-only controls have no room for a label, so their accessible name and their
     // long-press tooltip are set from the same locale key as everything else.
@@ -87,5 +103,8 @@ export function applyStaticTranslations(root = document) {
     for (const el of root.querySelectorAll('[data-i18n-label]')) {
         el.label = getString(el.dataset.i18nLabel);
     }
-    document.documentElement.lang = current;
+    // Resolve the owning document from `root`: a scoped root (dialog, test fixture) must not
+    // mutate the global page.
+    const doc = root.nodeType === Node.DOCUMENT_NODE ? root : root.ownerDocument;
+    if (doc?.documentElement) doc.documentElement.lang = current;
 }

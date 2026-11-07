@@ -13,10 +13,8 @@ import { getString } from './language.js';
 
 /** `<md-icon>` carrying a generated Material Symbols glyph. */
 export function glyph(name, size = 24, extra = '') {
-    const el = document.createElement('md-icon');
-    el.className = `glyph${size === 24 ? '' : ` s${size}`}${extra ? ` ${extra}` : ''}`;
-    el.innerHTML = window.__icon(name);
-    return el;
+    // Delegates: the class/innerHTML construction used to exist twice and could drift.
+    return setGlyph(name, document.createElement('md-icon'), size, extra);
 }
 
 /**
@@ -28,7 +26,18 @@ export function glyph(name, size = 24, extra = '') {
  */
 export function setGlyph(name, el, size = 24, extra = '') {
     if (!el) return el;
-    el.className = `glyph${size === 24 ? '' : ` s${size}`}${extra ? ` ${extra}` : ''}`;
+    // classList, not `className =`: the old form dropped any class the markup already put on
+    // the element (e.g. `<md-icon class="glyph s16" id="…">`).
+    el.classList.add('glyph');
+    el.classList.toggle(`s${size}`, size !== 24);
+    if (extra) {
+        for (const cls of extra.split(' ')) {
+            if (cls) el.classList.add(cls);
+        }
+    }
+    if (typeof window.__icon !== 'function') {
+        throw new Error('window.__icon is not installed (index.js not evaluated?)');
+    }
     el.innerHTML = window.__icon(name);
     return el;
 }
@@ -96,19 +105,35 @@ export function openInfo(titleKey, blocks, params) {
 
 /** Confirmation dialog. `onOk` runs after the dialog closes. */
 export function askConfirm(titleKey, bodyKey, params, onOk) {
+    // Resolve every node once, with a message that names the missing id: an unattributed
+    // `Cannot set properties of null` was the old failure mode.
     const dialog = document.getElementById('confirm-dialog');
-    document.getElementById('confirm-title').textContent = getString(titleKey, params);
-    document.getElementById('confirm-body').textContent = getString(bodyKey, params);
-    document.getElementById('confirm-cancel').onclick = () => dialog.close();
-    document.getElementById('confirm-ok').onclick = () => {
+    const title = document.getElementById('confirm-title');
+    const body = document.getElementById('confirm-body');
+    const cancel = document.getElementById('confirm-cancel');
+    const ok = document.getElementById('confirm-ok');
+    if (!dialog || !title || !body || !cancel || !ok) {
+        throw new Error('confirm dialog markup is incomplete');
+    }
+    title.textContent = getString(titleKey, params);
+    body.textContent = getString(bodyKey, params);
+    cancel.onclick = () => dialog.close();
+    ok.onclick = async () => {
         dialog.close();
-        onOk?.();
+        // `onOk` may be async (the restart path is): a rejection used to become an unhandled
+        // promise rejection inside a DOM handler, with no feedback at all.
+        try {
+            await onOk?.();
+        } catch (err) {
+            window.__toast?.(err instanceof Error ? err.message : String(err));
+        }
     };
-    showDialog('confirm-dialog');
+    dialog.show();
 }
 
 function showDialog(id) {
     const dialog = document.getElementById(id);
+    if (!dialog) throw new Error(`dialog #${id} is missing`);
     dialog.show();
     return dialog;
 }

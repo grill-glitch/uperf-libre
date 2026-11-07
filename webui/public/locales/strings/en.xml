@@ -23,10 +23,10 @@
     <string name="state_unknown">Reading…</string>
     <string name="state_running">Running</string>
     <string name="state_stopped">Not running</string>
-    <string name="state_running_detail">pids {pids} · up {uptime}</string>
+    <string name="state_running_detail">pids {pids} · device up {uptime}</string>
     <string name="section_presets">Presets</string>
     <string name="state_stopped_detail">uperf daemon is not running</string>
-    <string name="stat_uptime">Uptime</string>
+    <string name="stat_uptime">Device uptime</string>
     <string name="stat_pids">Daemon pids</string>
     <string name="stat_armed">Armed clusters</string>
 
@@ -35,7 +35,7 @@
     <string name="badge_governor_off">governor untouched</string>
     <string name="badge_info_title">CPU governor</string>
     <string name="badge_info_what">"Takeover" means this module switches each CPU policy's scaling_governor to userspace and publishes a target frequency every cycle. Without it the platform's own governor (schedutil here) picks frequencies.</string>
-    <string name="badge_info_off">Right now the governor is untouched, which is the default: on this device scaling_max_freq is read-only at the driver level, so tuning can only happen through full userspace takeover — more risk than benefit unless it is asked for explicitly with UPERF_CPU_GOVERNOR=1.</string>
+    <string name="badge_info_off">The platform governor is untouched, so frequency control is left to it. uperf can take the policies over instead (UPERF_CPU_GOVERNOR=1), which is more intrusive and is therefore opt-in.</string>
     <string name="badge_info_on">Right now the governor is taken over. If the daemon stops or is killed, the watchdog restores the value recorded before takeover.</string>
     <string name="badge_info_policies">Current governors: {policies}</string>
     <string name="badge_info_recorded">Recorded before takeover: {recorded}</string>
@@ -89,7 +89,7 @@
     <string name="state_starting">starting</string>
     <string name="state_recovering">recovering</string>
     <string name="state_restarting">restarting</string>
-    <string name="state_restarted">restarted</string>
+    <string name="state_unhealthy">unhealthy</string>
     <string name="state_restart_failed">restart failed</string>
     <string name="state_restored">restored</string>
     <string name="state_gave_up">gave up</string>
@@ -146,6 +146,7 @@
     <!-- log -->
     <string name="log_fullscreen">Full screen</string>
     <string name="log_exit_fullscreen">Exit full screen</string>
+    <string name="button_exit">Exit the WebUI</string>
     <string name="log_wrap">Wrap long lines</string>
     <string name="log_copy">Copy to clipboard</string>
     <string name="log_export">Export to a file</string>

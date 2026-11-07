@@ -75,9 +75,12 @@ function renderHero(data, error) {
         card.classList.remove('ok');
         card.classList.add('down');
         setGlyph('error', document.getElementById('status-icon'), 24);
-        title.textContent = error.includes('ksu is not defined')
+        // Normalise first: an `Error` object has no `.includes`, and the branch meant to
+        // explain a load failure would throw instead, leaving a blank page.
+        const message = error instanceof Error ? error.message : String(error);
+        title.textContent = message.includes('ksu is not defined')
             ? getString('msg_no_ksu')
-            : getString('msg_load_fail', { err: error });
+            : getString('msg_load_fail', { err: message });
         sub.textContent = '';
         badge.hidden = true;
         stats.hidden = true;
@@ -87,7 +90,7 @@ function renderHero(data, error) {
     badge.hidden = false;
     stats.hidden = false;
 
-    const running = Number(data['daemon.count'] || 0) > 0;
+    const running = isDaemonRunning(data);
     card.classList.toggle('ok', running);
     card.classList.toggle('down', !running);
     setGlyph(running ? 'speed' : 'warning', document.getElementById('status-icon'), 24);
@@ -158,7 +161,9 @@ function renderGovernorBadge(data) {
 function renderConfig(data, config, onPresetChanged) {
     kvRows(document.getElementById('config-kv'), [
         [getString('label_config'), basename(data['config.path'])],
-        [getString('label_meta'), config?.meta?.name ?? getString('msg_no_config', { path: `${USER_PATH}/uperf.json` })],
+        // "No config file" only when it is really absent: a loaded config without
+        // `meta.name` used to render that message next to the path row that proves otherwise.
+        [getString('label_meta'), config ? (config.meta?.name ?? '') : getString('msg_no_config', { path: `${USER_PATH}/uperf.json` })],
         [getString('label_sha'), data['config.present'] === '1' ? String(data['config.sha256'] || '').slice(0, 16) : '', { mono: true }],
         [getString('label_path'), data['config.path'], { mono: true }],
     ]);
@@ -192,7 +197,7 @@ function renderConfig(data, config, onPresetChanged) {
  * is in charge on purpose (docs/records/m9-watchdog.md).
  */
 function renderSupervision(data) {
-    const running = Number(data['daemon.count'] || 0) > 0;
+    const running = isDaemonRunning(data);
     const wdState = String(data['watchdog.state'] || '').trim();
     const claim = String(data['daemon.state'] || '').trim();
     const killed = claim === 'running' && !running;
@@ -224,12 +229,30 @@ function renderSupervision(data) {
     kvRows(document.getElementById('supervision-kv'), pairs);
 }
 
+/**
+ * Whether the daemon is running, from one place (the hero and the supervision card used to
+ * duplicate the expression and could disagree).
+ *
+ * `daemon.count` absent is *unknown*, not 0: the old `|| 0` turned a missing sample into the
+ * definite claim "daemon stopped", and a `daemon.state=running` sample was then shown as
+ * "killed" — a fact the data never contained.
+ */
+function isDaemonRunning(data) {
+    const count = data?.['daemon.count'];
+    return count !== undefined && count !== '' && Number(count) > 0;
+}
+
 function renderDeviceModule(data) {
     // ⑩: the module ships arm64-only binaries, so say it rather than let a user
     // wonder why nothing runs.
-    const abi = data['device.abi']
-        ? (data['module.arch_supported'] === '1' ? data['device.abi'] : `${data['device.abi']} (${getString('value_unsupported')})`)
-        : '';
+    // Only an explicit '0' means unsupported: an absent flag is "unknown", and claiming
+    // "unsupported" from a missing field contradicts this file's own rule.
+    let abi = '';
+    if (data['device.abi']) {
+        abi = data['module.arch_supported'] === '0'
+            ? `${data['device.abi']} (${getString('value_unsupported')})`
+            : data['device.abi'];
+    }
 
     kvRows(document.getElementById('device-kv'), [
         [getString('label_model'), (data['device.model'] || '').trim()],

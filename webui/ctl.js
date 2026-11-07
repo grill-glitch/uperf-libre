@@ -32,16 +32,23 @@ export function parseKeyValue(text) {
  * quoting it as well worked, but it made the shipped command differ from the verified
  * one, which is the kind of gap that hides a real mismatch later.
  */
-async function ctl(subcommand, ...args) {
-    const parts = [`sh ${SCRIPT}`, subcommand, ...args.map(shellQuote)];
+async function runScript(script, subcommand, ...args) {
+    // One runner for both device scripts: the two copies were byte-identical apart from the
+    // path, so any quoting/timeout fix had to be made twice (and silently diverged).
+    const parts = [`sh ${script}`, subcommand, ...args.map(shellQuote)];
     const result = await exec(parts.join(' '));
     const err = (result.stderr || '').trim();
-    // The script always prints its verdict on stdout, so a non-zero exit without any
-    // output is the case that means "the shell bridge itself failed".
+    // The script always prints its verdict on stdout, so a non-zero exit without any output
+    // is the case that means "the shell bridge itself failed". Keep the stderr either way: a
+    // partial result followed by a failure must not look like a clean run.
     if (result.errno !== 0 && !result.stdout) {
         throw new Error(err || `exit ${result.errno}`);
     }
-    return result;
+    return { ...result, stderr: err };
+}
+
+async function ctl(subcommand, ...args) {
+    return runScript(SCRIPT, subcommand, ...args);
 }
 
 export async function readInfo() {
@@ -69,7 +76,18 @@ export async function readConfig() {
     if (result.errno !== 0) {
         throw new Error((result.stderr || '').trim() || `exit ${result.errno}`);
     }
-    return JSON.parse(result.stdout);
+    // A truncated/invalid file surfaced as a raw `SyntaxError` from deep inside the bridge
+    // call, and a `null`/array body then blew up at the first property access.
+    let config;
+    try {
+        config = JSON.parse(result.stdout);
+    } catch (e) {
+        throw new Error(`cannot parse ${USER_PATH}/uperf.json: ${e.message}`);
+    }
+    if (!config || typeof config !== 'object' || Array.isArray(config)) {
+        throw new Error(`${USER_PATH}/uperf.json is not a JSON object`);
+    }
+    return config;
 }
 
 export async function setPreset(name) {
@@ -77,7 +95,11 @@ export async function setPreset(name) {
 }
 
 export async function readLog(lines) {
-    return (await ctl('log', String(lines))).stdout;
+    // `undefined`/`NaN` used to reach the shell as `-n undefined`, which either fails
+    // opaquely or silently returns the whole file.
+    const n = Number(lines);
+    if (!Number.isInteger(n) || n <= 0) throw new Error(`invalid line count: ${lines}`);
+    return (await ctl('log', String(n))).stdout;
 }
 
 /**
@@ -97,13 +119,7 @@ export async function restart() {
 
 /** dfps control entry — same `key=value` protocol as webui.sh. */
 async function dfpsCtl(subcommand, ...args) {
-    const parts = [`sh ${DFPS_SCRIPT}`, subcommand, ...args.map(shellQuote)];
-    const result = await exec(parts.join(' '));
-    const err = (result.stderr || '').trim();
-    if (result.errno !== 0 && !result.stdout) {
-        throw new Error(err || `exit ${result.errno}`);
-    }
-    return result;
+    return runScript(DFPS_SCRIPT, subcommand, ...args);
 }
 
 export async function dfpsStatus() {
@@ -120,6 +136,13 @@ export async function setRule(pkg, idle, active) {
 
 /** Opens a URL through Android, with a WebView fallback. */
 export async function openUrl(url) {
-    const result = await exec(`am start -a android.intent.action.VIEW -d ${shellQuote(url)}`);
-    return result.errno === 0;
+    // `exec` can reject (bridge unavailable, KSU permission error): that used to escape as an
+    // opaque unhandled rejection. `am start` also exits 0 when nothing resolves the intent, so
+    // the boolean only means "the command ran".
+    try {
+        const result = await exec(`am start -a android.intent.action.VIEW -d ${shellQuote(url)}`);
+        return result.errno === 0;
+    } catch (e) {
+        throw new Error(`cannot open URL: ${e instanceof Error ? e.message : String(e)}`);
+    }
 }

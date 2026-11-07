@@ -29,9 +29,13 @@ async function load() {
     }
     try {
         state.config = await readConfig();
-    } catch {
-        // Keep the previously parsed config: a transient read failure should not empty
-        // the preset list. When there has never been one, `mode.js` says so.
+        state.configError = '';
+    } catch (err) {
+        // Keep the previously parsed config: a transient read failure should not empty the
+        // preset list. When there has never been one, `mode.js` says so — but record the
+        // reason so "stale config" is distinguishable from "no config".
+        state.configError = err instanceof Error ? err.message : String(err);
+        console.warn('config read failed', err);
     }
 }
 
@@ -42,16 +46,29 @@ async function reload() {
 }
 
 async function render() {
-    home.render(state.data, state.config, state.error, reload);
-    mode.render(state.data, state.config, reload);
-    dfps.render(state.data, state.config, reload);
-    // `more.js` owns the confirmation dialog; it only needs the action itself.
-    more.render(state.data, doRestart);
+    // Isolate the pages: one throwing renderer used to abort the rest and propagate out of
+    // `reload()`, leaving a half-updated UI plus an unhandled rejection.
+    const pages = [
+        ['home', () => home.render(state.data, state.config, state.error, reload)],
+        ['mode', () => mode.render(state.data, state.config, reload)],
+        ['dfps', () => dfps.render(state.data, state.config, reload)],
+        // `more.js` owns the confirmation dialog; it only needs the action itself.
+        ['more', () => more.render(state.data, doRestart)],
+    ];
+    for (const [name, draw] of pages) {
+        try {
+            draw();
+        } catch (err) {
+            console.error(`render ${name} failed`, err);
+        }
+    }
 }
 
 window.__rerender = () => {
     applyStaticTranslations();
-    render();
+    // `render()` may return a rejected promise from an async page; swallow it here so callers
+    // in other modules do not produce unhandled rejections.
+    Promise.resolve(render()).catch((err) => console.error('render failed', err));
 };
 
 async function doRestart() {
@@ -64,8 +81,42 @@ async function doRestart() {
         }
         toast(getString('toast_restart_ok'));
     } catch (err) {
-        toast(getString('toast_restart_fail', { err: err.message }));
+        toast(getString('toast_restart_fail', { err: err instanceof Error ? err.message : String(err) }));
     }
+    await reload();
+}
+
+/** Startup sequence, separated so the splash teardown can live in a `finally`. */
+async function startApp() {
+    try {
+        await loadTranslations();
+    } catch {
+        // Falling back to the key names is ugly but beats an empty page.
+    }
+    applyStaticTranslations();
+    more.setupLogControls();
+
+    setupRoute(async (tab) => {
+        if (tab !== 'more') return;
+        try {
+            await more.refreshLog();
+        } catch (err) {
+            window.__toast?.(err instanceof Error ? err.message : String(err));
+        }
+    });
+
+    const refreshBtn = document.getElementById('refresh-btn');
+    if (refreshBtn) {
+        refreshBtn.onclick = async () => {
+            try {
+                await reload();
+                if (currentTab() === 'more') await more.refreshLog();
+            } catch (err) {
+                window.__toast?.(err instanceof Error ? err.message : String(err));
+            }
+        };
+    }
+
     await reload();
 }
 
@@ -90,27 +141,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     const splash = document.getElementById('splash');
     setTimeout(() => document.getElementById('splash-mark')?.classList.add('show'), 20);
 
+    // Everything below can throw (a missing node, a rejected read). Without the `finally`,
+    // the splash overlay stayed on screen forever and the app looked hung.
     try {
-        await loadTranslations();
-    } catch {
-        // Falling back to the key names is ugly but beats an empty page.
+        await startApp();
+    } catch (err) {
+        console.error('startup failed', err);
+        window.__toast?.(err instanceof Error ? err.message : String(err));
+    } finally {
+        if (splash) {
+            setTimeout(() => splash.classList.add('exit'), 50);
+            setTimeout(() => splash.remove(), 400);
+        }
     }
-    applyStaticTranslations();
-    more.setupLogControls();
 
-    setupRoute(async (tab) => {
-        if (tab === 'more') await more.refreshLog();
-    });
-
-    document.getElementById('refresh-btn').onclick = async () => {
-        await reload();
-        if (currentTab() === 'more') await more.refreshLog();
-    };
-
-    await reload();
-
-    if (splash) {
-        setTimeout(() => splash.classList.add('exit'), 50);
-        setTimeout(() => splash.remove(), 400);
-    }
 });

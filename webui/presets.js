@@ -52,9 +52,14 @@ export function presetNames(config) {
     return [AUTO, ...known, ...rest];
 }
 
+/** One preset write at a time: a module-level guard, so a second tap is a no-op. */
+let inFlight = false;
+
 /** True when `name` is a preset the loaded config defines (so not `auto`). */
 export function isDefinedPreset(config, name) {
-    return Boolean(config && config.presets && name in config.presets);
+    // `in` walks the prototype chain, so `toString`/`constructor`/`valueOf` looked like
+    // presets the config defines.
+    return Boolean(config && config.presets && Object.prototype.hasOwnProperty.call(config.presets, name));
 }
 
 /**
@@ -65,17 +70,29 @@ export function isDefinedPreset(config, name) {
  */
 export async function applyPreset(name, el, onChanged) {
     if (el?.getAttribute('aria-current') === 'true') return;
+    // Real in-flight guard, not the cosmetic `busy` class: two rapid taps on different rows
+    // used to run two writes concurrently (last writer wins, UI reads from a race).
+    if (inFlight) return;
+    inFlight = true;
     el?.classList.add('busy');
     try {
         const result = await setPreset(name);
         if (result['preset.ok'] !== '1') {
             throw new Error(result['preset.error'] || 'write failed');
         }
-        window.__toast(getString('toast_preset_ok', { name: presetLabel(name) }));
+        // Success toast and refresh *outside* the write's error handling: a failing refresh
+        // used to be reported as a failed write (the user saw both a success and a failure).
+        window.__toast?.(getString('toast_preset_ok', { name: presetLabel(name) }));
+    } catch (err) {
+        window.__toast?.(getString('toast_preset_fail', { err: err instanceof Error ? err.message : String(err) }));
+        return;
+    } finally {
+        inFlight = false;
+        el?.classList.remove('busy');
+    }
+    try {
         await onChanged?.();
     } catch (err) {
-        window.__toast(getString('toast_preset_fail', { err: err.message }));
-    } finally {
-        el?.classList.remove('busy');
+        console.warn('reload after preset change failed', err);
     }
 }

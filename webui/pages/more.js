@@ -13,6 +13,8 @@ import { glyph, setGlyph, askConfirm } from '../ui.js';
 
 const LOG_STEPS = [100, 500, 2000];
 let logLines = 100;
+/// Monotonic id of the newest log read; a response with an older id is dropped.
+let logRequest = 0;
 let logMeta = { lines: '', path: '' };
 let exported = '';
 
@@ -83,8 +85,20 @@ function addLink(container, iconEl, label, value, url) {
 /** Two locales, so a tap toggles; a longer list would need a picker dialog. */
 async function cycleLanguage() {
     const list = availableLanguages();
+    // `% 0` is NaN and `loadTranslations(undefined)` would run if the list were ever empty;
+    // with one locale the tap silently reloads the same language and shows a pointless toast.
+    if (list.length < 2) {
+        window.__toast(currentLanguage());
+        return;
+    }
     const next = list[(list.indexOf(currentLanguage()) + 1) % list.length];
-    await loadTranslations(next);
+    try {
+        await loadTranslations(next);
+    } catch (err) {
+        // A failed fetch used to become an unhandled rejection with the UI half-switched.
+        window.__toast(err instanceof Error ? err.message : String(err));
+        return;
+    }
     applyStaticTranslations();
     window.__rerender();
     window.__toast(next);
@@ -92,12 +106,18 @@ async function cycleLanguage() {
 
 export async function refreshLog() {
     const view = document.getElementById('log-view');
+    if (!view) return;
     view.textContent = getString('msg_loading');
+    // Request token: rapid step changes or repeated taps left several reads in flight, and a
+    // slower earlier response could overwrite a newer (or fresher) one.
+    const request = ++logRequest;
     try {
         const text = await readLog(logLines);
+        if (request !== logRequest) return;
         view.textContent = text.trim() ? text : getString('msg_no_log');
     } catch (err) {
-        view.textContent = err.message;
+        if (request !== logRequest) return;
+        view.textContent = err instanceof Error ? err.message : String(err);
     }
 }
 
@@ -125,7 +145,12 @@ export function setupLogControls() {
             refreshLog();
         };
     }
-    document.getElementById('log-wrap').onclick = toggleWrap;
+    const wrapButton = document.getElementById('log-wrap');
+    wrapButton.onclick = toggleWrap;
+    // The markup starts with wrapping on; without this the button's `active` state started
+    // out wrong and the first tap turned wrapping *off* while the button turned on.
+    const logView = document.getElementById('log-view');
+    if (logView) wrapButton.toggleAttribute('active', logView.classList.contains('wrap'));
     document.getElementById('log-copy').onclick = copyLog;
     document.getElementById('log-export').onclick = exportLogFile;
     document.getElementById('log-fullscreen').onclick = toggleFullscreen;
@@ -195,8 +220,12 @@ async function writeClipboard(text) {
     } catch {
         /* fall through */
     }
+    // The hidden node must be removed on every path: a locked-down WebView throws in
+    // `select()`/`execCommand`, and the old code returned from `catch` with a full log still
+    // attached to the document (a new one per failed copy).
+    let area = null;
     try {
-        const area = document.createElement('textarea');
+        area = document.createElement('textarea');
         area.value = text;
         area.setAttribute('readonly', '');
         area.style.position = 'fixed';
@@ -204,11 +233,11 @@ async function writeClipboard(text) {
         area.style.opacity = '0';
         document.body.append(area);
         area.select();
-        const ok = document.execCommand('copy');
-        area.remove();
-        return ok;
+        return document.execCommand('copy');
     } catch {
         return false;
+    } finally {
+        area?.remove();
     }
 }
 

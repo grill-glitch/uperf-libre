@@ -29,8 +29,8 @@ async function refresh() {
     let status;
     let info;
     try {
-        status = await dfpsStatus();
-        info = await dfpsInfo();
+        // Independent shell round-trips: serially awaiting them doubled every refresh.
+        [status, info] = await Promise.all([dfpsStatus(), dfpsInfo()]);
     } catch (e) {
         document.getElementById('dfps-cur').textContent = '—';
         document.getElementById('dfps-config-path').textContent = '';
@@ -40,7 +40,11 @@ async function refresh() {
         return;
     }
 
-    document.getElementById('dfps-cur').textContent = (status['cur'] || '—') + (status['cur'] ? ' Hz' : '');
+    // `dfps.sh status` prints `(none)`/`(empty)` when dfps_cur.txt is missing or empty: those
+    // were rendered as "(none) Hz" instead of the placeholder.
+    const cur = status['cur'];
+    const hasCur = Boolean(cur) && cur !== '(none)' && cur !== '(empty)';
+    document.getElementById('dfps-cur').textContent = hasCur ? `${cur} Hz` : '—';
     document.getElementById('dfps-config-path').textContent = status['config.path'] || '';
 
     // The script packs the rule file into `pkg idle active|pkg idle active|…`. A line
@@ -66,6 +70,13 @@ async function refresh() {
     document.getElementById('dfps-rule-count').textContent = String(rules.length);
 }
 
+/** Icon for a rule row: the two special tokens, else a normal app. */
+function packageIcon(pkg) {
+    if (pkg === '*') return 'all_inclusive';
+    if (pkg === '-') return 'bedtime';
+    return 'apps';
+}
+
 function packageLabel(pkg) {
     if (pkg === '*') return getString('dfps_any_app');
     if (pkg === '-') return getString('dfps_offscreen');
@@ -78,7 +89,7 @@ function ruleRow(rule) {
     row.dataset.pkg = rule.pkg;
     row.setAttribute('role', 'button');
     row.append(document.createElement('md-ripple'));
-    row.append(glyph(rule.pkg === '*' ? 'all_inclusive' : rule.pkg === '-' ? 'bedtime' : 'apps', 22, 'dim'));
+    row.append(glyph(packageIcon(rule.pkg), 22, 'dim'));
 
     const text = document.createElement('div');
     text.className = 'rule-text';
@@ -150,7 +161,11 @@ async function save() {
     const idle = document.getElementById('field-idle').value.trim();
     const active = document.getElementById('field-active').value.trim();
 
-    if (!pkg) {
+    // dfps.sh writes the value verbatim as `pkg idle active` and also uses it in a grep
+    // pattern: whitespace splits the line, a pipe breaks the `info` encoding, and regex
+    // metacharacters match the wrong rule. Only a real package name or the two special
+    // tokens may pass.
+    if (!/^(?:[A-Za-z0-9._:]+|\*|-)$/.test(pkg)) {
         window.__toast(getString('dfps_err_pkg'));
         return;
     }

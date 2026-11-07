@@ -13,24 +13,33 @@
 import { getString } from '../language.js';
 import { glyph, setGlyph, openInfo } from '../ui.js';
 import { USER_PATH } from '../ctl.js';
-import { AUTO, presetLabel, presetNames, isDefinedPreset, applyPreset } from '../presets.js';
+import { AUTO, presetLabel, presetNames, applyPreset } from '../presets.js';
+
+/** The power-mode file the daemon and `powercfg_main.sh` share. */
+const MODE_FILE = 'cur_powermode.txt';
 
 /** Set by `render`; the row click needs the app's reload-and-redraw callback. */
 let onChanged = null;
 
 export function render(data, config, onPresetChanged) {
-    const current = data['preset.present'] === '1' ? data['preset.current'] : '';
-    onChanged = onPresetChanged;
+    // Optional chaining: `render(undefined, …)` used to throw before the "no mode set"
+    // fallback below could run, leaving the tab blank.
+    const current = data?.['preset.present'] === '1' ? data['preset.current'] : '';
+    // Only overwrite when a callback is supplied, so a later render without one cannot leave
+    // row clicks silently re-rendering nothing.
+    if (onPresetChanged) onChanged = onPresetChanged;
 
     setGlyph('info', document.getElementById('mode-info-icon'), 16);
     document.getElementById('mode-info').onclick = () => openInfo('mode_info_title', [
         { text: 'mode_info_what' },
         { text: 'mode_hint_auto' },
         { text: 'mode_info_preset' },
-        { text: 'mode_info_file', params: { path: `${USER_PATH}/cur_powermode.txt` } },
+        { text: 'mode_info_file', params: { path: `${USER_PATH}/${MODE_FILE}` } },
     ]);
 
     const list = document.getElementById('preset-list');
+    list.setAttribute('role', 'radiogroup');
+    list.setAttribute('aria-label', getString('tab_mode'));
     list.textContent = '';
 
     // A value the config does not define can still be in the file (a config was swapped
@@ -44,7 +53,7 @@ export function render(data, config, onPresetChanged) {
     }
 
     document.getElementById('mode-note').textContent = config
-        ? getString('mode_hint_inode', { path: `${USER_PATH}/cur_powermode.txt` })
+        ? getString('mode_hint_inode', { path: `${USER_PATH}/${MODE_FILE}` })
         : getString('msg_no_config', { path: `${USER_PATH}/uperf.json` });
 }
 
@@ -52,7 +61,19 @@ function modeRow(name, current, config) {
     const row = document.createElement('div');
     row.className = 'preset';
     row.setAttribute('role', 'radio');
+    // `aria-current` is what `applyPreset` uses for the "already selected" check; `aria-checked`
+    // is what a screen reader announces for a radio (aria-current is not a valid radio state).
     row.setAttribute('aria-current', String(name === current));
+    row.setAttribute('aria-checked', String(name === current));
+    // Keyboard reachable: the rows are divs, so without this they cannot be focused or
+    // activated at all (roving tabindex: only the selected row is in the tab order).
+    row.tabIndex = name === current ? 0 : -1;
+    row.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+            ev.preventDefault();
+            applyPreset(name, row, onChanged);
+        }
+    });
     row.dataset.preset = name;
     row.append(document.createElement('md-ripple'));
     row.append(glyph(name === current ? 'check_circle' : 'radio_button_unchecked', 22, 'sel'));
@@ -66,12 +87,12 @@ function modeRow(name, current, config) {
 
     // Only `auto` needs a line of its own, and only when the config is loaded: the
     // generic "defined by the loaded config" subtitle said nothing about any row.
-    if (config === undefined) {
+    if (!config) {
+        // Covers both `undefined` (config read failed) and `null`. The old chain let a null
+        // config fall through every branch and show no badge at all.
         text.append(subLine('preset_undefined'));
     } else if (name === AUTO) {
         text.append(subLine('mode_hint_auto'));
-    } else if (config && !isDefinedPreset(config, name)) {
-        text.append(subLine('preset_undefined'));
     }
     row.append(text);
     row.onclick = () => applyPreset(name, row, onChanged);
