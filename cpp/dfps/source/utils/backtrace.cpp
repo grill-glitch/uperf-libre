@@ -14,165 +14,227 @@
  * limitations under the License.
  */
 
+// Crash handler.
+//
+// Everything reachable from here runs in signal context, where only async-signal-safe
+// functions are legal. The previous implementation called spdlog (mutex + malloc + file
+// I/O), std::string, __cxa_demangle (malloc) and exit() (atexit + stdio flush) from the
+// handler — a crash inside the allocator or while the log mutex was held deadlocked the
+// process instead of reporting it. This version formats into a static buffer with hand
+// rolled integer conversion and emits it with write(2); frames are raw addresses, which are
+// symbolised offline (the tombstone path still gives symbolised traces on Android).
+
 #include "backtrace.h"
 #include "frame_pointer_trace.h"
-#include <cxxabi.h>
-#include <dlfcn.h>
 #include <signal.h>
-#include <spdlog/spdlog.h>
-#include <string>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <unwind.h>
 
+namespace {
+
 constexpr size_t MAX_FRAMES = 64;
+constexpr size_t CRASH_BUF_SIZE = 4096;
+// Leave room for one frame line even if a write fails.
+constexpr size_t CRASH_BUF_LOW_WATER = CRASH_BUF_SIZE - 128;
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wpadded"
+char g_buf[CRASH_BUF_SIZE];
+size_t g_len = 0;
+volatile sig_atomic_t g_signal = 0;
 
-struct UnwindClang {
-    size_t frame_num;
-    ucontext_t *uc;
-    uintptr_t prev_pc;
-    uintptr_t prev_sp;
+void Flush(void) {
+    size_t off = 0;
+    while (off < g_len) {
+        auto n = write(STDERR_FILENO, g_buf + off, g_len - off);
+        if (n <= 0) {
+            break;
+        }
+        off += static_cast<size_t>(n);
+    }
+    g_len = 0;
+}
+
+void AppendChar(char c) {
+    if (g_len < CRASH_BUF_SIZE) {
+        g_buf[g_len++] = c;
+    }
+}
+
+void AppendStr(const char *s) {
+    while (*s != '\0') {
+        AppendChar(*s++);
+    }
+}
+
+void AppendHex(uintptr_t v) {
+    char tmp[2 * sizeof(uintptr_t)];
+    int n = 0;
+    do {
+        int digit = static_cast<int>(v & 0xf);
+        tmp[n++] = static_cast<char>(digit < 10 ? '0' + digit : 'a' + digit - 10);
+        v >>= 4;
+    } while (v != 0);
+    while (n > 0) {
+        AppendChar(tmp[--n]);
+    }
+}
+
+void AppendDec(unsigned int v) {
+    char tmp[10];
+    int n = 0;
+    do {
+        tmp[n++] = static_cast<char>('0' + v % 10);
+        v /= 10;
+    } while (v != 0);
+    while (n > 0) {
+        AppendChar(tmp[--n]);
+    }
+}
+
+struct UnwindState {
+    size_t frame;
+    // Skip everything until the interrupted PC/LR is reached: the frames above it are the
+    // signal trampoline and this handler, which are noise for the reader.
     uintptr_t sig_pc;
     uintptr_t sig_lr;
-    int found_sig_pc;
+    bool found;
+    uintptr_t prev_pc;
+    uintptr_t prev_sp;
 };
 
-#pragma clang diagnostic pop
+_Unwind_Reason_Code UnwindCallback(struct _Unwind_Context *ctx, void *arg) {
+    auto *self = static_cast<UnwindState *>(arg);
+    auto pc = static_cast<uintptr_t>(_Unwind_GetIP(ctx));
+    auto sp = static_cast<uintptr_t>(_Unwind_GetCFA(ctx));
 
-std::string Demangle(const char *mangled) {
-    std::string str = mangled;
-    int status = 0;
-    char *demangled = __cxxabiv1::__cxa_demangle(mangled, 0, 0, &status);
-    if (demangled) {
-        str = demangled;
-        free(demangled);
-    }
-    return str;
-}
-
-int RecordFrameClang(UnwindClang *self, uintptr_t pc) {
-    Dl_info info;
-    uintptr_t addr;
-    std::string symbol;
-
-    // append line for current frame
-    if (0 == dladdr((void *)pc, &info) || (uintptr_t)info.dli_fbase > pc) {
-        addr = pc;
-        symbol = "?";
-    } else {
-        addr = pc - (uintptr_t)info.dli_fbase;
-        if (NULL == info.dli_fname || '\0' == info.dli_fname[0]) {
-            symbol = fmt::format("<anonymous:{:#x}>", (uintptr_t)info.dli_fbase);
+    if (!self->found) {
+        // pc may be the interrupted PC itself or one instruction past it.
+        if ((self->sig_pc != 0 && pc >= self->sig_pc - 4 && pc <= self->sig_pc + 4) ||
+            (self->sig_lr != 0 && pc >= self->sig_lr - 4 && pc <= self->sig_lr + 4)) {
+            self->found = true;
         } else {
-            if (NULL == info.dli_sname || '\0' == info.dli_sname[0]) {
-                symbol = fmt::format("{} (?)", info.dli_fname);
-            } else {
-                if (0 == (uintptr_t)info.dli_saddr || (uintptr_t)info.dli_saddr > pc) {
-                    symbol = fmt::format("{} ({})", info.dli_fname, Demangle(info.dli_sname));
-                } else {
-                    symbol = fmt::format("{} ({}+{:#x})", info.dli_fname, Demangle(info.dli_sname),
-                                         pc - (uintptr_t)info.dli_saddr);
-                }
-            }
-        }
-    }
-    SPDLOG_ERROR("#{:02}: {:#016x} {}", self->frame_num, addr, symbol);
-
-    // check unwinding limit
-    self->frame_num++;
-    if (self->frame_num >= MAX_FRAMES) {
-        return 1;
-    }
-
-    return 0;
-}
-
-static _Unwind_Reason_Code UnwindClangCallback(struct _Unwind_Context *unw_ctx, void *arg) {
-    UnwindClang *self = (UnwindClang *)arg;
-    uintptr_t pc = _Unwind_GetIP(unw_ctx);
-    uintptr_t sp = _Unwind_GetCFA(unw_ctx);
-
-    if (0 == self->found_sig_pc) {
-        if ((self->sig_pc >= sizeof(uintptr_t) && pc <= self->sig_pc + sizeof(uintptr_t) &&
-             pc >= self->sig_pc - sizeof(uintptr_t)) ||
-            (self->sig_lr >= sizeof(uintptr_t) && pc <= self->sig_lr + sizeof(uintptr_t) &&
-             pc >= self->sig_lr - sizeof(uintptr_t))) {
-            self->found_sig_pc = 1;
-        } else {
-            return _URC_NO_REASON; // skip and continue
+            return _URC_NO_REASON;
         }
     }
 
-    if (self->frame_num > 0 && pc == self->prev_pc && sp == self->prev_sp) {
-        return _URC_END_OF_STACK; // stop
+    if (self->frame > 0 && pc == self->prev_pc && sp == self->prev_sp) {
+        return _URC_END_OF_STACK;
     }
 
-    if (0 != RecordFrameClang(self, pc)) {
-        return _URC_END_OF_STACK; // stop
+    AppendStr("  #");
+    if (self->frame < 10) {
+        AppendChar('0');
+    }
+    AppendDec(static_cast<unsigned int>(self->frame));
+    AppendStr(" 0x");
+    AppendHex(pc);
+    AppendChar('\n');
+    if (g_len >= CRASH_BUF_LOW_WATER) {
+        Flush();
     }
 
     self->prev_pc = pc;
     self->prev_sp = sp;
-
-    return _URC_NO_REASON; // continue
+    if (++self->frame >= MAX_FRAMES) {
+        return _URC_END_OF_STACK;
+    }
+    return _URC_NO_REASON;
 }
 
-void DumpBacktraceClang(ucontext_t *uc) {
-    UnwindClang self;
-    memset(&self, 0, sizeof(UnwindClang));
-    self.uc = uc;
+} // namespace
 
-    // Trying to get LR for x86 and x86_64 on local unwind is usually
-    // leads to access unmapped memory, which will crash the process immediately.
-#if defined(__arm__)
-    self.sig_pc = (uintptr_t)uc->uc_mcontext.arm_pc;
-    self.sig_lr = (uintptr_t)uc->uc_mcontext.arm_lr;
-#elif defined(__aarch64__)
-    self.sig_pc = (uintptr_t)uc->uc_mcontext.pc;
-    self.sig_lr = (uintptr_t)uc->uc_mcontext.regs[30];
-#elif defined(__i386__)
-    self.sig_pc = (uintptr_t)uc->uc_mcontext.gregs[REG_EIP];
-#elif defined(__x86_64__)
-    self.sig_pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+void DumpBacktrace(const ucontext_t *uc) {
+    UnwindState self{};
+#if defined(__aarch64__)
+    if (uc != nullptr) {
+        self.sig_pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
+        self.sig_lr = static_cast<uintptr_t>(uc->uc_mcontext.regs[30]);
+    }
+#elif defined(__arm__)
+    if (uc != nullptr) {
+        self.sig_pc = static_cast<uintptr_t>(uc->uc_mcontext.arm_pc);
+        self.sig_lr = static_cast<uintptr_t>(uc->uc_mcontext.arm_lr);
+    }
 #endif
-
-    SPDLOG_ERROR("Unwind backtrace:");
-    _Unwind_Backtrace(UnwindClangCallback, &self);
-}
-
-void DumpBacktraceFramePointer(ucontext_t *uc) {
-    void *pointers[MAX_FRAMES];
-    auto len = trace_stackframepointers(pointers, MAX_FRAMES, 0);
-
-    SPDLOG_ERROR("Framepointer backtrace:");
-    for (size_t i = 0; i < len; ++i) {
-        SPDLOG_ERROR("#{:02}: {:#016x}", i, (uintptr_t)pointers[i]);
+    AppendStr("Unwind backtrace (raw addresses):\n");
+    _Unwind_Backtrace(UnwindCallback, &self);
+    // A frame-pointer walk is the fallback when the unwinder produced nothing usable; it
+    // never allocates, so it is safe here too.
+    if (self.frame == 0) {
+        void *pointers[MAX_FRAMES];
+        auto len = trace_stackframepointers(pointers, MAX_FRAMES, 1);
+        AppendStr("Framepointer backtrace (raw addresses):\n");
+        for (size_t i = 0; i < len; ++i) {
+            AppendStr("  #");
+            if (i < 10) {
+                AppendChar('0');
+            }
+            AppendDec(static_cast<unsigned int>(i));
+            AppendStr(" 0x");
+            AppendHex(reinterpret_cast<uintptr_t>(pointers[i]));
+            AppendChar('\n');
+            if (g_len >= CRASH_BUF_LOW_WATER) {
+                Flush();
+            }
+        }
     }
 }
 
-void DumpBacktrace(ucontext_t *uc) {
-    DumpBacktraceClang(uc);
-    // DumpBacktraceFramePointer(uc);
-}
+namespace {
 
 void CrashSignalHandler(int sig, siginfo_t *si, void *uc) {
-    SPDLOG_ERROR("Receive signal {}, terminated", sig);
-    DumpBacktrace(reinterpret_cast<ucontext_t *>(uc));
-    exit(EXIT_FAILURE);
+    g_signal = sig;
+    g_len = 0;
+    AppendStr("\n*** uperf: fatal signal ");
+    AppendDec(static_cast<unsigned int>(sig));
+    AppendStr(" ***\n");
+    if (si != nullptr) {
+        AppendStr("fault addr 0x");
+        AppendHex(reinterpret_cast<uintptr_t>(si->si_addr));
+        AppendChar('\n');
+    }
+    Flush();
+    DumpBacktrace(static_cast<const ucontext_t *>(uc));
+    Flush();
+    AppendStr("*** end of backtrace (symbolise offline) ***\n");
+    Flush();
+
+    // Re-raise with the default disposition so the exit status and core-dump behaviour are
+    // the ones a crash should produce (exit() would have run atexit handlers and flushed
+    // stdio, neither of which is async-signal-safe).
+    signal(sig, SIG_DFL);
+    raise(sig);
+    _exit(EXIT_FAILURE);
 }
 
+} // namespace
+
 void SetDumpBacktraceAsCrashHandler(void) {
-    int crashSignals[] = {SIGILL, SIGABRT, SIGFPE, SIGSEGV, SIGBUS, SIGSYS};
+    static const int crashSignals[] = {SIGILL, SIGABRT, SIGFPE, SIGSEGV, SIGBUS, SIGSYS};
+    // A stack-overflow SIGSEGV cannot run a handler on the exhausted stack: without an
+    // alternate stack + SA_ONSTACK the backtrace was simply lost.
+    // Fixed size: SIGSTKSZ is a sysconf() call (i.e. a VLA) on some libcs.
+    constexpr size_t ALT_STACK_SIZE = 64 * 1024;
+    static char altStack[ALT_STACK_SIZE];
+    stack_t ss;
+    memset(&ss, 0, sizeof(ss));
+    ss.ss_sp = altStack;
+    ss.ss_size = ALT_STACK_SIZE;
+    ss.ss_flags = 0;
+    bool onStack = sigaltstack(&ss, nullptr) == 0;
 
     struct sigaction act;
     memset(&act, 0, sizeof(act));
     sigfillset(&act.sa_mask);
     act.sa_sigaction = CrashSignalHandler;
-    act.sa_flags = SA_RESTART | SA_SIGINFO;
+    act.sa_flags = SA_RESTART | SA_SIGINFO | (onStack ? SA_ONSTACK : 0);
 
-    for (int i = 0; i < sizeof(crashSignals) / sizeof(int); ++i) {
-        sigaction(crashSignals[i], &act, nullptr);
+    for (int sig : crashSignals) {
+        if (sigaction(sig, &act, nullptr) != 0) {
+            // Not in signal context: the normal logger is fine here.
+            const char msg[] = "uperf: cannot install the crash handler\n";
+            (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        }
     }
 }

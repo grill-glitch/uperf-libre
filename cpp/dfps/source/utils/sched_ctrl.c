@@ -14,7 +14,15 @@
  * limitations under the License.
  */
 
+// SCHED_NORMAL / SCHED_BATCH / SCHED_IDLE / SCHED_RESET_ON_FORK are GNU extensions: a C
+// translation unit only sees them when _GNU_SOURCE is defined before the first system
+// header (C++ TUs get it from the compiler driver).
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "sched_ctrl.h"
+#include <errno.h>
 #include <sys/capability.h>
 #include <sys/resource.h>
 
@@ -33,7 +41,13 @@ int SchedCtrlGetStaticPrio(int tid) {
 
     switch (sched_getscheduler(tid)) {
         case SCHED_NORMAL: {
+            // getpriority() returns -1 both for a real nice of -1 and on error: clear
+            // errno first so the two can be told apart.
+            errno = 0;
             int nice = getpriority(PRIO_PROCESS, tid);
+            if (errno != 0) {
+                return -1;
+            }
             prio = NORMAL_PRIO + nice;
             break;
         }
@@ -43,12 +57,20 @@ int SchedCtrlGetStaticPrio(int tid) {
         case SCHED_IDLE:
             prio = IDLE_PRIO;
             break;
+        case SCHED_DEADLINE:
+            // No meaningful static priority: sched_getparam() reports 0, which would map to
+            // 99 here and cannot be fed back into SchedCtrlSetStaticPrio().
+            return -1;
         case SCHED_FIFO:
-        case SCHED_RR:
-        case SCHED_DEADLINE: {
-            struct sched_param param;
-            sched_getparam(tid, &param);
+        case SCHED_RR: {
+            struct sched_param param = {0};
+            if (sched_getparam(tid, &param) != 0) {
+                return -1;
+            }
             prio = MAX_RT_PRIO - param.sched_priority;
+            if (prio < MIN_RT_PRIO) {
+                prio = MIN_RT_PRIO; // kernel prio 99 is outside the logical range
+            }
             break;
         }
         default:
@@ -59,32 +81,41 @@ int SchedCtrlGetStaticPrio(int tid) {
 }
 
 int SchedCtrlSetSchedClass(int tid, int policy, int prio) {
-    struct sched_param param;
+    struct sched_param param = {0};
     param.sched_priority = prio;
     return sched_setscheduler(tid, policy, &param);
 }
 
-static int SetNormStaticPrio(int tid, int prio) {
-    int ret = SchedCtrlSetSchedClass(tid, SCHED_NORMAL, 0);
+static int SetNormStaticPrio(int tid, int prio, bool reset_on_fork) {
+    int policy = SCHED_NORMAL;
+    if (reset_on_fork) {
+        // Without this the normal-priority path silently ignored the caller's request.
+        policy |= SCHED_RESET_ON_FORK;
+    }
+    int ret = SchedCtrlSetSchedClass(tid, policy, 0);
     if (ret) {
         return ret;
     }
     return setpriority(PRIO_PROCESS, tid, prio - NORMAL_PRIO);
 }
 
-int SchedCtrlSetStaticPrio(int tid, int prio, bool resetOnFork) {
-    if (MIN_RT_PRIO <= prio && prio <= MAX_RT_PRIO) {
+int SchedCtrlSetStaticPrio(int tid, int prio, bool reset_on_fork) {
+    // Logical 1..98 maps to kernel RT 98..1: 99 would map to kernel priority 0, which
+    // sched_setscheduler() rejects with EINVAL.
+    if (MIN_RT_PRIO <= prio && prio <= MAX_RT_PRIO - 1) {
         int policy = SCHED_FIFO;
-        if (resetOnFork) {
+        if (reset_on_fork) {
             policy |= SCHED_RESET_ON_FORK;
         }
         return SchedCtrlSetSchedClass(tid, policy, MAX_RT_PRIO - prio);
     }
 
     if (MIN_NORM_PRIO <= prio && prio <= MAX_NORM_PRIO) {
-        return SetNormStaticPrio(tid, prio);
+        return SetNormStaticPrio(tid, prio, reset_on_fork);
     }
 
+    // Uniform failure mode: the other entry points return -1 with errno set.
+    errno = EINVAL;
     return -1;
 }
 

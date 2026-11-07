@@ -16,27 +16,60 @@
 
 #include "misc_android.h"
 #include "utils/misc.h"
+#include <atomic>
 #include <cstring>
 #include <dirent.h>
 #include <stdlib.h>
+#include <string>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
-static int androidOsVersion;
+// -1 = "not read yet": 0 is a legitimate value and used to be indistinguishable from the
+// uninitialised cache.
+static std::atomic<int> androidOsVersion{-1};
 
 int GetOSVersion(void) {
-    if (androidOsVersion) {
-        return androidOsVersion;
+    int cached = androidOsVersion.load(std::memory_order_relaxed);
+    if (cached >= 0) {
+        return cached;
     }
 
-    char version[PROP_VALUE_MAX + 1];
-    __system_property_get("ro.build.version.release", version);
-    androidOsVersion = atoi(version);
+    char version[PROP_VALUE_MAX + 1] = {};
+    // Some bionic versions return 0 without touching the buffer when the property is
+    // absent, so an initialised buffer and a checked length are both required.
+    if (__system_property_get("ro.build.version.release", version) <= 0) {
+        return 0;
+    }
+    int parsed = atoi(version);
+    if (parsed <= 0) {
+        return 0;
+    }
+    androidOsVersion.store(parsed, std::memory_order_relaxed);
+    return parsed;
+}
 
-    return androidOsVersion;
+/// Extract `<package>` from a `<pid>:<package>/<uid>` token that ends at `tokenEnd`.
+static std::string PackageFromPidToken(const std::string &buf, size_t tokenEnd) {
+    if (tokenEnd == 0 || tokenEnd > buf.size()) {
+        return {};
+    }
+    // rfind from tokenEnd - 1: the character at tokenEnd is usually the separating space.
+    auto space = buf.rfind(' ', tokenEnd - 1);
+    auto tokenStart = (space == std::string::npos) ? 0 : space + 1;
+    auto colon = buf.find(':', tokenStart);
+    if (colon == std::string::npos || colon >= tokenEnd) {
+        return {};
+    }
+    auto pkgStart = colon + 1;
+    auto slash = buf.find('/', pkgStart);
+    auto pkgEnd = (slash == std::string::npos || slash > tokenEnd) ? tokenEnd : slash;
+    if (pkgEnd <= pkgStart) {
+        return {};
+    }
+    return buf.substr(pkgStart, pkgEnd - pkgStart);
 }
 
 std::string GetTopAppNameDumpsysAndroid7(void) {
@@ -53,25 +86,12 @@ std::string GetTopAppNameDumpsysAndroid7(void) {
     }
 
     constexpr char TA_KEYWORD[] = " (top-activity)";
-    char *topappName = strstr(buf.data(), TA_KEYWORD);
-    if (topappName == nullptr) {
+    auto keyword = buf.find(TA_KEYWORD);
+    if (keyword == std::string::npos) {
         return {};
     }
-    topappName--;
-    while (topappName > buf.data() && *topappName != ' ') {
-        topappName--;
-    }
-    while (topappName < buf.data() + buf.size() && *topappName != ':') {
-        topappName++;
-    }
-    topappName++;
-
-    char *end = std::min(strchr(topappName, '/'), strchr(topappName, ':'));
-    if (end == nullptr) {
-        return {};
-    }
-    *end = '\0';
-    return topappName;
+    // The keyword starts with the space that ends the pid/package token.
+    return PackageFromPidToken(buf, keyword);
 }
 
 std::string GetTopAppNameDumpsysAndroid10(void) {
@@ -86,22 +106,19 @@ std::string GetTopAppNameDumpsysAndroid10(void) {
     }
 
     constexpr char TA_KEYWORD[] = " TOP";
-    char *topappName = strstr(buf.data(), TA_KEYWORD);
-    if (topappName == nullptr) {
+    auto keyword = buf.find(TA_KEYWORD);
+    if (keyword == std::string::npos) {
         return {};
     }
-
-    while (topappName < buf.data() + buf.size() && *topappName != ':') {
-        topappName++;
-    }
-    topappName++;
-
-    char *end = std::min(strchr(topappName, '/'), strchr(topappName, ':'));
-    if (end == nullptr) {
+    auto colon = buf.find(':', keyword);
+    if (colon == std::string::npos) {
         return {};
     }
-    *end = '\0';
-    return topappName;
+    auto tokenEnd = buf.find_first_of(" \n", colon);
+    if (tokenEnd == std::string::npos) {
+        tokenEnd = buf.size();
+    }
+    return PackageFromPidToken(buf, tokenEnd);
 }
 
 std::string GetTopAppNameDumpsys(void) {
@@ -127,26 +144,25 @@ std::string GetHomePackageName(void) {
     }
 
     constexpr char KEYWORD[] = "packageName=";
-    char *home = strstr(buf.data(), KEYWORD);
-    if (home == nullptr) {
+    auto pos = buf.find(KEYWORD);
+    if (pos == std::string::npos) {
         return {};
     }
-
-    home += sizeof(KEYWORD) - 1; // no '\0'
-    char *end = strchr(home, '\n');
-    if (end == nullptr) {
-        return {};
+    auto valueStart = pos + sizeof(KEYWORD) - 1; // no '\0'
+    auto valueEnd = buf.find_first_of("\r\n", valueStart);
+    if (valueEnd == std::string::npos) {
+        valueEnd = buf.size();
     }
-
-    *end = '\0';
-    return home;
+    return buf.substr(valueStart, valueEnd - valueStart);
 }
 
 std::string GetTombstone(int pid) {
     constexpr char TOMBSTONE_DIR[] = "/data/tombstones";
     constexpr int TOMBSTONE_HEAD_LINES = 8;
+    // Tombstones can be several MB; the recovery path only needs the crash header + trace.
+    constexpr std::size_t TOMBSTONE_MAX_BYTES = 512 * 1024;
 
-    if (access(TOMBSTONE_DIR, F_OK) != 0) {
+    if (pid <= 0 || access(TOMBSTONE_DIR, F_OK) != 0) {
         return {};
     }
 
@@ -157,6 +173,11 @@ std::string GetTombstone(int pid) {
 
     // get the latest tombstone
     DIR *tsfp = opendir(TOMBSTONE_DIR);
+    if (tsfp == nullptr) {
+        // access(F_OK) succeeding does not guarantee opendir() will (SELinux denial, fd
+        // exhaustion, directory replaced in between) and readdir(nullptr) crashes.
+        return {};
+    }
     struct dirent *dp;
     while ((dp = readdir(tsfp))) {
         // skip . and ..
@@ -165,7 +186,9 @@ std::string GetTombstone(int pid) {
         }
         snprintf(path, sizeof(path), "%s/%s", TOMBSTONE_DIR, dp->d_name);
         if (stat(path, &st) == 0) {
-            int64_t ts = st.st_mtim.tv_sec * 1e9 + st.st_mtim.tv_nsec;
+            // Integer arithmetic: `tv_sec * 1e9` promoted to double and lost the nanoseconds
+            // (the product is far outside 2^53).
+            auto ts = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000LL + st.st_mtim.tv_nsec;
             if (ts > latestTs) {
                 latest = path;
                 latestTs = ts;
@@ -186,13 +209,14 @@ std::string GetTombstone(int pid) {
     char buf[512];
     bool isThisFile = false;
     for (int i = 0; i < TOMBSTONE_HEAD_LINES; ++i) {
-        if (feof(fp))
+        // fgets() returning NULL leaves `buf` untouched, so sscanf() would parse the
+        // previous iteration's line and could match the wrong pid.
+        if (fgets(buf, sizeof(buf), fp) == nullptr) {
             break;
+        }
         // pid: 17096, tid: 17098, name: unwind  >>> ./unwind <<<
         int owner_pid = 0;
-        fgets(buf, sizeof(buf), fp);
-        sscanf(buf, "%*s %d", &owner_pid);
-        if (owner_pid == pid) {
+        if (sscanf(buf, "%*s %d", &owner_pid) == 1 && owner_pid == pid) {
             isThisFile = true;
             break;
         }
@@ -204,9 +228,14 @@ std::string GetTombstone(int pid) {
 
     std::string bt;
     rewind(fp);
-    while (feof(fp) == false) {
-        fgets(buf, sizeof(buf), fp);
+    // Loop on the read result, not feof(): the old loop appended the last line twice and, on
+    // a read error, appended stale data forever.
+    while (fgets(buf, sizeof(buf), fp) != nullptr) {
         bt += buf;
+        if (bt.size() >= TOMBSTONE_MAX_BYTES) {
+            bt += "\n[uperf: tombstone truncated]\n";
+            break;
+        }
     }
 
     fclose(fp);
@@ -235,17 +264,25 @@ void SyncCallSurfaceflingerBackdoor(const char *code, const char *hz) {
     ExecCmdSync(nullptr, "/system/bin/service", "call", "SurfaceFlinger", code, "i32", hz);
 }
 
-void SysPeakRefreshRate(const std::string &hz, bool force) {
+void SysPeakRefreshRate(const std::string &hz) {
+    // Validate here rather than in every caller: an empty/non-numeric value is written
+    // straight into the system settings by `cmd settings put`.
+    int parsed = 0;
+    if (!ParseInt(hz.c_str(), &parsed) || parsed <= 0 || parsed > 240) {
+        return;
+    }
     CallSettingsPut("system", "peak_refresh_rate", hz.c_str());
     CallSettingsPut("system", "min_refresh_rate", hz.c_str());
     CallSettingsPut("system", "miui_refresh_rate", hz.c_str());
     CallSettingsPut("secure", "miui_refresh_rate", hz.c_str());
 }
 
-void SysSurfaceflingerBackdoor(const std::string &idx, bool force) {
+void SysSurfaceflingerBackdoor(int configIndex, bool force) {
     // >= Android 10
     // 1035 -1/0/1/2: setActiveConfig
-    SyncCallSurfaceflingerBackdoor("1035", idx.c_str());
+    char idx[16];
+    snprintf(idx, sizeof(idx), "%d", configIndex);
+    SyncCallSurfaceflingerBackdoor("1035", idx);
 
     if (force) {
         // >= Android 11
@@ -257,6 +294,6 @@ void SysSurfaceflingerBackdoor(const std::string &idx, bool force) {
         SyncCallSurfaceflingerBackdoor("1036", "1");
         SyncCallSurfaceflingerBackdoor("1035", "-1");
         SyncCallSurfaceflingerBackdoor("1036", "0");
-        SyncCallSurfaceflingerBackdoor("1035", idx.c_str());
+        SyncCallSurfaceflingerBackdoor("1035", idx);
     }
 }

@@ -27,9 +27,18 @@
 // THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// gettid()/pthread_getattr_np() are GNU extensions; in a C translation unit they are only
+// declared with _GNU_SOURCE (C++ TUs get it from the compiler driver).
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <unistd.h>
+
+#include "frame_pointer_trace.h"
 
 #if defined(__arm__) && defined(__GNUC__) && !defined(__clang__)
 // GCC and LLVM generate slightly different frames on ARM, see
@@ -40,17 +49,19 @@ const size_t kStackFrameAdjustment = sizeof(uintptr_t);
 const size_t kStackFrameAdjustment = 0;
 #endif
 
-uintptr_t get_nextstackframe(uintptr_t fp) {
+// Implementation details: `static` so the generic names cannot collide at link time with
+// another translation unit (this project links several objects into one binary).
+static uintptr_t get_nextstackframe(uintptr_t fp) {
     const uintptr_t *fp_addr = (const uintptr_t *)(fp);
     return fp_addr[0] - kStackFrameAdjustment;
 }
 
-uintptr_t get_stackframepc(uintptr_t fp) {
+static uintptr_t get_stackframepc(uintptr_t fp) {
     const uintptr_t *fp_addr = (const uintptr_t *)(fp);
     return fp_addr[1];
 }
 
-bool is_stackframe_valid(uintptr_t fp, uintptr_t prev_fp, uintptr_t stack_end) {
+static bool is_stackframe_valid(uintptr_t fp, uintptr_t prev_fp, uintptr_t stack_end) {
     // With the stack growing downwards, older stack frame must be
     // at a greater address that the current one.
     if (fp <= prev_fp)
@@ -62,8 +73,10 @@ bool is_stackframe_valid(uintptr_t fp, uintptr_t prev_fp, uintptr_t stack_end) {
     if (fp & (sizeof(uintptr_t) - 1))
         return false;
     if (stack_end) {
-        // Both fp[0] and fp[1] must be within the stack.
-        if (fp > stack_end - 2 * sizeof(uintptr_t))
+        // Both fp[0] and fp[1] must be within the stack. Compare from the other direction:
+        // `stack_end - 2 * sizeof(uintptr_t)` underflows for a degenerate (short) stack and
+        // the upper-bound check then passes against a huge value.
+        if (stack_end < 2 * sizeof(uintptr_t) || fp > stack_end - 2 * sizeof(uintptr_t))
             return false;
         // Additional check to filter out false positives.
         if (get_stackframepc(fp) < 32768)
@@ -72,7 +85,7 @@ bool is_stackframe_valid(uintptr_t fp, uintptr_t prev_fp, uintptr_t stack_end) {
     return true;
 }
 
-uintptr_t get_stackend() {
+static uintptr_t get_stackend() {
     // Bionic reads proc/maps on every call to pthread_getattr_np() when called
     // from the main thread. So we need to cache end of stack in that case to get
     // acceptable performance.
@@ -83,15 +96,20 @@ uintptr_t get_stackend() {
     if (is_main_thread && main_stack_end) {
         return main_stack_end;
     }
-    uintptr_t stack_begin = 0;
+    // pthread_attr_getstack() takes a `void **`: writing a pointer through a `uintptr_t *`
+    // cast is a strict-aliasing violation.
+    void *stack_begin = NULL;
     size_t stack_size = 0;
     pthread_attr_t attributes;
     int error = pthread_getattr_np(pthread_self(), &attributes);
     if (!error) {
-        error = pthread_attr_getstack(&attributes, (void **)(&stack_begin), &stack_size);
+        error = pthread_attr_getstack(&attributes, &stack_begin, &stack_size);
         pthread_attr_destroy(&attributes);
     }
-    uintptr_t stack_end = stack_begin + stack_size;
+    if (error) {
+        return 0;
+    }
+    uintptr_t stack_end = (uintptr_t)stack_begin + stack_size;
     if (is_main_thread) {
         main_stack_end = stack_end;
     }
@@ -99,11 +117,21 @@ uintptr_t get_stackend() {
 }
 
 size_t trace_stackframepointers(void **out_trace, size_t max_depth, size_t skip_initial) {
+    // Guard the output buffer: the loop below writes `out_trace[depth]` unconditionally.
+    if (out_trace == NULL || max_depth == 0) {
+        return 0;
+    }
     // Usage of __builtin_frame_address() enables frame pointers in this
     // function even if they are not enabled globally. So 'fp' will always
     // be valid.
     uintptr_t fp = (uintptr_t)(__builtin_frame_address(0)) - kStackFrameAdjustment;
     uintptr_t stack_end = get_stackend();
+    if (stack_end == 0) {
+        // Without the stack boundary every frame check is skipped and the unwinder walks an
+        // arbitrary frame-pointer chain — inside a crash handler that turns a recoverable
+        // failure into a secondary crash.
+        return 0;
+    }
     size_t depth = 0;
     while (depth < max_depth) {
         if (skip_initial != 0) {
