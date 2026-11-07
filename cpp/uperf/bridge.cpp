@@ -34,7 +34,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -50,8 +52,9 @@ void uperf_rs_init(const uperf_bridge_t *bridge);
 //  Rust → C++ log sink: forward bytes to spdlog at INFO level
 // ---------------------------------------------------------------------------
 
-static std::string log_prefix; // reserved for future per-tag routing
-
+// Nothing here may let a C++ exception cross the FFI boundary: Rust declares these as plain
+// `extern "C"` functions and unwinding through them is undefined behaviour. Every entry
+// point below is wrapped.
 // `uperf_bridge_write_log`: forward bytes to spdlog at INFO level.
 // The original v3 binary's spdlog pattern is "%H:%M:%S %L %v" (no logger name) —
 // keep the same. The argument identifies the originating Rust module so we can
@@ -59,19 +62,26 @@ static std::string log_prefix; // reserved for future per-tag routing
 // schema-specific code. Tag "" means default and matches the original's bare
 // output.
 extern "C" void uperf_bridge_write_log(const char *tag, const char *msg, size_t len) {
+    // `tag` may be null/empty; `msg` is exactly `len` bytes and need not be NUL-terminated.
     if (msg == nullptr || len == 0) {
         return;
     }
-    std::string line(msg, msg + len);
-    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-        line.pop_back();
-    }
-    if (tag == nullptr || *tag == '\0') {
-        SPDLOG_INFO("{}", line);
-    } else {
-        // spdlog default pattern (%v) does NOT include %n; we prefix the tag
-        // manually so the original's grep-by-class-name workflow keeps working.
-        SPDLOG_INFO("[{}] {}", tag, line);
+    try {
+        std::string line(msg, msg + len);
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+            line.pop_back();
+        }
+        if (tag == nullptr || *tag == '\0') {
+            SPDLOG_INFO("{}", line);
+        } else {
+            // spdlog default pattern (%v) does NOT include %n; we prefix the tag
+            // manually so the original's grep-by-class-name workflow keeps working.
+            SPDLOG_INFO("[{}] {}", tag, line);
+        }
+    } catch (const std::exception &e) {
+        SPDLOG_ERROR("write_log failed: {}", e.what());
+    } catch (...) {
+        SPDLOG_ERROR("write_log failed with an unknown exception");
     }
 }
 
@@ -85,8 +95,9 @@ extern "C" void uperf_bridge_write_log(const char *tag, const char *msg, size_t 
 
 namespace {
 
-// Output payloads live in these per-call scratch buffers; they are valid for the
-// duration of `uperf_rs_on_event` (AGENT.md §5.1 lifetime rule).
+// Output payloads live in these per-thread scratch buffers, valid only for the duration of
+// `uperf_rs_on_event` (AGENT.md §5.1): the Rust side copies before returning (`to_vec()`),
+// and a re-entrant publish on the same thread would overwrite them.
 
 struct PidListBuf {
     std::vector<int32_t> storage;
@@ -177,7 +188,25 @@ void install_subscribers(void) {
 // never sees C++ objects — `subscribe` here just records "Rust is interested"
 // and the dispatcher forwards every event we install above.
 
-int g_subscribers_installed = 0;
+// Every topic this bridge can deliver. Rust asks for them by name, so a typo must be
+// reported instead of silently producing a stream of no events.
+constexpr const char *KNOWN_TOPICS[] = {
+    "input.touch",       "input.btn",          "input.state",     "topapp.pkgName",
+    "offscreen.state",   "cgroup.ta.list",     "cgroup.fg.list",  "cgroup.bg.list",
+    "cgroup.re.list",    "cgroup.ta.update",   "cgroup.fg.update", "cgroup.bg.update",
+    "cgroup.re.update",
+};
+
+bool IsKnownTopic(const char *topic) {
+    for (const auto *known : KNOWN_TOPICS) {
+        if (strcmp(known, topic) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::once_flag g_installOnce;
 
 } // namespace
 
@@ -185,11 +214,21 @@ extern "C" int uperf_bridge_subscribe(const char *topic) {
     if (topic == nullptr) {
         return -1;
     }
-    if (g_subscribers_installed == 0) {
-        install_subscribers();
-        g_subscribers_installed = 1;
+    try {
+        if (!IsKnownTopic(topic)) {
+            SPDLOG_ERROR("uperf_bridge_subscribe: unknown topic '{}'", topic);
+            return -1;
+        }
+        // Exactly once even when Rust subscribes from several threads.
+        std::call_once(g_installOnce, install_subscribers);
+        return 0;
+    } catch (const std::exception &e) {
+        SPDLOG_ERROR("uperf_bridge_subscribe: {}", e.what());
+        return -1;
+    } catch (...) {
+        SPDLOG_ERROR("uperf_bridge_subscribe: unknown exception");
+        return -1;
     }
-    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -244,28 +283,38 @@ extern "C" void uperf_bridge_set_log_level(const char *level) {
     // Flush on the same level so every line we emit reaches the file promptly
     // without an explicit flush per call.
     logger->flush_on(lv);
-    SPDLOG_INFO("Log level set to '{}'", spdlog::level::to_string_view(lv).data());
+    // Pass the view itself: `to_string_view(...).data()` is not guaranteed NUL-terminated and
+    // fmt would treat it as a C string.
+    SPDLOG_INFO("Log level set to '{}'", spdlog::level::to_string_view(lv));
 }
 
 // The one vendored-module adaptation: uperf reads the input thresholds from
 // `modules.input` while dfps hardcodes them. The listener is constructed in
 // StartPlatform() (before the config is parsed), so it registers itself here and
 // Rust applies the config values once it has them.
-static InputListener *g_inputListener = nullptr;
+static std::atomic<InputListener *> g_inputListener{nullptr};
 
+// Registration happens on the platform thread before the Rust thread applies thresholds;
+// the atomic makes that ordering explicit, and the module can unregister on teardown so a
+// later call cannot dereference a destroyed listener.
 extern "C" void uperf_register_input_listener(void *listener) {
-    g_inputListener = static_cast<InputListener *>(listener);
+    g_inputListener.store(static_cast<InputListener *>(listener), std::memory_order_release);
 }
 
 extern "C" void uperf_bridge_set_input_thresholds(float swipeThd, float gestureThdX,
                                                  float gestureThdY) {
-    if (g_inputListener == nullptr) {
+    auto *listener = g_inputListener.load(std::memory_order_acquire);
+    if (listener == nullptr) {
         SPDLOG_WARN("input listener not registered, thresholds not applied");
         return;
     }
-    g_inputListener->SetThresholds(swipeThd, gestureThdX, gestureThdY);
-    SPDLOG_INFO("Input thresholds: swipeThd={} gestureThdX={} gestureThdY={}", swipeThd,
-                gestureThdX, gestureThdY);
+    try {
+        listener->SetThresholds(swipeThd, gestureThdX, gestureThdY);
+        SPDLOG_INFO("Input thresholds: swipeThd={} gestureThdX={} gestureThdY={}", swipeThd,
+                    gestureThdX, gestureThdY);
+    } catch (const std::exception &e) {
+        SPDLOG_ERROR("set_input_thresholds: {}", e.what());
+    }
 }
 
 // `modules.atrace.enable`.
@@ -286,20 +335,32 @@ static bool g_atraceInited = false;
 
 extern "C" void uperf_bridge_set_atrace(bool enable) {
     if (!g_atraceInited) {
-        g_atraceInited = true;
         if (AtraceInit() != 0) {
             // Upstream's string for this failure, verbatim.
             SPDLOG_ERROR("Failed to open tracemark for atrace");
+            // Leave the flag unset: a later call retries the init instead of toggling a
+            // trace_marker that was never opened.
             return;
         }
+        g_atraceInited = true;
     }
     AtraceToggle(enable);
     SPDLOG_INFO("Atrace {}", enable ? "enabled" : "disabled");
 }
 
 extern "C" void uperf_bridge_init_rust(const char *config_path, const char *log_path) {
-    uperf_rs_init(&kBridge);
-    if (uperf_rs_start(config_path, log_path) != 0) {
-        SPDLOG_ERROR("uperf_rs_start failed");
+    if (config_path == nullptr || log_path == nullptr) {
+        SPDLOG_ERROR("uperf_bridge_init_rust: null path");
+        return;
+    }
+    try {
+        uperf_rs_init(&kBridge);
+        if (uperf_rs_start(config_path, log_path) != 0) {
+            SPDLOG_ERROR("uperf_rs_start failed");
+        }
+    } catch (const std::exception &e) {
+        SPDLOG_ERROR("uperf_bridge_init_rust: {}", e.what());
+    } catch (...) {
+        SPDLOG_ERROR("uperf_bridge_init_rust: unknown exception");
     }
 }

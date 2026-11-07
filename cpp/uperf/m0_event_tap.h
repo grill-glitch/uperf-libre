@@ -24,23 +24,34 @@
 #pragma once
 
 #include "platform/module_base.h"
+#include <atomic>
 #include <cstdint>
 #include <string>
 
-class M0EventTap : public ModuleBase {
+class M0EventTap final : public ModuleBase {
 public:
     M0EventTap();
     ~M0EventTap() override;
     void Start(void) override;
+    void Stop(void) override;
+
+    // Self-registering: copying would duplicate `events_` while the registered lambdas
+    // keep pointing at the original instance.
+    M0EventTap(const M0EventTap &) = delete;
+    M0EventTap &operator=(const M0EventTap &) = delete;
 
 private:
-    int64_t events_;
+    // Incremented from the four cgroup update handlers, i.e. from publisher threads.
+    std::atomic<int64_t> events_{0};
 
     void OnTouch(const void *data);
     void OnBtn(const void *data);
     void OnInputState(const void *data);
     void OnTopapp(const void *data);
     void OnOffscreen(const void *data);
-    void OnCgroupList(const char *topic, const void *data);
-    void OnCgroupUpdate(const char *topic);
+    void OnCgroupList(const std::string &topic, const void *data);
+    void OnCgroupUpdate(const std::string &topic);
+
+    /// Number of topics registered in the constructor (logged by Start()).
+    int subs_ = 0;
 };
