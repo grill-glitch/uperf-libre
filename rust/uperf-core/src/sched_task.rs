@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 
-use uperf_config::{SchedPlanner, SchedPolicy};
+use uperf_config::{SchedDecision, SchedPlanner, SchedPolicy};
 
 use crate::sched_apply::{self, ProcInfo};
 
@@ -87,6 +87,10 @@ pub struct SchedApplier {
     /// Scheduler scene from the hint FSM: `idle` / `touch` / `boost`.
     scene: String,
     applied: HashMap<i32, Applied>,
+    /// tid -> `comm`, so a scene change (which clears `applied`) does not have to re-read
+    /// `/proc/<pid>/task/<tid>/comm` for every thread again: on this device that is ~3300
+    /// opens per re-decide. Entries are dropped with the tid, exactly like `applied`.
+    comms: HashMap<i32, String>,
     pub dry_run: bool,
     /// Verification-only process filter (`UPERF_SCHED_ONLY`).
     only: Option<String>,
@@ -101,6 +105,7 @@ impl SchedApplier {
             top_app: None,
             scene: "idle".to_string(),
             applied: HashMap::new(),
+            comms: HashMap::new(),
             dry_run,
             only,
         }
@@ -152,8 +157,9 @@ impl SchedApplier {
             }
             report.merge(&self.apply_proc(p));
         }
-        // Forget tids that no longer exist so the map cannot grow forever.
+        // Forget tids that no longer exist so neither map can grow forever.
         self.applied.retain(|tid, _| live.contains(tid));
+        self.comms.retain(|tid, _| live.contains(tid));
         report
     }
 
@@ -184,6 +190,12 @@ impl SchedApplier {
         // Resolve the scene once per process: it only depends on the rule's
         // `pinned` flag, the top-app state and the FSM scene.
         let scene = self.scene.clone();
+        // Memoise this process's decisions by thread name. Within one process the inputs
+        // that differ per thread are only `comm` — so a process with 800 threads sharing a
+        // dozen names paid for 800 regex matches per scan (and a full re-decide whenever the
+        // scene moved). The memo is per process because `main_comm` is.
+        let mut memo: std::collections::HashMap<String, Option<SchedDecision>> =
+            std::collections::HashMap::new();
         for t in &p.threads {
             r.threads_seen += 1;
             // Already decided and still in effect: the decision cannot differ
@@ -196,14 +208,28 @@ impl SchedApplier {
                 continue;
             }
             r.first_seen += 1;
-            let comm = sched_apply::comm_of(p.pid, t.tid);
-            let Some(d) = self.planner.decide(
-                &p.name,
-                is_top,
-                &scene,
-                &main_comm,
-                &comm,
-            ) else {
+            // Cached `comm`: a scene change clears `applied`, and re-reading 3300 comm files
+            // just to reach the same decisions was most of a re-decide's cost.
+            if !self.comms.contains_key(&t.tid) {
+                let c = sched_apply::comm_of(p.pid, t.tid);
+                self.comms.insert(t.tid, c);
+            }
+            let comm: &str = self.comms.get(&t.tid).map(String::as_str).unwrap_or("");
+            let decided: Option<SchedDecision> = match memo.get(comm) {
+                Some(v) => v.clone(),
+                None => {
+                    let v = self.planner.decide(
+                        &p.name,
+                        is_top,
+                        &scene,
+                        &main_comm,
+                        comm,
+                    );
+                    memo.insert(comm.to_string(), v.clone());
+                    v
+                }
+            };
+            let Some(d) = decided else {
                 // The process matched but no thread rule does: cache that as "nothing to
                 // do", or every later scan re-reads `comm` and re-runs the whole match for
                 // this thread — the per-thread cost the cache exists to avoid.
