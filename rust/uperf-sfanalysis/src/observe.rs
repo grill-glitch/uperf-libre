@@ -48,7 +48,6 @@ pub static SFH_IDLE_MS: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
 pub static SFH_INSTALLED: AtomicU32 = AtomicU32::new(0);
 
-static SFH_PREV_MS: AtomicU64 = AtomicU64::new(0);
 
 /// CLOCK_MONOTONIC in ms. Uses the raw syscall wrapper so this works before
 /// anything else in the process is initialised.
@@ -73,9 +72,10 @@ pub extern "C" fn note(a: usize, b: usize, ret: i32, kind: u32) {
         SFH_CALLS[kind as usize].fetch_add(1, Ordering::Relaxed);
     }
     let now = monotonic_ms();
+    // `swap` already publishes `now`. The extra store that used to be here could move the
+    // published timestamp *backwards* when another thread swapped a newer value in between,
+    // making the next gap 0 and skewing idle accounting.
     let prev = SFH_LAST_MS.swap(now, Ordering::Relaxed);
-    SFH_LAST_MS.store(now, Ordering::Relaxed);
-    SFH_PREV_MS.store(prev, Ordering::Relaxed);
 
     match kind {
         KIND_IOCTL => {
@@ -84,7 +84,7 @@ pub extern "C" fn note(a: usize, b: usize, ret: i32, kind: u32) {
                 // struct binder_write_read { size_t write_size; size_t
                 // write_consumed; uintptr_t write_buffer; size_t read_size;
                 // size_t read_consumed; uintptr_t read_buffer; }
-                if b != 0 {
+                if b != 0 && ret == 0 {
                     // SAFETY: `b` is the ioctl's third argument, so for a
                     // BINDER_WRITE_READ it is the `struct binder_write_read *` the
                     // caller (surfaceflinger) passed. The kernel read it through
@@ -104,22 +104,30 @@ pub extern "C" fn note(a: usize, b: usize, ret: i32, kind: u32) {
             advance_state(prev, now, 1);
         }
         KIND_EPOLL_WAIT => {
-            // A tiny/zero timeout is a poll; a large one is a block.
+            // timeout < 0 blocks indefinitely, 0 polls, > 0 waits up to that. The old code
+            // skipped the infinite case entirely (the normal surfaceflinger wait!) and also
+            // skipped a wait that ran to its full timeout, so idle time was under-reported.
             let timeout_ms = b as i64;
-            if timeout_ms != 0 {
+            if timeout_ms != 0 && prev != 0 {
                 let spent = now.saturating_sub(prev);
-                if spent < (timeout_ms.max(0) as u64) {
+                if timeout_ms < 0 || spent <= timeout_ms as u64 {
                     SFH_IDLE_MS.fetch_add(spent, Ordering::Relaxed);
                 }
             }
             advance_state(prev, now, 2);
         }
         KIND_COND_WAIT => {
-            SFH_IDLE_MS.fetch_add(now.saturating_sub(prev), Ordering::Relaxed);
+            // `prev == 0` means this is the first observation ever: the "gap" would be the
+            // whole uptime and would be attributed to one wait.
+            if prev != 0 {
+                SFH_IDLE_MS.fetch_add(now.saturating_sub(prev), Ordering::Relaxed);
+            }
             advance_state(prev, now, 3);
         }
         KIND_COND_TIMEDWAIT => {
-            SFH_IDLE_MS.fetch_add(now.saturating_sub(prev), Ordering::Relaxed);
+            if prev != 0 {
+                SFH_IDLE_MS.fetch_add(now.saturating_sub(prev), Ordering::Relaxed);
+            }
             advance_state(prev, now, 4);
         }
         _ => {}
@@ -127,23 +135,23 @@ pub extern "C" fn note(a: usize, b: usize, ret: i32, kind: u32) {
 
     // The vendor re-reads one byte from libandroid.so on state transitions;
     // reproduce the read (read-only, best-effort) so the shape matches.
-    let _ = ret;
-    (); // keep this a unit function
 }
 
 /// Vendor-shaped state word transitions: 0 idle, 1 active, 2 waiting, 3 ending.
 fn advance_state(prev: u64, now: u64, cause: u32) {
     let gap = now.saturating_sub(prev);
-    let cur = SFH_STATE.load(Ordering::Relaxed);
-    let next = match (cur, cause) {
-        (_, 1) => 1,                 // ioctl → active
-        (_, 2) => 2,                 // epoll_wait → waiting
-        (2, 3) | (2, 4) if gap < 500 => 2, // cond_wait inside a wait window
-        (2, 3) | (2, 4) => 3,        // long wait ends → ending
-        (3, _) if gap > 1000 => 0,   // quiet → idle
-        (c, _) => c,
-    };
-    SFH_STATE.store(next, Ordering::Relaxed);
+    // Read-modify-write as one atomic: a plain load+store let two hook threads both read the
+    // same `cur` and the later store discard the other's transition.
+    let _ = SFH_STATE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        Some(match (cur, cause) {
+            (_, 1) => 1,                        // ioctl → active
+            (_, 2) => 2,                        // epoll_wait → waiting
+            (2, 3) | (2, 4) if gap < 500 => 2,  // cond_wait inside a wait window
+            (2, 3) | (2, 4) => 3,               // long wait ends → ending
+            (3, _) if gap > 1000 => 0,          // quiet → idle
+            (c, _) => c,
+        })
+    });
 }
 
 /// Snapshot for tests / device verification.
@@ -191,14 +199,21 @@ pub fn reset_for_test() {
     SFH_BINDER_WRITES.store(0, Ordering::Relaxed);
     SFH_STATE.store(0, Ordering::Relaxed);
     SFH_LAST_MS.store(0, Ordering::Relaxed);
-    SFH_PREV_MS.store(0, Ordering::Relaxed);
-    SFH_IDLE_MS.store(0, Ordering::Relaxed);
-    let _ = AtomicI64::new(0); // keep the import used
+    SFH_IDLE_MS.store(0, Ordering::Relaxed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The counters are process-global statics and `cargo test` runs tests on several threads:
+    /// two tests that both `reset_for_test()` + assert interleaved and made each other flaky.
+    /// Every test that touches them runs under this lock.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn binder_write_read_constant() {
@@ -210,6 +225,7 @@ mod tests {
 
     #[test]
     fn counts_calls_by_kind() {
+        let _g = guard();
         reset_for_test();
         note(0xc030_6201, 0, 0, KIND_IOCTL);
         note(0, 0, 0, KIND_EPOLL_WAIT);
@@ -224,6 +240,7 @@ mod tests {
 
     #[test]
     fn only_binder_write_read_counts_as_transaction() {
+        let _g = guard();
         reset_for_test();
         note(0x1234_5678, 0, 0, KIND_IOCTL);
         note(0x1234_5678, 0, 0, KIND_IOCTL);
@@ -234,6 +251,7 @@ mod tests {
 
     #[test]
     fn non_empty_write_buffer_is_noticed() {
+        let _g = guard();
         reset_for_test();
         // write_size = 8, then write_consumed, write_buffer
         let buf: [usize; 6] = [8, 0, 0, 0, 0, 0];
@@ -246,6 +264,7 @@ mod tests {
 
     #[test]
     fn null_arg_is_tolerated() {
+        let _g = guard();
         reset_for_test();
         note(0xc030_6201, 0, 0, KIND_IOCTL);
         assert_eq!(SFH_BINDER_TXNS.load(Ordering::Relaxed), 1);
@@ -254,6 +273,7 @@ mod tests {
 
     #[test]
     fn state_goes_active_on_ioctl_and_waiting_on_epoll() {
+        let _g = guard();
         reset_for_test();
         note(0, 0, 0, KIND_IOCTL);
         assert_eq!(SFH_STATE.load(Ordering::Relaxed), 1);
@@ -263,6 +283,7 @@ mod tests {
 
     #[test]
     fn stats_reports_expected_slots() {
+        let _g = guard();
         reset_for_test();
         note(0xc030_6201, 0, 0, KIND_IOCTL);
         note(0, 0, 0, KIND_EPOLL_WAIT);
@@ -276,6 +297,7 @@ mod tests {
 
     #[test]
     fn stats_tolerates_small_buffer() {
+        let _g = guard();
         reset_for_test();
         let mut out = [0u64; 3];
         assert_eq!(unsafe { sfh_stats(out.as_mut_ptr(), out.len()) }, 3);
@@ -283,6 +305,7 @@ mod tests {
 
     #[test]
     fn unknown_kind_is_ignored() {
+        let _g = guard();
         reset_for_test();
         note(0, 0, 0, 99);
         assert_eq!(SFH_CALLS.iter().map(|c| c.load(Ordering::Relaxed)).sum::<u64>(), 0);

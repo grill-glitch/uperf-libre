@@ -147,8 +147,9 @@ extern "C" fn cb(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_in
         return 0;
     }
 
-    // locate PT_DYNAMIC
+    // locate PT_DYNAMIC (and remember its size: the DT_NULL walk below is bounded by it)
     let mut dynp: *const Elf64Dyn = core::ptr::null();
+    let mut dynsz = 0usize;
     let (mut lo, mut hi) = (usize::MAX, 0usize);
     for i in 0..info.dlpi_phnum as usize {
         // SAFETY: `dlpi_phdr` points at `dlpi_phnum` headers (the loader's own
@@ -156,6 +157,7 @@ extern "C" fn cb(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_in
         let ph = unsafe { &*info.dlpi_phdr.add(i) };
         if ph.p_type == PT_DYNAMIC {
             dynp = (info.dlpi_addr + ph.p_vaddr as usize) as *const Elf64Dyn;
+            dynsz = ph.p_memsz as usize;
         } else if ph.p_type == PT_LOAD {
             lo = lo.min(info.dlpi_addr + ph.p_vaddr as usize);
             hi = hi.max(info.dlpi_addr + (ph.p_vaddr + ph.p_memsz) as usize);
@@ -171,12 +173,16 @@ extern "C" fn cb(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_in
 
     let (mut symtab, mut strtab, mut jmprel, mut jmprelsz, mut rela, mut relasz, mut relaent) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 24usize);
-    let mut d = dynp;
-    loop {
-        // SAFETY: `dynp` is the module's PT_DYNAMIC array, inside the load range
-        // `[lo, hi)` we computed, and the walk is terminated by the ELF-mandated
-        // DT_NULL entry — so every step stays inside that array.
-        let e = unsafe { &*d };
+    // The walk is bounded by the segment size as well as by DT_NULL: a module with a
+    // truncated/missing DT_NULL used to read past `hi` and SIGSEGV, and a `p_vaddr` outside
+    // the load segments made the very first dereference arbitrary memory.
+    if !in_range(dynp as usize) || dynsz == 0 || dynsz > 1 << 20 {
+        return 0;
+    }
+    let max_entries = dynsz / core::mem::size_of::<Elf64Dyn>();
+    for entry in 0..max_entries {
+        // SAFETY: the array is `max_entries` long by `dynsz`, and `[lo,hi)` was checked.
+        let e = unsafe { &*(dynp as *const Elf64Dyn).add(entry) };
         match e.d_tag {
             DT_NULL => break,
             DT_SYMTAB => symtab = e.d_val as usize,
@@ -189,13 +195,16 @@ extern "C" fn cb(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_in
             DT_SYMENT => {}
             _ => {}
         }
-        // SAFETY: see above; step to the next `Elf64Dyn`.
-        d = unsafe { d.add(1) };
     }
     {
-        // SAFETY: `dlpi_name` is the loader's NUL-terminated module path for this
-        // module, valid for the duration of the callback.
-        let name = unsafe { core::ffi::CStr::from_ptr(info.dlpi_name) };
+        // `dlpi_name` is null for the main executable on some loaders: dereferencing it turned
+        // a logging-only path into a SIGSEGV that aborted the whole scan.
+        let name: &core::ffi::CStr = if info.dlpi_name.is_null() {
+            core::ffi::CStr::from_bytes_with_nul(b"<main>\0").unwrap()
+        } else {
+            // SAFETY: the loader's NUL-terminated module path, valid for this callback.
+            unsafe { core::ffi::CStr::from_ptr(info.dlpi_name) }
+        };
         crate::dbg_log(&format!(
             "got scan raw {}: base={:#x} lo={:#x} hi={:#x} sym={:#x} str={:#x} jmprel={:#x}/{:#x} rela={:#x}/{:#x}",
             name.to_string_lossy(),
@@ -213,12 +222,28 @@ extern "C" fn cb(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_in
     // bionic does not rewrite the address tags in the loaded dynamic section:
     // for an ET_DYN object they stay vaddr-relative. Fold the load bias only
     // where the raw value is not already inside the module.
-    let fix = |v: usize| if v != 0 && in_range(v) { v } else { info.dlpi_addr + v };
+    // `0` means "tag absent" and must stay 0: the old version turned it into `dlpi_addr`,
+    // which `in_range` accepts, so the ELF header at the load base was parsed as a symbol /
+    // string / relocation table.
+    let fix = |v: usize| {
+        if v == 0 {
+            0
+        } else if in_range(v) {
+            v
+        } else {
+            info.dlpi_addr + v
+        }
+    };
     symtab = fix(symtab);
     strtab = fix(strtab);
     jmprel = fix(jmprel);
     rela = fix(rela);
-    if symtab == 0 || strtab == 0 || !in_range(symtab) || !in_range(strtab) || !in_range(symtab + 24)
+    if symtab == 0
+        || strtab == 0
+        || !in_range(symtab)
+        || !in_range(strtab)
+        // Whole 24-byte symbol, not just its first byte.
+        || symtab + core::mem::size_of::<Elf64Sym>() > hi
     {
         return 0;
     }
@@ -231,7 +256,13 @@ extern "C" fn cb(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_in
         if base == 0 || size == 0 || !in_range(base) || !in_range(base + size - 1) {
             continue;
         }
-        let ent = if relaent == 0 { 24 } else { relaent };
+        // The stride must be at least one ELF64 Rela entry, else the last iteration reads past
+        // the table.
+        let ent = if relaent < core::mem::size_of::<Elf64Rel>() {
+            core::mem::size_of::<Elf64Rel>()
+        } else {
+            relaent
+        };
         let n = size / ent;
         for i in 0..n {
             // SAFETY: `[base, base+size)` was checked to be inside the module
@@ -239,7 +270,9 @@ extern "C" fn cb(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_in
             // size), and `i < size / ent` keeps `base + i * ent` inside it.
             let r = unsafe { &*((base + i * ent) as *const Elf64Rel) };
             let sym_idx = (r.r_info >> 32) as usize;
-            if sym_idx == 0 || !in_range(symtab + sym_idx * 24) {
+            // Whole 24-byte symbol inside the module (the old check only tested the first
+            // byte, so the `Elf64Sym` read and the name scan could cross `hi`).
+            if sym_idx == 0 || symtab + (sym_idx + 1) * core::mem::size_of::<Elf64Sym>() > hi {
                 continue;
             }
             // SAFETY: `symtab + sym_idx * 24` was checked to be inside the module;
@@ -265,7 +298,12 @@ extern "C" fn cb(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_in
             if nm != w.target {
                 continue;
             }
+            // `r_offset` is trusted blindly otherwise: a non-address relocation or a corrupt
+            // offset would make `patch_slot` mprotect and overwrite an arbitrary page.
             let addr = info.dlpi_addr + r.r_offset as usize;
+            if !in_range(addr) || addr + core::mem::size_of::<usize>() > hi {
+                continue;
+            }
             // SAFETY: the slot address is `load bias + r_offset` for a relocation
             // this module owns, so it is inside the module's writable GOT; the read
             // is `usize`-sized from a GOT entry (hence `read_unaligned` guarding the
@@ -293,7 +331,8 @@ fn perms_of(addr: usize) -> Option<i32> {
     for line in txt.lines() {
         let mut it = line.split_whitespace();
         let (Some(range), Some(p)) = (it.next(), it.next()) else { continue };
-        let (s, e) = range.split_once('-')?;
+        // `?` here aborted the scan for the whole process on one malformed line.
+        let Some((s, e)) = range.split_once('-') else { continue };
         let (Ok(s), Ok(e)) = (usize::from_str_radix(s, 16), usize::from_str_radix(e, 16)) else {
             continue;
         };
@@ -319,7 +358,11 @@ fn perms_of(addr: usize) -> Option<i32> {
 pub fn patch_slot(addr: usize, new_value: usize) -> Result<(), (i32, &'static str)> {
     let ps = crate::hook::page_size();
     let page = addr & !(ps - 1);
-    let orig_prot = perms_of(page).unwrap_or(PROT_READ);
+    // Do not guess the original protection: defaulting to PROT_READ narrowed an RW GOT page on
+    // restore, which can break lazy binding (or later writes) in that module.
+    let Some(orig_prot) = perms_of(page) else {
+        return Err((errno(), "read /proc/self/maps for the slot page"));
+    };
     // SAFETY: `page` is page-aligned (masked with `!ps + 1`) and `ps` comes from
     // `sysconf(_SC_PAGESIZE)`, so the range `[page, page + ps)` lies inside the
     // single mapping that contains `addr`. RELRO/GOT pages are data, so making them
@@ -327,15 +370,23 @@ pub fn patch_slot(addr: usize, new_value: usize) -> Result<(), (i32, &'static st
     if unsafe { mprotect(page as *mut c_void, ps, PROT_READ | PROT_WRITE) } != 0 {
         return Err((errno(), "mprotect RW"));
     }
-    // SAFETY: `addr` is a GOT slot inside that now-writable page; the store is
-    // `usize`-sized and unaligned-safe, and nothing else in the process dereferences
-    // this slot concurrently while we hold it (the hooks are installed from the
-    // single `xh_refresh_loop` worker before any shim can be called).
-    unsafe { core::ptr::write_unaligned(addr as *mut usize, new_value) };
-    // restore; a failure here would leave the page writable, which is not fatal
-    // SAFETY: same page, same length, with the protection read from
-    // `/proc/self/maps` for exactly this mapping.
-    let _ = unsafe { mprotect(page as *mut c_void, ps, orig_prot) };
+    // SAFETY: `addr` is a GOT slot inside that now-writable page. A release store (atomic when
+    // the slot is aligned, which the ELF ABI guarantees for GOT entries) so another thread
+    // executing through this slot cannot observe a torn pointer; nothing else in the process
+    // writes it while the single `xh_refresh_loop` worker installs the hooks.
+    if addr % core::mem::align_of::<usize>() == 0 {
+        unsafe { (addr as *const core::sync::atomic::AtomicUsize).as_ref() }
+            .expect("aligned slot")
+            .store(new_value, core::sync::atomic::Ordering::Release);
+    } else {
+        unsafe { core::ptr::write_unaligned(addr as *mut usize, new_value) };
+    }
+    // SAFETY: same page, same length, with the protection read from `/proc/self/maps` for
+    // exactly this mapping.
+    if unsafe { mprotect(page as *mut c_void, ps, orig_prot) } != 0 {
+        // Leaving the page writable for the process lifetime is a real hardening regression.
+        return Err((errno(), "mprotect restore"));
+    }
     Ok(())
 }
 

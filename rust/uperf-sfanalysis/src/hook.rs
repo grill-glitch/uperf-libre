@@ -77,20 +77,37 @@ pub fn install(name: &str) -> Result<Hook, HookError> {
     if slots.is_empty() {
         return Err(HookError::NoSlot(name.into()));
     }
-    let orig = slots[0].value;
-    slot_for(name).ok_or_else(|| HookError::NoSymbol(name.into()))?
-        .store(orig, Ordering::SeqCst);
+    let published = slot_for(name).ok_or_else(|| HookError::NoSymbol(name.into()))?;
+    // Capture the original ONCE. `install` is re-run periodically (the worker re-applies on its
+    // period), and after the first success the slots hold our own shim: re-reading them
+    // published the shim as "original" and the shim then `blr`'d itself forever.
+    let orig = match published.load(Ordering::SeqCst) {
+        0 => slots[0].value,
+        prev => prev,
+    };
+    published.store(orig, Ordering::SeqCst);
 
     #[cfg(target_arch = "aarch64")]
     {
         let shim = arch::arch_shim_for(name).ok_or_else(|| HookError::NoSymbol(name.into()))?;
+        // All-or-nothing: a failure part-way used to leave some slots pointing at the shim and
+        // the rest at libc, with the install reported as failed.
+        let mut done: Vec<usize> = Vec::with_capacity(slots.len());
         for s in &slots {
-            crate::got::patch_slot(s.addr, shim).map_err(|(e, what)| HookError::Slot {
-                name: name.into(),
-                addr: s.addr,
-                errno: e,
-                what,
-            })?;
+            match crate::got::patch_slot(s.addr, shim) {
+                Ok(()) => done.push(s.addr),
+                Err((e, what)) => {
+                    for addr in done {
+                        let _ = crate::got::patch_slot(addr, orig);
+                    }
+                    return Err(HookError::Slot {
+                        name: name.into(),
+                        addr: s.addr,
+                        errno: e,
+                        what,
+                    });
+                }
+            }
         }
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -205,6 +222,11 @@ pub fn resolve_entry(name: &str) -> Result<usize, HookError> {
     }
     let mut addr = p as usize;
     for _ in 0..3 {
+        // `dlsym` may legitimately return a data symbol, and a mis-decoded `b` immediate
+        // yields an arbitrary address: both used to be dereferenced by this *safe* function.
+        if !is_executable(addr) {
+            return Err(HookError::NoExecMapping(name.into()));
+        }
         let insns = unsafe { read_insns(addr, 4) };
         let mut followed = false;
         for (i, &insn) in insns.iter().enumerate() {
@@ -370,7 +392,11 @@ mod arch {
     /// (the `libc_relro_page` probe shows only that a *data* page can be made RW,
     /// which is all the live GOT path in `got.rs` needs). Believe a successful
     /// `mmap`/`mprotect` here only after checking it on the actual target.
-    #[allow(dead_code)]
+    // Kept for the record only: this is the path SELinux refuses on this device (execmem /
+    // execmod) and it leaves a permanent RWX mapping. Compiling it behind `cfg(test)` means a
+    // release build cannot reach it by accident — LTO dropping it was a build property, not a
+    // guarantee.
+    #[cfg(test)]
     pub fn install_inline(name: &str) -> Result<Hook, HookError> {
         let entry = resolve_entry(name)?;
         let shim = arch_shim_for(name).ok_or_else(|| HookError::NoSymbol(name.into()))?;
@@ -547,7 +573,10 @@ mod arch {
         "mov  x20, \\rb",
         "adrp x17, \\orig",
         "add  x17, x17, :lo12:\\orig",
-        "ldr  x17, [x17]",
+        // `ldar`: the GOT slot is published with a release store, so a thread that starts
+        // executing a freshly patched slot must see the original pointer with acquire ordering
+        // (a plain `ldr` may observe a stale/zero value and `blr` to address 0).
+        "ldar x17, [x17]",
         "blr  x17",
         "mov  w21, w0",
         "mov  x0, x19",

@@ -71,7 +71,9 @@ fn env_secs(name: &str, default: u64) -> u64 {
 /// does not forward it to logcat, so `eprintln!` is invisible in SF.
 /// Is the diagnostic sink on? (env var, or the marker file next to the log)
 pub(crate) fn debug_enabled() -> bool {
-    if std::env::var("UPERF_SFANALYSIS_DEBUG").is_ok() {
+    // `env_flag`, not `var().is_ok()`: `UPERF_SFANALYSIS_DEBUG=0` (or an empty value) used to
+    // count as enabled, contradicting the documented `=1` convention.
+    if env_flag("UPERF_SFANALYSIS_DEBUG") {
         return true;
     }
     let dir = std::env::var("UPERF_SFANALYSIS_LOG_DIR")
@@ -107,15 +109,21 @@ fn install_all() -> usize {
                     "hooked {} slots={} orig={:#x}",
                     h.name, h.slots, h.orig
                 ));
-                eprintln!(
-                    "uperf-sfanalysis: hooked {} ({} GOT slots, orig {:#x})",
-                    h.name, h.slots, h.orig
-                );
+                // Same reason as the failure line below: SF's stderr goes nowhere, and the
+                // vendor is silent. Only the documented debug sink deviates.
+                if debug_enabled() {
+                    eprintln!(
+                        "uperf-sfanalysis: hooked {} ({} GOT slots, orig {:#x})",
+                        h.name, h.slots, h.orig
+                    );
+                }
             }
             Err(e) => {
                 // A slot we cannot patch must never abort the host process.
                 dbg_log(&format!("NOT hooked {}: {}", name, e));
-                eprintln!("uperf-sfanalysis: {} not hooked: {}", name, e);
+                if debug_enabled() {
+                    eprintln!("uperf-sfanalysis: {} not hooked: {}", name, e);
+                }
             }
         }
     }
@@ -148,7 +156,10 @@ fn worker(delay: u64, interval: u64) {
     std::thread::sleep(std::time::Duration::from_secs(delay));
     let n = install_all();
     if n == 0 {
-        return;
+        // The target mappings may simply not be ready yet (a late-loaded library). Returning
+        // here gave up permanently and lost the vendor's periodic re-apply, which is exactly
+        // what makes it robust against that case.
+        dbg_log("initial install hooked 0 targets, will retry on the period");
     }
     dbg_log(&format!("install done: {}", stats_line()));
     if debug_enabled() {
@@ -171,9 +182,11 @@ fn worker(delay: u64, interval: u64) {
 /// Failure is not fatal (an unprivileged process simply cannot).
 fn set_realtime() {
     #[cfg(target_os = "android")]
+    // SAFETY: `sched_setscheduler` only reads the caller-provided `sched_param` (a plain C
+    // struct, fully initialised here) and returns an error code; failure is ignored on
+    // purpose, matching the vendor library.
     unsafe {
-        let mut p: libc::sched_param = core::mem::zeroed();
-        p.sched_priority = 3;
+        let p = libc::sched_param { sched_priority: 3 };
         let _ = libc::sched_setscheduler(0, libc::SCHED_FIFO, &p);
     }
 }
@@ -188,14 +201,21 @@ extern "C" fn sfh_ctor() {
     set_realtime();
     // Debug mode (env var or the marker file) installs immediately, so a device
     // round does not have to sit through the vendor's 60 s delay.
-    let debug = std::env::var("UPERF_SFANALYSIS_DEBUG").is_ok()
-        || std::path::Path::new("/data/misc/surfaceflinger/sfh.debug").exists();
-    let default_delay = if debug { 0 } else { 60 };
+    // One source of truth for "debug on" (env flag or marker file), so the two decisions
+    // cannot disagree.
+    let default_delay = if debug_enabled() { 0 } else { 60 };
     let delay = env_secs("UPERF_SFANALYSIS_DELAY_SECS", default_delay);
-    let interval = env_secs("UPERF_SFANALYSIS_INTERVAL_SECS", 60);
-    let _ = std::thread::Builder::new()
+    // Clamp: a 0-period refresh loop re-walks /proc/self/maps and re-patches GOT slots with no
+    // delay, on a SCHED_FIFO thread — device-wide starvation.
+    let interval = env_secs("UPERF_SFANALYSIS_INTERVAL_SECS", 60).max(1);
+    if let Err(e) = std::thread::Builder::new()
         .name("xh_refresh_loop".into())
-        .spawn(move || worker(delay, interval));
+        .spawn(move || worker(delay, interval))
+    {
+        // Thread creation can fail in an already-loaded surfaceflinger; without a worker the
+        // library silently does nothing, which is indistinguishable from "never triggered".
+        dbg_log(&format!("failed to spawn xh_refresh_loop: {e}"));
+    }
 }
 
 #[used]
