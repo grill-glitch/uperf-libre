@@ -32,10 +32,15 @@ ps_ret=""
 # $1:task_name $2:cgroup_name $3:"cpuset"/"stune"
 change_task_cgroup() {
     local comm
+    # An empty pattern matches every process: refuse it instead of moving the whole system.
+    [ -n "$1" ] || return 1
     for temp_pid in $(echo "$ps_ret" | grep -i -E "$1" | awk '{print $1}'); do
-        for temp_tid in $(ls "/proc/$temp_pid/task/"); do
-            comm="$(cat /proc/$temp_pid/task/$temp_tid/comm)"
-            echo "$temp_tid" >"/dev/$3/$2/tasks"
+        # Glob, not `ls`: one fork per matched pid just to list a directory. A vanished pid
+        # (the ps snapshot is stale) is skipped instead of printing "No such file".
+        [ -d "/proc/$temp_pid/task" ] || continue
+        for temp_tid in /proc/$temp_pid/task/*; do
+            temp_tid="${temp_tid##*/}"
+            echo "$temp_tid" >"$(_cgroup_tasks_path "$3" "$2")"
         done
     done
 }
@@ -44,8 +49,7 @@ change_task_cgroup() {
 change_proc_cgroup() {
     local comm
     for temp_pid in $(echo "$ps_ret" | grep -i -E "$1" | awk '{print $1}'); do
-        comm="$(cat /proc/$temp_pid/comm)"
-        echo $temp_pid >"/dev/$3/$2/cgroup.procs"
+        echo "$temp_pid" >"/dev/$3/$2/cgroup.procs" 2>/dev/null
     done
 }
 
@@ -53,9 +57,13 @@ change_proc_cgroup() {
 change_thread_cgroup() {
     local comm
     for temp_pid in $(echo "$ps_ret" | grep -i -E "$1" | awk '{print $1}'); do
-        for temp_tid in $(ls "/proc/$temp_pid/task/"); do
-            comm="$(cat /proc/$temp_pid/task/$temp_tid/comm)"
-            if [ "$(echo $comm | grep -i -E "$2")" != "" ]; then
+        # An empty thread name matches every thread: require a pattern.
+        [ -n "$2" ] || return 1
+        [ -d "/proc/$temp_pid/task" ] || continue
+        for temp_tid in /proc/$temp_pid/task/*; do
+            temp_tid="${temp_tid##*/}"
+            comm="$(cat "/proc/$temp_pid/task/$temp_tid/comm" 2>/dev/null)"
+            if printf '%s\n' "$comm" | grep -qiE -- "$2"; then
                 echo "$temp_tid" >"/dev/$4/$3/tasks"
             fi
         done
@@ -75,9 +83,10 @@ change_main_thread_cgroup() {
 change_task_affinity() {
     local comm
     for temp_pid in $(echo "$ps_ret" | grep -i -E "$1" | awk '{print $1}'); do
-        for temp_tid in $(ls "/proc/$temp_pid/task/"); do
-            comm="$(cat /proc/$temp_pid/task/$temp_tid/comm)"
-            taskset -p "$2" "$temp_tid" >>$LOG_FILE
+        [ -d "/proc/$temp_pid/task" ] || continue
+        for temp_tid in /proc/$temp_pid/task/*; do
+            temp_tid="${temp_tid##*/}"
+            taskset -p "$2" "$temp_tid" >>"${LOG_FILE:-/dev/null}" 2>&1 || echo "libcgroup: taskset $2 on tid $temp_tid failed" >>"${LOG_FILE:-/dev/stderr}"
         done
     done
 }
@@ -86,10 +95,13 @@ change_task_affinity() {
 change_thread_affinity() {
     local comm
     for temp_pid in $(echo "$ps_ret" | grep -i -E "$1" | awk '{print $1}'); do
-        for temp_tid in $(ls "/proc/$temp_pid/task/"); do
-            comm="$(cat /proc/$temp_pid/task/$temp_tid/comm)"
-            if [ "$(echo $comm | grep -i -E "$2")" != "" ]; then
-                taskset -p "$3" "$temp_tid" >>$LOG_FILE
+        [ -n "$2" ] || return 1
+        [ -d "/proc/$temp_pid/task" ] || continue
+        for temp_tid in /proc/$temp_pid/task/*; do
+            temp_tid="${temp_tid##*/}"
+            comm="$(cat "/proc/$temp_pid/task/$temp_tid/comm" 2>/dev/null)"
+            if printf '%s\n' "$comm" | grep -qiE -- "$2"; then
+                taskset -p "$3" "$temp_tid" >>"${LOG_FILE:-/dev/null}"
             fi
         done
     done
@@ -98,10 +110,16 @@ change_thread_affinity() {
 # $1:task_name $2:nice(relative to 120)
 change_task_nice() {
     for temp_pid in $(echo "$ps_ret" | grep -i -E "$1" | awk '{print $1}'); do
-        for temp_tid in $(ls "/proc/$temp_pid/task/"); do
-            renice -n +40 -p "$temp_tid"
-            renice -n -19 -p "$temp_tid"
-            renice -n "$2" -p "$temp_tid"
+        [ -d "/proc/$temp_pid/task" ] || continue
+        for temp_tid in /proc/$temp_pid/task/*; do
+            temp_tid="${temp_tid##*/}"
+            # Validate first and check each step: a failure left the thread at nice -19
+            # (maximum priority) on an arbitrary matched system thread.
+            case "$2" in '' | *[!0-9-]*) continue ;; esac
+            renice -n +40 -p "$temp_tid" </dev/null >/dev/null 2>&1 || continue
+            renice -n -19 -p "$temp_tid" </dev/null >/dev/null 2>&1 || continue
+            renice -n "$2" -p "$temp_tid" </dev/null >>"${LOG_FILE:-/dev/null}" 2>&1 ||
+                renice -n 0 -p "$temp_tid" </dev/null >/dev/null 2>&1
         done
     done
 }
@@ -110,9 +128,12 @@ change_task_nice() {
 change_thread_nice() {
     local comm
     for temp_pid in $(echo "$ps_ret" | grep -i -E "$1" | awk '{print $1}'); do
-        for temp_tid in $(ls "/proc/$temp_pid/task/"); do
-            comm="$(cat /proc/$temp_pid/task/$temp_tid/comm)"
-            if [ "$(echo $comm | grep -i -E "$2")" != "" ]; then
+        [ -n "$2" ] || return 1
+        [ -d "/proc/$temp_pid/task" ] || continue
+        for temp_tid in /proc/$temp_pid/task/*; do
+            temp_tid="${temp_tid##*/}"
+            comm="$(cat "/proc/$temp_pid/task/$temp_tid/comm" 2>/dev/null)"
+            if printf '%s\n' "$comm" | grep -qiE -- "$2"; then
                 renice -n +40 -p "$temp_tid"
                 renice -n -19 -p "$temp_tid"
                 renice -n "$3" -p "$temp_tid"
@@ -124,9 +145,10 @@ change_thread_nice() {
 # $1:task_name $2:priority(99-x, 1<=x<=99)
 change_task_rt() {
     for temp_pid in $(echo "$ps_ret" | grep -i -E "$1" | awk '{print $1}'); do
-        for temp_tid in $(ls "/proc/$temp_pid/task/"); do
-            comm="$(cat /proc/$temp_pid/task/$temp_tid/comm)"
-            chrt -f -p "$2" "$temp_tid" >>$LOG_FILE
+        [ -d "/proc/$temp_pid/task" ] || continue
+        for temp_tid in /proc/$temp_pid/task/*; do
+            temp_tid="${temp_tid##*/}"
+            chrt -f -p "$2" "$temp_tid" >>"${LOG_FILE:-/dev/null}"
         done
     done
 }
@@ -135,10 +157,13 @@ change_task_rt() {
 change_thread_rt() {
     local comm
     for temp_pid in $(echo "$ps_ret" | grep -i -E "$1" | awk '{print $1}'); do
-        for temp_tid in $(ls "/proc/$temp_pid/task/"); do
-            comm="$(cat /proc/$temp_pid/task/$temp_tid/comm)"
-            if [ "$(echo $comm | grep -i -E "$2")" != "" ]; then
-                chrt -f -p "$3" "$temp_tid" >>$LOG_FILE
+        [ -n "$2" ] || return 1
+        [ -d "/proc/$temp_pid/task" ] || continue
+        for temp_tid in /proc/$temp_pid/task/*; do
+            temp_tid="${temp_tid##*/}"
+            comm="$(cat "/proc/$temp_pid/task/$temp_tid/comm" 2>/dev/null)"
+            if printf '%s\n' "$comm" | grep -qiE -- "$2"; then
+                chrt -f -p "$3" "$temp_tid" >>"${LOG_FILE:-/dev/null}"
             fi
         done
     done

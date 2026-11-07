@@ -21,7 +21,9 @@
 
 # $1:"4.14" return:string_in_version
 match_linux_version() {
-    echo "$(cat /proc/version | grep -i "$1")"
+    # -F: the argument is a fixed string, not a regex (the dots in "4.14" matched any char);
+    # no `cat` pipeline.
+    grep -iF -- "$1" /proc/version
 }
 
 get_socid() {
@@ -33,32 +35,46 @@ get_socid() {
 }
 
 get_nr_core() {
-    echo "$(cat /proc/stat | grep cpu[0-9] | wc -l)"
+    # Anchored and multi-digit: `grep cpu[0-9]` counted any line *containing* cpuN and missed
+    # cpu10+.
+    grep -cE '^cpu[0-9]+' /proc/stat
 }
 
 # $1:cpuid
 get_maxfreq() {
-    echo "$(cat "/sys/devices/system/cpu/cpu$1/cpufreq/cpuinfo_max_freq")"
+    # Failure must be distinguishable: an empty string made every caller's `[ ... -gt ... ]`
+    # error out and silently select the *else* (lower-tier SoC) branch.
+    local f="/sys/devices/system/cpu/cpu$1/cpufreq/cpuinfo_max_freq"
+    [ -r "$f" ] || return 1
+    cat "$f"
 }
 
 get_socname() {
-    echo "$(cat "/sys/devices/soc0/machine"| tr '[A-Z]' '[a-z]')"
+    # Missing node must not print a `cat` error into the caller's value.
+    [ -r /sys/devices/soc0/machine ] || return 1
+    tr '[A-Z]' '[a-z]' < /sys/devices/soc0/machine
 }
 
-# ⑩ 32-bit coverage. Exactly two things here are arch-locked: bin/uperf (the daemon) and
-# bin/libsfanalysis_rs.so (loaded into surfaceflinger). Everything else is shell or dex and
-# arch-neutral. On a device whose primary ABI is not arm64-v8a neither can exec -- and the
-# injection target would itself be 32-bit -- so the install is refused up front instead of
-# appearing to succeed and failing silently at boot.
+# ⑩ 32-bit coverage. Three things here are arch-locked: bin/uperf (the daemon),
+# bin/libsfanalysis_rs.so (loaded into surfaceflinger) and the statically linked aarch64
+# bin/busybox every boot script depends on. Everything else is shell or dex and arch-neutral.
+# On a device whose primary ABI is not arm64-v8a none can exec -- and the injection target
+# would itself be 32-bit -- so the install is refused up front instead of appearing to
+# succeed and failing silently at boot.
 #
-# `UPERF_FAKE_ABI` is a testing seam for exercising the refusal path on a 64-bit device,
-# in the same spirit as `UPERF_FAKE_ROOT`.
+# `UPERF_FAKE_ABI` is a testing seam for exercising the refusal path on a 64-bit device, in
+# the same spirit as `UPERF_FAKE_ROOT`; it is only honoured together with
+# `UPERF_SELFTEST=1` so a leftover variable cannot bypass the guard on a real install.
 module_abi() {
     if [ -n "$UPERF_FAKE_ABI" ]; then
-        echo "$UPERF_FAKE_ABI"
-    else
-        getprop ro.product.cpu.abi
+        if [ "$UPERF_SELFTEST" = "1" ]; then
+            echo "uperf: honouring UPERF_FAKE_ABI=$UPERF_FAKE_ABI (self-test)" >&2
+            echo "$UPERF_FAKE_ABI"
+            return
+        fi
+        echo "uperf: ignoring UPERF_FAKE_ABI (set UPERF_SELFTEST=1 to use it)" >&2
     fi
+    getprop ro.product.cpu.abi
 }
 
 is_aarch64() {
@@ -85,8 +101,9 @@ require_aarch64() {
     fi
     echo "! unsupported ABI: $(module_abi)"
     echo "  uperf-libre ships arm64-v8a binaries only:"
-    echo "    bin/uperf               the daemon"
-    echo "    bin/libsfanalysis_rs.so loaded into surfaceflinger"
+    echo "    bin/uperf                 the daemon"
+    echo "    bin/libsfanalysis_rs.so   loaded into surfaceflinger"
+    echo "    bin/busybox/busybox       aarch64 static, used by the boot scripts"
     echo "  None of them can exec on a 32-bit-only device, and the injection target"
     echo "  would be 32-bit too, so the install is refused rather than left to fail"
     echo "  silently at boot. No 32-bit build is shipped (docs/records/m11-10-32bit.md)."
@@ -110,11 +127,16 @@ is_mtk() {
 }
 
 miui_check(){
-if [ "$(printf '%s\n' "90" "$(getprop ro.miui.ui.version.name)" | sort -V | head -n1)" = "90" ]; then
-  echo "true"
-else
-  echo "false"
-fi
+  # Test the property directly. The old `sort -V` against the literal "90" only worked while
+  # the value started with a letter (`V12.5.3`): a digit-leading `12.5.3` sorted *before* "90"
+  # and a real MIUI device reported false.
+  local ver
+  ver="$(getprop ro.miui.ui.version.name 2>/dev/null)"
+  if [ -n "$ver" ]; then
+    echo "true"
+  else
+    echo "false"
+  fi
 }
 
 _get_sm6150_type() {
@@ -174,7 +196,12 @@ _get_kalama_type() {
 
 # $1:board_name
 get_config_name() {
-    case "$1" in
+    # Normalise the subject the same way `get_socname` does. Without this, any caller that
+    # passed the lower-cased `get_socname` made every mixed-case key (MSM8916, msm8952Pro,
+    # Infinix-X6827, …) unreachable and the device showed up as `unsupported`.
+    local board
+    board="$(printf '%s' "$1" | tr '[A-Z]' '[a-z]')"
+    case "$board" in
     "pineapple") echo "$(_get_pinekala_type)" ;;
     "kalama") echo "$(_get_kalama_type)" ;;
     "taro") echo "$(_get_taro_type)" ;;
@@ -191,15 +218,15 @@ get_config_name() {
     "sdm710") echo "sdm710" ;;
     "msm8939") echo "sdm616" ;;
     "msm8916") echo "sdm616" ;;
-    "MSM8916") echo "sdm616" ;;
+    "msm8916") echo "sdm616" ;;
     "sky") echo "sdm4g2" ;;
     "parrot") echo "sdm4g2" ;;
     "msm8937") echo "sdm439" ;;
     "msm8953") echo "sdm625" ;;    # 625
     "msm8953pro") echo "sdm625" ;; # 626
-    "msm8952Pro") echo "sdm653" ;; #653
+    "msm8952pro") echo "sdm653" ;; #653
     "msm8952") echo "sdm653" ;; #652
-    "msm8976SG") echo "sdm653" ;; #653
+    "msm8976sg") echo "sdm653" ;; #653
     "sdm660") echo "sdm660" ;;
     "sdm636") echo "sdm660" ;;
     "trinket") echo "sdm665" ;; # sdm665
@@ -232,7 +259,7 @@ get_config_name() {
     "mt6779") echo "mtp90" ;;
     "mt6789") echo "mtg99" ;;
     "mt6785") echo "mtg90t" ;;
-    "Infinix-X6827") echo "mtg96" ;;
+    "infinix-x6827") echo "mtg96" ;;
     "mt6827") echo "mtg96" ;;
     "mt6795") echo "mtx10" ;;
     "mt6797") echo "mtx20" ;;

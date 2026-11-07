@@ -17,3 +17,10 @@
 
 # powercfg wrapper for com.omarea.vtools
 # MAKE SURE THAT THE MAGISK MODULE "Uperf" HAS BEEN INSTALLED
+#
+# NOTE: this file is only a *header*. The working entry point is produced by
+# `magisk/script/initsvc.sh`, which copies it to `/data/powercfg.sh` and appends
+#     sh "<module>/script/powercfg_main.sh" "$1"
+# Editing this file alone does nothing: both places must stay in sync, and a deployment path
+# that copies it without the append (manual copy, interrupted boot) produces an inert wrapper
+# that exits 0 while applying no tuning at all.

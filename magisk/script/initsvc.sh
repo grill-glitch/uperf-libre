@@ -31,21 +31,42 @@ uperf_check_shell_deps() {
         command -v "$c" >/dev/null 2>&1 || missing="$missing $c"
     done
     [ -z "$missing" ] && return 0
-    echo "uperf: missing shell command(s):$missing -- ROM toybox too old? tuning paths using them are no-ops" >>"$LOG_FILE"
+    # /sdcard is not mounted yet at this point (the mkdir happens inside uperf_start), so
+    # the redirect used to fail and the warning was lost. Create the directory first and
+    # fall back to the kernel log.
+    mkdir -p "$USER_PATH" 2>/dev/null
+    if ! echo "uperf: missing shell command(s):$missing -- ROM toybox too old? tuning paths using them are no-ops" >>"$LOG_FILE" 2>/dev/null; then
+        echo "uperf: missing shell command(s):$missing" >/dev/kmsg 2>/dev/null
+    fi
 }
 uperf_check_shell_deps
 
 # support vtools
-cp -af $SCRIPT_PATH/vtools_powercfg.sh /data/powercfg.sh
-cp -af $SCRIPT_PATH/vtools_powercfg.sh /data/powercfg-base.sh
-cp -af $SCRIPT_PATH/powercfg.json /data/powercfg.json
-chmod 755 /data/powercfg.sh
-chmod 755 /data/powercfg-base.sh
-echo "sh $SCRIPT_PATH/powercfg_main.sh \"\$1\"" >>/data/powercfg.sh
+# Unchecked copies left a stale /data/powercfg.sh that then got the appended line again on
+# the next boot, running powercfg_main.sh several times per event.
+cp -af "$SCRIPT_PATH/vtools_powercfg.sh" /data/powercfg.sh || exit 1
+cp -af "$SCRIPT_PATH/vtools_powercfg.sh" /data/powercfg-base.sh || exit 1
+cp -af "$SCRIPT_PATH/powercfg.json" /data/powercfg.json || exit 1
+chmod 755 /data/powercfg.sh || exit 1
+chmod 755 /data/powercfg-base.sh || exit 1
+# The appended line is the only thing that makes the wrapper work: verify the target exists
+# (and the append landed) instead of shipping a wrapper that exits 0 and tunes nothing.
+if [ ! -f "$SCRIPT_PATH/powercfg_main.sh" ]; then
+    echo "uperf: missing $SCRIPT_PATH/powercfg_main.sh, vtools powercfg will be inert" >/dev/kmsg 2>/dev/null
+fi
+# Quoted: the emitted command is executed later by vtools' shell.
+echo "sh \"$SCRIPT_PATH/powercfg_main.sh\" \"\$1\"" >>/data/powercfg.sh || exit 1
+grep -q "powercfg_main.sh" /data/powercfg.sh || echo "uperf: powercfg wrapper has no command appended" >/dev/kmsg 2>/dev/null
 
-wait_until_login
+wait_until_login || echo "uperf: login not detected in time; continuing" >/dev/kmsg 2>/dev/null
 
-sh $SCRIPT_PATH/powercfg_once.sh
-sh $SCRIPT_PATH/platform_special.sh
-sh $SCRIPT_PATH/miui_migt.sh
-uperf_start
+# Report each step: a missing script or a failed pass used to leave the device on a
+# half-applied boot configuration with no trace in the log.
+for _s in powercfg_once.sh platform_special.sh miui_migt.sh; do
+    if [ ! -f "$SCRIPT_PATH/$_s" ]; then
+        echo "uperf: missing $SCRIPT_PATH/$_s" >/dev/kmsg 2>/dev/null
+        continue
+    fi
+    sh "$SCRIPT_PATH/$_s" || echo "uperf: $_s failed" >/dev/kmsg 2>/dev/null
+done
+uperf_start || echo "uperf: uperf_start failed" >/dev/kmsg 2>/dev/null

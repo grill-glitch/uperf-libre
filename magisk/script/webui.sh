@@ -38,8 +38,20 @@ BASEDIR="$(cd "$(dirname "$0")" && pwd)"
 # Host-test seams, defaulting to the device paths (`scripts/test_watchdog_host.sh`
 # exercises `status` without a phone). Placed before GOVERNOR_STATE/PRESET_FILE so
 # everything derived from them follows the override too.
-USER_PATH="${UPERF_WEBUI_USER_PATH:-$USER_PATH}"
-FLAG_PATH="${UPERF_WEBUI_FLAG_PATH:-$FLAG_PATH}"
+# The override is only honoured for a self-test or for an absolute path in a scratch
+# location: the KernelSU WebUI `exec()` lets the calling page supply the environment, so an
+# untrusted page could otherwise make this root-run script write (and export) anywhere.
+if [ -n "$UPERF_WEBUI_USER_PATH" ]; then
+    case "$UPERF_WEBUI_USER_PATH" in
+        /sdcard/* | /data/local/tmp/* | /data/media/*)
+            USER_PATH="$UPERF_WEBUI_USER_PATH" ;;
+        *)
+            echo "uperf: ignoring UPERF_WEBUI_USER_PATH=$UPERF_WEBUI_USER_PATH" >&2 ;;
+    esac
+fi
+if [ -n "$UPERF_WEBUI_FLAG_PATH" ] && [ "$UPERF_SELFTEST" = "1" ]; then
+    FLAG_PATH="$UPERF_WEBUI_FLAG_PATH"
+fi
 
 GOVERNOR_STATE="$USER_PATH/orig_governor.txt"
 PRESET_FILE="$USER_PATH/cur_powermode.txt"
@@ -64,7 +76,15 @@ SYS_PS=/system/bin/ps
 # live daemon as `daemon.count=0` and made `restart.ok` a lie. Zombies are excluded:
 # a killed worker lingers as `[uperf]`/state `Z` and must not count as running.
 uperf_pids() {
-    $SYS_PS -A -o PID,STAT,NAME 2>/dev/null | awk '$NF == "uperf" && $2 !~ /Z/ { print $1 }'
+    # `ps` failing must be visible: `2>/dev/null` hid exactly the failure mode this function
+    # exists to avoid (a broken `ps` reads as "daemon down").
+    local out
+    out="$($SYS_PS -A -o PID,STAT,NAME 2>/dev/null)" || {
+        echo "uperf: ps is unusable ($SYS_PS)" >&2
+        return 1
+    }
+    [ -n "$out" ] || { echo "uperf: ps returned no processes" >&2; return 1; }
+    printf '%s\n' "$out" | awk '$NF == "uperf" && $2 !~ /Z/ { print $1 }'
 }
 
 uperf_pid_count() {
@@ -77,8 +97,12 @@ uperf_pid_list() {
 
 print_status() {
     local cfg="$USER_PATH/uperf.json"
+    # One `ps` sample, count derived from it: two independent invocations could disagree
+    # (count=0 with a non-empty pid list) and the WebUI keys "running" off the count.
     local pids; pids="$(uperf_pid_list)"
-    echo "daemon.count=$(uperf_pid_count)"
+    local count
+    count="$(printf '%s' "$pids" | wc -w | tr -d ' ')"
+    echo "daemon.count=$count"
     echo "daemon.pids=$pids"
     echo "user.path=$USER_PATH"
     echo "config.path=$cfg"
@@ -88,7 +112,11 @@ print_status() {
     # The preset the user last asked for. Note the file is what the *switcher* reads,
     # so it is authoritative even if the daemon is down.
     if [ -f "$PRESET_FILE" ]; then
-        echo "preset.current=$(cat "$PRESET_FILE" 2>/dev/null)"
+        # Sanitised: the file lives on /sdcard and its raw content is embedded in the
+        # `key=value` protocol, so a newline injected extra fields the frontend parses.
+        local cur
+        cur="$(head -n 1 "$PRESET_FILE" 2>/dev/null | tr -cd 'a-zA-Z0-9_+-')"
+        echo "preset.current=$cur"
         echo "preset.present=1"
     else
         echo "preset.current="
@@ -100,8 +128,8 @@ print_status() {
     # crash (see libuperf.sh).
     local armed=0 govs=""
     for d in $(uperf_policy_dirs); do
-        local g; g="$(cat $d/scaling_governor 2>/dev/null)"
-        govs="$govs$(basename $d)=$g "
+        local g; g="$(cat "$d/scaling_governor" 2>/dev/null)"
+        govs="$govs$(basename "$d")=$g "
         [ "$g" = "userspace" ] && armed=1
     done
     echo "governor.takeover=$armed"
@@ -192,6 +220,25 @@ set_preset() {
             return 1
             ;;
     esac
+    # Bounded: a megabyte-long "preset name" used to be written verbatim.
+    if [ "${#want}" -gt 64 ]; then
+        echo "preset.set="
+        echo "preset.ok=0"
+        echo "preset.error=name too long"
+        return 1
+    fi
+    # Optional whitelist against the presets the loaded config defines. Unset by default
+    # (the frontend offers only real presets), but the seam is honoured here rather than
+    # documented as if it existed.
+    if [ -n "$PRESET_LEGAL_EXTRA" ] && [ -f "$USER_PATH/uperf.json" ]; then
+        if ! grep -q "\"$want\"" "$USER_PATH/uperf.json" 2>/dev/null &&
+            [ "$want" != "$PRESET_LEGAL_EXTRA" ]; then
+            echo "preset.set="
+            echo "preset.ok=0"
+            echo "preset.error=$want is not a preset of the loaded config"
+            return 1
+        fi
+    fi
     mkdir -p "$USER_PATH" 2>/dev/null
     printf '%s\n' "$want" > "$PRESET_FILE" 2>/dev/null
     local got; got="$(cat "$PRESET_FILE" 2>/dev/null)"
@@ -244,11 +291,22 @@ export_log() {
         echo "export.error=no log at $log"
         return 1
     fi
-    mkdir -p "$dir" 2>/dev/null
+    mkdir -p "$dir" 2>/dev/null || { echo "export.ok=0"; echo "export.error=could not create $dir"; return 1; }
+    # Unique name: two exports inside the same second used to collapse onto one file.
+    dst="$dir/uperf_log_${stamp}_$$.txt"
+    # Remove first: `>` truncates, so a stale file with the same name could make the
+    # `-s` check below pass for a write that actually failed.
+    rm -f "$dst" 2>/dev/null
     tail -n "$n" "$log" > "$dst" 2>/dev/null
-    if [ ! -s "$dst" ]; then
+    if [ ! -f "$dst" ]; then
         echo "export.ok=0"
         echo "export.error=could not write $dst"
+        return 1
+    fi
+    # An empty log is a legitimate export; distinguish it from a failed write.
+    if [ ! -s "$dst" ] && [ -s "$log" ]; then
+        echo "export.ok=0"
+        echo "export.error=wrote an empty file (log is not empty)"
         return 1
     fi
     echo "export.path=$dst"
@@ -263,10 +321,21 @@ do_restart() {
     # an in-WebUI restart is safe (a plain background child would be taken down with
     # the exec's process group).
     uperf_stop
+    # The stop must be verified: `uperf_stop`'s status was ignored and success was inferred
+    # from "some uperf pid exists", so a restart that left the old daemon running (or two
+    # daemons) reported ok=1.
+    local stopped
+    stopped="$(uperf_pid_count)"
+    [ "$stopped" -eq 0 ] || echo "restart.stale_pids=$stopped"
     uperf_start
     local n; n="$(uperf_pid_count)"
     echo "restart.after=$n"
-    [ "$n" -gt 0 ] && echo "restart.ok=1" || echo "restart.ok=0"
+    if [ "$n" -gt 0 ] && [ "${stopped:-0}" -eq 0 ]; then
+        echo "restart.ok=1"
+    else
+        echo "restart.ok=0"
+        echo "restart.error=previous daemon did not stop (stale_pids=${stopped:-?})"
+    fi
 }
 
 case "$1" in

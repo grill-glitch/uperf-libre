@@ -41,8 +41,13 @@ DFPS_CUR="$USER_PATH/dfps_cur.txt"
 print_status() {
     local cur="(none)"
     if [ -f "$DFPS_CUR" ]; then
-        cur="$(cat "$DFPS_CUR" 2>/dev/null | tr -d '[:space:]')"
-        [ -z "$cur" ] && cur="(empty)"
+        # First line only: stripping *all* whitespace concatenated a momentarily multi-line
+        # file into e.g. "60120". Anything non-numeric is reported as invalid.
+        cur="$(head -n 1 "$DFPS_CUR" 2>/dev/null | tr -d '[:space:]')"
+        case "$cur" in
+            '') cur="(empty)" ;;
+            *[!0-9]*) cur="(invalid)" ;;
+        esac
     fi
     echo "cur=${cur}"
     echo "config.path=$DFPS_CONFIG"
@@ -57,11 +62,20 @@ print_info() {
         # nothing out — the rule list came back with the comments and the
         # `/tunable` lines included (caught on the device: 7 lines instead of
         # 3). ERE is what toybox implements.
-        n=$(grep -c -v -E '^[[:space:]]*$|^#|^/' "$DFPS_CONFIG" 2>/dev/null || echo 0)
+        # `grep -c` prints 0 *and* exits 1 when nothing matches: `|| echo 0` appended a
+        # second 0 ("0\n0") and broke the key=value protocol. Default only on empty output.
+        n=$(grep -c -v -E '^[[:space:]]*$|^#|^/' "$DFPS_CONFIG" 2>/dev/null)
+        [ -n "$n" ] || n=0
         rules="$(grep -v -E '^[[:space:]]*$|^#|^/' "$DFPS_CONFIG" 2>/dev/null | sed 's/[[:space:]]\+/ /g' | tr '\n' '|')"
     fi
     echo "lines=$n"
     echo "rules=$rules"
+}
+
+# `uperf_pid_count` lives in webui.sh, which is a separate entry point — using it here made
+# every count print "not found" and `restart.ok` report failure for a working restart.
+_uperf_pid_count() {
+    ps -A -o PID,STAT,NAME 2>/dev/null | awk '$NF == "uperf" && $2 !~ /Z/ { n++ } END { print n + 0 }'
 }
 
 # Replaces one rule line in dfps.txt. PKG may be "*" (universal) or "-"
@@ -81,9 +95,18 @@ set_rule() {
         echo "rule.error=missing argument (need: pkg idle active)"
         return 1
     fi
-    case "$idle$active" in
-        *[!0-9-]*) echo "rule.ok=0"; echo "rule.error=non-integer hz"; return 1 ;;
+    # Validate each field separately and bound it: concatenating the two used to accept
+    # `idle=1-`, `active=--` and `idle=-60`, which the daemon's own rule validation then
+    # rejects — the edit silently never took effect while `rule.ok=1` was reported.
+    case "$pkg" in
+        '' | *[!A-Za-z0-9._:*-]*)
+            echo "rule.ok=0"; echo "rule.error=invalid package name"; return 1 ;;
     esac
+    case "$idle" in '' | *[!0-9]*) echo "rule.ok=0"; echo "rule.error=idle must be a non-negative integer"; return 1 ;; esac
+    case "$active" in '' | *[!0-9]*) echo "rule.ok=0"; echo "rule.error=active must be a non-negative integer"; return 1 ;; esac
+    if [ "$idle" -gt 240 ] || [ "$active" -gt 240 ]; then
+        echo "rule.ok=0"; echo "rule.error=hz out of range (0..240)"; return 1
+    fi
     mkdir -p "$USER_PATH" 2>/dev/null
     if [ ! -f "$DFPS_CONFIG" ]; then
         # Both special rules are required upstream (dfps_config::ParseError).
@@ -93,20 +116,22 @@ set_rule() {
         echo "* 0 60" > "$DFPS_CONFIG"
         echo "- 0 30" >> "$DFPS_CONFIG"
     fi
-    local tmp="${DFPS_CONFIG}.tmp"
-    if grep -q "^${pkg} " "$DFPS_CONFIG" 2>/dev/null; then
-        # Replace existing line.
-        grep -v "^${pkg} " "$DFPS_CONFIG" > "$tmp" 2>/dev/null
+    # Field-exact matching, not a grep pattern: `pkg='*'` is a valid rule name but an invalid
+    # BRE (`^* `), and `pkg='.*'` would match every line and delete the whole table.
+    local tmp
+    tmp="$(mktemp "${DFPS_CONFIG}.XXXXXX" 2>/dev/null)" || tmp="${DFPS_CONFIG}.$$.tmp"
+    if awk -v p="$pkg" '$1 == p { found = 1 } END { exit !found }' "$DFPS_CONFIG" 2>/dev/null; then
+        awk -v p="$pkg" '$1 != p' "$DFPS_CONFIG" > "$tmp" || { rm -f "$tmp"; echo "rule.ok=0"; echo "rule.error=read failed"; return 1; }
     else
-        # Append.
-        cp -f "$DFPS_CONFIG" "$tmp" 2>/dev/null
+        cp -f "$DFPS_CONFIG" "$tmp" || { rm -f "$tmp"; echo "rule.ok=0"; echo "rule.error=copy failed"; return 1; }
     fi
-    printf '%s %s %s\n' "$pkg" "$idle" "$active" >> "$tmp"
+    printf '%s %s %s\n' "$pkg" "$idle" "$active" >> "$tmp" || { rm -f "$tmp"; echo "rule.ok=0"; echo "rule.error=write failed"; return 1; }
     chmod 644 "$tmp" 2>/dev/null
-    mv -f "$tmp" "$DFPS_CONFIG"
+    sync
+    mv -f "$tmp" "$DFPS_CONFIG" || { rm -f "$tmp"; echo "rule.ok=0"; echo "rule.error=rename failed"; return 1; }
     # Read back to verify.
     local got
-    got="$(grep "^${pkg} " "$DFPS_CONFIG" 2>/dev/null | head -1 | sed 's/[[:space:]]\+/ /g')"
+    got="$(awk -v p="$pkg" '$1 == p { print; exit }' "$DFPS_CONFIG" 2>/dev/null | sed 's/[[:space:]]\+/ /g')"
     echo "rule.pkg=$pkg"
     echo "rule.idle=$idle"
     echo "rule.active=$active"
@@ -121,10 +146,10 @@ set_rule() {
 }
 
 do_restart() {
-    echo "restart.before=$(uperf_pid_count)"
+    echo "restart.before=$(_uperf_pid_count)"
     uperf_stop
     uperf_start
-    local n; n="$(uperf_pid_count)"
+    local n; n="$(_uperf_pid_count)"
     echo "restart.after=$n"
     [ "$n" -gt 0 ] && echo "restart.ok=1" || echo "restart.ok=0"
 }

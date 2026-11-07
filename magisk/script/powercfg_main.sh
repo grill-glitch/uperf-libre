@@ -15,13 +15,24 @@
 # limitations under the License.
 #
 
-BASEDIR="$(dirname $(readlink -f "$0"))"
-. $BASEDIR/pathinfo.sh
+BASEDIR="$(dirname "$(readlink -f "$0")")"
+# A failed source is non-fatal in mksh: execution continued with USER_PATH unset, so the
+# write below landed on /cur_powermode.txt. Validate instead.
+PATHINFO_FILE="$BASEDIR/pathinfo.sh"
+[ -r "$PATHINFO_FILE" ] || { echo "Failed to source $PATHINFO_FILE." >&2; exit 1; }
+. "$PATHINFO_FILE"
+[ -n "$USER_PATH" ] || { echo "USER_PATH is not set by pathinfo.sh." >&2; exit 1; }
 
 action="$1"
-case "$1" in
-"powersave" | "balance" | "performance" | "fast" | "auto") echo "$1" >"$USER_PATH/cur_powermode.txt" ;;
-"pedestal") echo "performance" >"$USER_PATH/cur_powermode.txt" ;;
-"init") echo "balance" >"$USER_PATH/cur_powermode.txt" ;;
-*) echo "Failed to apply unknown action '$1'." ;;
+case "$action" in
+"powersave" | "balance" | "performance" | "fast" | "auto") ;;
+"pedestal") action="performance" ;;
+"init") action="balance" ;;
+*) echo "Failed to apply unknown action '$1'." >&2; exit 1 ;;
 esac
+
+mkdir -p "$USER_PATH" 2>/dev/null
+if ! echo "$action" >"$USER_PATH/cur_powermode.txt" 2>/dev/null; then
+    echo "Failed to write $USER_PATH/cur_powermode.txt" >&2
+    exit 1
+fi

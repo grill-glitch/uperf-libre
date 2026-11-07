@@ -15,14 +15,27 @@
 # limitations under the License.
 #
 
-MODULE_PATH="$(dirname $(readlink -f "$0"))"
+# Quote the inner substitution: unquoted, `readlink -f` output is word-split and
+# glob-expanded before `dirname` sees it, so a module path containing a space (or a glob
+# character) produced a truncated root - and every derived path with it.
+MODULE_PATH="$(dirname "$(readlink -f "$0")")"
 MODULE_PATH="${MODULE_PATH%\/script}"
+if [ ! -d "$MODULE_PATH/script" ] || [ ! -f "$MODULE_PATH/module.prop" ]; then
+    echo "pathinfo: cannot resolve the module root from \$0='$0' (got '$MODULE_PATH'); source this file from <module>/script" >&2
+    return 1 2>/dev/null || exit 1
+fi
 SCRIPT_PATH="$MODULE_PATH/script"
 BIN_PATH="$MODULE_PATH/bin"
 FLAG_PATH="$MODULE_PATH/flag"
 
 USER_PATH="/sdcard/Android/yc/uperf"
+# Absolute CPU root: `$CPU/cpuN/...` was used by platform_special.sh and powercfg_once.sh
+# but never defined, so those writes targeted "/cpuN/..." and silently did nothing.
+CPU="/sys/devices/system/cpu"
 LOG_FILE="$USER_PATH/initsvc.log"
+# Panel state file read by `read_cfg_value`/`write_cfg_value` (libcommon.sh). It was never
+# defined anywhere, so every read returned "" and every write failed with "can't create".
+PANEL_FILE="$USER_PATH/panel_cfg.txt"
 
 # No private toolbox on PATH any more: the module used to prepend its bundled busybox
 # directory here, which shadowed the ROM's own applets (and once made `ps` lie about a

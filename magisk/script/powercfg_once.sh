@@ -58,10 +58,18 @@ unify_sched() {
 }
 
 unify_devfreq() {
-    for df in /sys/class/devfreq; do
-        for d in $df/*cpubw $df/*gpubw $df/*llccbw $df/*cpu-cpu-llcc-bw $df/*cpu-llcc-ddr-bw $df/*cpu-llcc-lat $df/*llcc-ddr-lat $df/*cpu-ddr-latfloor $df/*cpu-l3-lat $df/*cdsp-l3-lat $df/*cdsp-l3-lat $df/*cpu-ddr-qoslat $df/*bpu-ddr-latfloor $df/*snoc_cnoc_keepalive; do
-            lock_val "9999000000" "$d/max_freq"
-        done
+    # Iterate the device *directories* and match the basename: `for df in /sys/class/devfreq`
+    # iterated the literal path once, so `$df/*cpubw` expanded at the wrong level and almost
+    # nothing was ever locked (real nodes are `soc:qcom,cpubw.0`, with max_freq inside).
+    for df in /sys/class/devfreq/*; do
+        [ -d "$df" ] || continue
+        case "${df##*/}" in
+            *cpubw* | *gpubw* | *llccbw* | *cpu-cpu-llcc-bw* | *cpu-llcc-ddr-bw* | \
+            *cpu-llcc-lat* | *llcc-ddr-lat* | *cpu-ddr-latfloor* | *cpu-l3-lat* | \
+            *cdsp-l3-lat* | *cpu-ddr-qoslat* | *bpu-ddr-latfloor* | *snoc_cnoc_keepalive*)
+                lock_val "9999000000" "$df/max_freq"
+                ;;
+        esac
     done
     for d in DDR LLCC L3; do
         lock_val "9999000000" "/sys/devices/system/cpu/bus_dcvs/$d/*/max_freq"
@@ -138,8 +146,11 @@ disable_kernel_boost() {
     done
     lock_val "6 1" /proc/ppm/policy_status
     lock_val "enable 0" /proc/perfmgr/tchbst/user/usrtch
-    lock "/proc/ppm/policy/*"
-    lock "/proc/ppm/*"
+    # `lock` tests its argument as-is and never globs (unlike lock_val), so the quoted
+    # wildcard made both calls silent no-ops and the PPM nodes stayed writable.
+    for f in /proc/ppm/policy/* /proc/ppm/*; do
+        lock "$f"
+    done
     lock_val "0" "/sys/module/mtk_fpsgo/parameters/boost_affinity*"
     lock_val "0" "/sys/module/fbt_cpu/parameters/boost_affinity*"
     lock_val "9999000" "/sys/kernel/fpsgo/fbt/limit_*"
@@ -212,8 +223,14 @@ disable_userspace_thermal() {
     killall mi_thermald
     # prohibit mi_thermald use cpu thermal interface
     for i in 0 2 4 6 7; do
-        local maxfreq="$(cat /sys/devices/system/cpu/cpu$i/cpufreq/cpuinfo_max_freq)"
-        [ "$maxfreq" -gt "0" ] && lock_val "cpu$i $maxfreq" /sys/devices/virtual/thermal/thermal_message/cpu_limits
+        # Readability + numeric check: an empty read made `[ "" -gt 0 ]` print an error and
+        # skip the lock (a partially written node has the same effect).
+        local maxfreq=""
+        maxfreq="$(cat "/sys/devices/system/cpu/cpu$i/cpufreq/cpuinfo_max_freq" 2>/dev/null)"
+        case "$maxfreq" in
+            '' | *[!0-9]*) continue ;;
+        esac
+        [ "$maxfreq" -gt 0 ] && lock_val "cpu$i $maxfreq" /sys/devices/virtual/thermal/thermal_message/cpu_limits
     done
 }
 
@@ -223,8 +240,10 @@ restart_userspace_thermal() {
 }
 
 clear_log
-exec 1>$LOG_FILE
-# exec 2>&1
+exec 1>"$LOG_FILE"
+# stderr too: otherwise every expected "no such file" from this script went to the init log
+# instead of $LOG_FILE, and the file looked clean.
+exec 2>&1
 echo "PATH=$PATH"
 echo "sh=$(which sh)"
 
@@ -235,10 +254,10 @@ unify_sched
 unify_devfreq
 unify_lpm
 
+# Order: kill the thermal daemon, tune, then bring the HALs back last — a HAL restarted before
+# the second tuning pass rewrites the same sysfs knobs the pass then locks 0444.
 disable_userspace_thermal
-restart_userspace_thermal
 disable_userspace_boost
-restart_userspace_boost
 
 # unify value
 disable_kernel_boost
@@ -247,12 +266,13 @@ unify_sched
 unify_devfreq
 unify_lpm
 
+# HALs last: they must not be running while their knobs are rewritten and locked.
+restart_userspace_thermal
+restart_userspace_boost
 
-BASEDIR="$(dirname "$(readlink -f "$0")")"
-. "$BASEDIR"/pathinfo.sh
-. "$BASEDIR"/libcommon.sh
-. "$BASEDIR"/libpowercfg.sh
-. "$BASEDIR"/libcgroup.sh
+
+# Sources are already loaded at the top of this file (libsysinfo.sh is the one addition
+# here); re-sourcing them was pointless duplication.
 . "$BASEDIR"/libsysinfo.sh
 
 
@@ -268,11 +288,11 @@ if [ "$(is_mtk)" == "true" ]; then
         
         lock_val "stop 1" /proc/mtk_batoc_throttling/battery_oc_protect_stop
         
+        # Clear every row. The two `1 1 1` writes after the loop re-installed a limit at
+        # minimum freq/voltage, contradicting the loop and pinning the GPU.
         for i in $(seq 0 10); do
             lock_val "$i 0 0" /proc/gpufreqv2/limit_table
         done
-        lock_val "1 1 1" /proc/gpufreqv2/limit_table
-        lock_val "3 1 1" /proc/gpufreqv2/limit_table
     
         lock_val "0" /sys/kernel/fpsgo/fbt/thrm_enable
         lock_val "300000" /sys/kernel/fpsgo/fbt/thrm_temp_th
@@ -285,19 +305,18 @@ if [ "$(is_mtk)" == "true" ]; then
             lock_val "$i" /sys/devices/system/cpu/sched/set_sched_deisolation
         done
 
-        #force use ppm
+        # Force uperf to use PPM. The *min* limits are 0 (unlimited): a hard minimum of
+        # 3200000 kHz pins the cluster near max frequency until uperf takes over (and forever
+        # if it never starts), and is rejected outright on clusters whose max is lower.
         echo "force uperf use PPM"
-        lock_val "0 3200000" /proc/ppm/policy/hard_userlimit_max_cpu_freq
-        lock_val "0 3200000" /proc/ppm/policy/hard_userlimit_min_cpu_freq
-        lock_val "1 3200000" /proc/ppm/policy/hard_userlimit_max_cpu_freq
-        lock_val "1 3200000" /proc/ppm/policy/hard_userlimit_min_cpu_freq
-        lock_val "2 3200000" /proc/ppm/policy/hard_userlimit_max_cpu_freq
-        lock_val "2 3200000" /proc/ppm/policy/hard_userlimit_min_cpu_freq
+        for i in 0 1 2; do
+            lock_val "$i 3200000" /proc/ppm/policy/hard_userlimit_max_cpu_freq
+            lock_val "$i 0" /proc/ppm/policy/hard_userlimit_min_cpu_freq
+        done
         echo "killing gpu thermal"
         for i in $(seq 0 8); do
             lock_val "$i 0 0" /proc/gpufreq/gpufreq_limit_table
         done
-        lock_val "1 1 1" /proc/gpufreq/gpufreq_limit_table
         # MTK-EARA
         lock_val "0" /sys/kernel/eara_thermal/enable
         lock_val "0" /proc/wmt_tm/tx_thro

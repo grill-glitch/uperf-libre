@@ -27,7 +27,16 @@ BASEDIR="$(dirname "$0")"
 # run (including SIGTERM/SIGINT — see docs/records/m6b-evidence.md §9), but a SIGKILL leaves
 # nothing able to do it. This is the script-side safety net, and it only ever undoes
 # our own state: a policy is touched solely while it reads `userspace`.
-GOVERNOR_STATE="$USER_PATH/orig_governor.txt"
+# Late-bound like `uperf_watchdog_lock_dir`: a caller that redirects USER_PATH after sourcing
+# this file (the host harness, UPERF_WATCHDOG_USER_PATH) would otherwise have
+# `uperf_restore_governors` and `uperf_restore_sysfs` reading/writing different trees.
+uperf_governor_state() {
+    echo "${UPERF_STATE_FILE:-$USER_PATH/orig_governor.txt}"
+}
+
+uperf_sysfs_orig() {
+    echo "${UPERF_SYSFS_ORIG:-$USER_PATH/sysfs_orig.txt}"
+}
 
 # M9: external watchdog. `UPERF_CPUFREQ_ROOT` is the one definition of where the
 # policies live, shared by the watchdog and the host harness
@@ -53,7 +62,9 @@ uperf_policy_dirs() {
 # overwriting the real original with `userspace`.
 uperf_save_governors() {
     mkdir -p "$USER_PATH"
-    local tmp="$GOVERNOR_STATE.new"
+    local state_file
+    state_file="$(uperf_governor_state)"
+    local tmp="$state_file.new"
     : >"$tmp"
     for d in $(uperf_policy_dirs); do
         local cur
@@ -62,7 +73,7 @@ uperf_save_governors() {
         [ "$cur" = "userspace" ] && continue
         echo "$(basename $d) $cur" >>"$tmp"
     done
-    [ -s "$tmp" ] && mv "$tmp" "$GOVERNOR_STATE" || rm -f "$tmp"
+    [ -s "$tmp" ] && mv "$tmp" "$state_file" || rm -f "$tmp"
 }
 
 # Undo the takeover, but only where the takeover is visible AND we know what to
@@ -73,6 +84,8 @@ uperf_save_governors() {
 # even earlier.
 uperf_restore_governors() {
     local restored=0 skipped=0
+    local GOVERNOR_STATE
+    GOVERNOR_STATE="$(uperf_governor_state)"
     for d in $(uperf_policy_dirs); do
         [ "$(cat $d/scaling_governor 2>/dev/null)" = "userspace" ] || continue
         local name want=""
@@ -99,13 +112,14 @@ uperf_restore_governors() {
 #
 # Why the restore lives here and not in the daemon: the interesting case is the daemon
 # that no longer exists. `/proc/<pid>/exe` has moved on; this file has not.
-SYSFS_ORIG="${UPERF_SYSFS_ORIG:-$USER_PATH/sysfs_orig.txt}"
 # Prefix for the paths in the ledger. Empty on a device (the ledger holds real paths);
 # set by the host/device harnesses so a restore never touches the real /sys.
 UPERF_SYSFS_ROOT="${UPERF_SYSFS_ROOT:-}"
 
 uperf_restore_sysfs() {
     local restored=0 unknown=0 failed=0 kept=0 corrupt=0 p v target cur
+    local SYSFS_ORIG
+    SYSFS_ORIG="$(uperf_sysfs_orig)"
     if [ ! -f "$SYSFS_ORIG" ]; then
         return 0
     fi
@@ -141,7 +155,32 @@ uperf_restore_sysfs() {
             unknown=$((unknown + 1))
             continue
         fi
+        # The ledger lives on /sdcard, which any storage-permitted app can write, and its
+        # first field is used as a literal path written as root. Accept only canonical
+        # sysfs paths (plus whatever the fake-root harness already prefixed).
+        case "$p" in
+        */../* | */.. | *//*)
+            echo "uperf: ignoring non-canonical ledger path: $p"
+            corrupt=$((corrupt + 1))
+            continue
+            ;;
+        esac
+        if [ -z "$UPERF_SYSFS_ROOT" ]; then
+            case "$p" in
+            /sys/*) ;;
+            *)
+                echo "uperf: ignoring out-of-tree ledger path: $p"
+                corrupt=$((corrupt + 1))
+                continue
+                ;;
+            esac
+        fi
         target="$UPERF_SYSFS_ROOT$p"
+        if [ -L "$target" ]; then
+            echo "uperf: refusing symlinked ledger target: $p"
+            corrupt=$((corrupt + 1))
+            continue
+        fi
         cur=""
         IFS= read -r cur <"$target" 2>/dev/null
         [ "$cur" = "$v" ] && { kept=$((kept + 1)); continue; }
@@ -176,12 +215,20 @@ uperf_restore_sysfs() {
 # `magisk/script/uperf_watchdog.sh` and `docs/records/m9-watchdog.md`.
 
 uperf_watchdog_pid() {
-    local owner lock_dir
+    local owner lock_dir pid rest start
     lock_dir="$(uperf_watchdog_lock_dir)"
     [ -f "$lock_dir/owner" ] || return 0
-    owner="$(cat "$lock_dir/owner" 2>/dev/null)"
+    owner="$(head -n 1 "$lock_dir/owner" 2>/dev/null)"
     [ -n "$owner" ] || return 0
-    echo "${owner%%:*}"
+    # The owner file survives reboots and pid reuse: verify the recorded start-ticks (field 22
+    # of /proc/<pid>/stat) so a stale owner cannot name an unrelated process that
+    # `uperf_watchdog_stop` would then SIGTERM.
+    pid="${owner%%:*}"
+    rest="${owner#*:}"
+    start="${rest%%:*}"
+    case "$pid$start" in '' | *[!0-9]*) return 0 ;; esac
+    [ "$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)" = "$start" ] || return 0
+    echo "$pid"
 }
 
 # Stopped by `uperf_stop` and by the uninstaller, so an explicit stop is never
@@ -197,10 +244,15 @@ uperf_watchdog_stop() {
         sleep 1
         i=$((i + 1))
     done
-    # A watchdog that did not exit in time still holds the lock; the caller is
-    # stopping the module, so drop it and let the process die on its own.
+    # Only drop the lock once the process is really gone: leaving a running supervisor that
+    # believes the daemon must be up makes it restart it right after `uperf_stop`, and frees
+    # the lock for a second watchdog — the single-instance invariant the lock exists for.
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null
+        sleep 1
+    fi
     lock_dir="$(uperf_watchdog_lock_dir)"
-    rm -rf "$lock_dir" 2>/dev/null
+    kill -0 "$pid" 2>/dev/null || rm -rf "$lock_dir" 2>/dev/null
     return 0
 }
 
@@ -225,8 +277,16 @@ uperf_stop() {
     # restart the daemon we are trying to take down.
     uperf_watchdog_stop
     killall uperf
-    # give the daemon its chance to disarm gracefully, then make sure
-    sleep 1
+    # A fixed sleep is not a synchronisation point: the daemon (supervisor + worker, both
+    # named `uperf`) disarms its own governors while exiting, so restoring underneath a
+    # process that is still writing used to be overwritten by it — or the daemon re-recorded
+    # originals into a ledger that had just been deleted.
+    local i=0
+    while [ "$i" -lt 5 ] && killall -0 uperf >/dev/null 2>&1; do
+        sleep 1
+        i=$((i + 1))
+    done
+    killall -KILL uperf 2>/dev/null
     uperf_restore_governors
     uperf_restore_sysfs
 }
@@ -260,15 +320,27 @@ uperf_trim_log_backup() {
 # after the user directory was removed. Keep a pristine copy at install time and
 # restore it here, loudly, so the failure is recoverable without a reinstall.
 uperf_ensure_config() {
+    # Derive the backing directory from USER_PATH instead of hardcoding today's layout: a
+    # caller that redirects USER_PATH (the host harness, UPERF_WATCHDOG_USER_PATH) used to
+    # get the *real* /data/media/0/... created while the restored file was looked for
+    # somewhere else.
+    if [ ! -d "$USER_PATH" ]; then
+        case "$USER_PATH" in
+            /sdcard/*) mkdir -p "/data/media/0/${USER_PATH#/sdcard/}" 2>/dev/null ;;
+            *) mkdir -p "$USER_PATH" 2>/dev/null ;;
+        esac
+    fi
     mkdir -p "$USER_PATH" 2>/dev/null
-    # /sdcard is an emulated view: creating the directory through it is what the
-    # module's own paths need, and it is also what keeps the view consistent.
-    [ -d "$USER_PATH" ] || mkdir -p /data/media/0/Android/yc/uperf 2>/dev/null
     [ -f "$USER_PATH/uperf.json" ] && return 0
     if [ -f "$USER_PATH/uperf.json.default" ]; then
-        cp -f "$USER_PATH/uperf.json.default" "$USER_PATH/uperf.json"
-        echo "uperf: no config at $USER_PATH/uperf.json, restored the installed default"
-        return 0
+        # A truncated copy is not a restore: check the write before reporting success.
+        if cp -f "$USER_PATH/uperf.json.default" "$USER_PATH/uperf.json" 2>/dev/null &&
+            [ -s "$USER_PATH/uperf.json" ]; then
+            echo "uperf: no config at $USER_PATH/uperf.json, restored the installed default"
+            return 0
+        fi
+        echo "uperf: failed to restore $USER_PATH/uperf.json from the installed default"
+        return 1
     fi
     echo "uperf: no config and no installed default to restore — reinstall the module"
     return 1
@@ -311,6 +383,12 @@ uperf_start() {
 
     # waiting for uperf initialization
     sleep 2
+    # A missing binary, a bad config or an immediate crash used to look identical to success:
+    # caller saw the same sleep, the same cgroup move and a started watchdog.
+    if ! killall -0 uperf >/dev/null 2>&1; then
+        echo "uperf: daemon did not come up, see $USER_PATH/uperf_log.txt"
+        return 1
+    fi
     # uperf shouldn't preempt foreground tasks
     rebuild_process_scan_cache
     change_task_cgroup "uperf" "background" "cpuset"

@@ -36,18 +36,22 @@ abort() {
 
 # $1:file_node $2:owner $3:group $4:permission $5:secontext
 set_perm() {
-    chown $2:$3 $1
-    chmod $4 $1
-    chcon $5 $1
+    # Report a failure instead of silently leaving wrong ownership/labels on the daemon
+    # binaries (the caller prints it; the install still completes).
+    chown "$2:$3" "$1" 2>/dev/null || echo "! warning: chown $2:$3 '$1' failed"
+    chmod "$4" "$1" 2>/dev/null || echo "! warning: chmod $4 '$1' failed"
+    chcon "$5" "$1" 2>/dev/null || echo "! warning: chcon $5 '$1' failed"
 }
 
 # $1:directory $2:owner $3:group $4:dir_permission $5:file_permission $6:secontext
 set_perm_recursive() {
-    find $1 -type d 2>/dev/null | while read dir; do
-        set_perm $dir $2 $3 $4 $6
+    # `read -r`, quoted paths, and a grouped find expression: `find $1 -type f -o -type l`
+    # applied -type f to the first branch only, and a name with a backslash was mangled.
+    find "$1" -type d 2>/dev/null | while IFS= read -r dir; do
+        set_perm "$dir" "$2" "$3" "$4" "$6"
     done
-    find $1 -type f -o -type l 2>/dev/null | while read file; do
-        set_perm $file $2 $3 $5 $6
+    find "$1" \( -type f -o -type l \) 2>/dev/null | while IFS= read -r file; do
+        set_perm "$file" "$2" "$3" "$5" "$6"
     done
 }
 
@@ -94,34 +98,44 @@ install_uperf() {
     fi
 
     echo "- Uperf config is located at $USER_PATH"
-    mkdir -p $USER_PATH
-    mv -f $USER_PATH/uperf.json $USER_PATH/uperf.json.bak
-    cp -f $MODULE_PATH/config/$cfgname.json $USER_PATH/uperf.json
+    # Every step is checked: `config/` is deleted below, so a silent copy failure left the
+    # device with no usable config at all while still printing "installed successfully".
+    mkdir -p "$USER_PATH" || abort "! Cannot create $USER_PATH (storage not mounted?)."
+    if [ -f "$USER_PATH/uperf.json" ]; then
+        mv -f "$USER_PATH/uperf.json" "$USER_PATH/uperf.json.bak" ||
+            abort "! Cannot back up $USER_PATH/uperf.json"
+    fi
+    cp -f "$MODULE_PATH/config/$cfgname.json" "$USER_PATH/uperf.json" ||
+        abort "! Cannot install $cfgname.json into $USER_PATH"
     # Kept for libuperf.sh::uperf_ensure_config(): `config/` is deleted below, so this
     # is the only copy left on the device, and it is what makes a lost user directory
     # recoverable instead of requiring a reinstall.
-    cp -f $MODULE_PATH/config/$cfgname.json $USER_PATH/uperf.json.default
-    [ ! -e "$USER_PATH/perapp_powermode.txt" ] && cp $MODULE_PATH/config/perapp_powermode.txt $USER_PATH/perapp_powermode.txt
-    rm -rf $MODULE_PATH/config
-    set_perm_recursive $BIN_PATH 0 0 0755 0755 u:object_r:system_file:s0
+    cp -f "$MODULE_PATH/config/$cfgname.json" "$USER_PATH/uperf.json.default" ||
+        abort "! Cannot install the config default into $USER_PATH"
+    if [ ! -e "$USER_PATH/perapp_powermode.txt" ]; then
+        cp -f "$MODULE_PATH/config/perapp_powermode.txt" "$USER_PATH/perapp_powermode.txt" ||
+            echo "! warning: could not install perapp_powermode.txt"
+    fi
+    # Guard the rm: MODULE_PATH is derived from `readlink -f "$0"`, and an empty value here
+    # would have expanded to `rm -rf /config`.
+    [ -n "$MODULE_PATH" ] && [ -d "$MODULE_PATH/config" ] && rm -rf "$MODULE_PATH/config"
+    set_perm_recursive "$BIN_PATH" 0 0 0755 0755 u:object_r:system_file:s0
 }
 
 fix_module_prop() {
-    mkdir -p /data/adb/modules/uperf/
-    cp -f "$MODULE_PATH/module.prop" /data/adb/modules/uperf/module.prop
+    # Read the id from module.prop: the installed directory is `<id>` under
+    # /data/adb/modules, and hardcoding `uperf` created a stray half-populated module dir
+    # (and broke silently if the id ever changed).
+    local modid
+    modid="$(grep -m1 '^id=' "$MODULE_PATH/module.prop" 2>/dev/null | cut -d= -f2-)"
+    [ -n "$modid" ] || modid=uperf
+    [ -d /data/adb/modules ] || return 0
+    mkdir -p "/data/adb/modules/$modid"
+    cp -f "$MODULE_PATH/module.prop" "/data/adb/modules/$modid/module.prop"
 }
 
 # Kept from upstream, currently unused (the call is commented out below): creates the
 # empty vendor perf config files so the ROM stops reading its own perf tuning.
-unlock_limit() {
-    if [ ! -d $MODPATH/system/vendor/etc/perf/ ]; then
-        dir=$MODPATH/system/vendor/etc/perf/
-        mkdir -p $dir
-    fi
-    for i in `ls /system/vendor/etc/perf/`; do
-        touch $dir/$i
-    done
-}
 
 print_banner
 
@@ -130,7 +144,6 @@ print_banner
 require_aarch64 || abort "! uperf-libre: this device is $(module_abi); see the reason above."
 
 install_uperf
-# unlock_limit
 fix_module_prop
 
 echo "* uperf-libre installed successfully."

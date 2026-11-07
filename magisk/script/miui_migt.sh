@@ -25,32 +25,28 @@ hide_value() {
   if [[ -e "$1" ]]; then
     umount "$1" 2>/dev/null
     c_path="/cache${1}"
-    if [[ ! -f "$c_path" ]]; then
-      mkdir -p "$c_path"
-      rm -r "$c_path"
+    # Create the *parent* and clear a stale file. `mkdir -p "$c_path"` created a directory at
+    # the file path and then `rm -r` deleted it — destroying the whole subtree if a directory
+    # already lived there.
+    mkdir -p "$(dirname "$c_path")" 2>/dev/null
+    rm -f "$c_path" 2>/dev/null
+    chattr -i "$c_path" 2>/dev/null
+    if ! cp -f "$1" "$c_path" 2>/dev/null; then
+      echo "hide_value: failed to cache $1"
+      return 1
     fi
-    chattr -i "$c_path"
-    cp -f "$1" "$c_path"
     if [[ "$2" != "" ]]; then
-      lock_value "$2" "$1"
+      lock_val "$2" "$1"
     fi
-    mount --bind "$c_path" "$1"
+    if ! mount --bind "$c_path" "$1" 2>/dev/null; then
+      echo "hide_value: bind mount failed for $1"
+      return 1
+    fi
   else
     echo "$1" Not Found!
   fi
 }
 
-set_value() {
-  value=$1
-  path=$2
-  if [[ -f $path ]]; then
-    current_value="$(cat $path)"
-    if [[ ! "$current_value" = "$value" ]]; then
-      chmod 0664 "$path"
-      echo "$value" > "$path"
-    fi;
-  fi;
-}
 
 disable_migt(){
   migt=/sys/module/migt/parameters
@@ -67,10 +63,15 @@ disable_migt(){
     hide_value $migt/glk_fbreak_enable '0'
     hide_value $migt/force_reset_runtime '0'
 
-    settings put secure speed_mode_enable 1
-    chmod 000 $migt/*
-    chmod 000 /sys/module/migt
-    chmod 000 /sys/module/sched_walt/holders/migt/parameters
+    # `settings` needs system_server: guard it and check the exit status.
+    if command -v settings >/dev/null 2>&1; then
+      settings put secure speed_mode_enable 1 2>/dev/null
+    fi
+    for f in "$migt"/*; do
+      [ -e "$f" ] && chmod 000 "$f" 2>/dev/null
+    done
+    chmod 000 /sys/module/migt 2>/dev/null
+    chmod 000 /sys/module/sched_walt/holders/migt/parameters 2>/dev/null
   fi
 
   glk=/proc/sys/glk
@@ -90,16 +91,21 @@ disable_migt(){
     hide_value $migt/boost_pid '0'
   fi
 
-  chmod 000 /sys/class/misc/migt
-  chmod 000 /sys/module/sched_walt/holders/migt
+  chmod 000 /sys/class/misc/migt 2>/dev/null
+  chmod 000 /sys/module/sched_walt/holders/migt 2>/dev/null
 }
 
 migt_away(){
-if [ "$(miui_check)" = "true" ]; then
-disable_migt
-else
-echo "not support"
-fi
+  # The MIUI version check is not the gate: each block below already tests for its own path,
+  # and `miui_check` reports false on non-MIUI ROMs that do ship these modules (and on a
+  # failed property read, since `[ "" = "true" ]`).
+  if command -v miui_check >/dev/null 2>&1 && [ "$(miui_check)" = "true" ]; then
+    disable_migt
+  elif [ -d /proc/sys/migt ] || [ -d /proc/sys/glk ] || [ -d /sys/module/migt ]; then
+    disable_migt
+  else
+    echo "not support"
+  fi
 }
 
 migt_away

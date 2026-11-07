@@ -110,6 +110,10 @@ WD_BACKSTOP="${UPERF_WATCHDOG_BACKSTOP:-20}"
 SF_ENABLE="${UPERF_SF_INJECT:-0}"
 SF_TARGET="${UPERF_SF_TARGET:-/system/bin/surfaceflinger}"
 SF_LIB="${UPERF_SF_LIB:-$BIN_PATH/libsfanalysis_rs.so}"
+# `/data/local/tmp` is shell-writable and is the conventional drop point for pushed
+# binaries: defaulting there means this root process ptrace-injects using a file the `shell`
+# user can replace at any time (a clean privilege escalation, on a schedule). The file must
+# therefore be root-owned and not group/other-writable before it is executed.
 SF_INJECTOR="${UPERF_SF_INJECTOR:-/data/local/tmp/injector}"
 # The library is staged before injecting, and this is not optional: surfaceflinger runs as
 # `system`, and the module's own directory is not a path that domain can read. Measured on
@@ -332,11 +336,23 @@ wd_lock_owner_alive() {
 }
 
 wd_lock_acquire() {
-    mkdir -p "$WD_LOCK_DIR" 2>/dev/null || return 1
-    if wd_lock_owner_alive; then
-        return 1
+    # Atomic: a bare `mkdir` fails for the loser of a simultaneous start (two watchdogs
+    # racing a boot script). `mkdir -p` succeeded either way and the liveness check ran
+    # *before* the owner file existed, so both could claim the lock and both would supervise.
+    local parent
+    parent="$(dirname "$WD_LOCK_DIR")"
+    mkdir -p "$parent" 2>/dev/null || return 1
+    if ! mkdir "$WD_LOCK_DIR" 2>/dev/null; then
+        # The lock exists: it is ours only if the recorded owner is dead.
+        if wd_lock_owner_alive; then
+            return 1
+        fi
+        rm -rf "$WD_LOCK_DIR" 2>/dev/null
+        mkdir "$WD_LOCK_DIR" 2>/dev/null || return 1
     fi
     printf '%s:%s:%s\n' "$$" "$WD_BOOT_ID" "$WD_SELF_START" >"$WD_LOCK_DIR/owner" 2>/dev/null || return 1
+    # Re-verify: if another instance wrote its owner line in between, it won.
+    [ "$(cut -d: -f1 "$WD_LOCK_DIR/owner" 2>/dev/null)" = "$$" ] || return 1
     WD_OWNED=1
     return 0
 }
@@ -415,6 +431,20 @@ wd_sf_check() {
     local id pid
     [ "$SF_ENABLE" = "1" ] || return 0
     [ "$SF_DISABLED" = "1" ] && return 0
+    # Dry run is documented as "samples and reports, never acts" — yet this path still
+    # ptrace-injected, staged a library into /data/misc/surfaceflinger and changed its owner.
+    [ "$WD_DRY_RUN" = "1" ] && return 0
+    # The injector is executed as root: refuse one that `shell` could have replaced.
+    if [ -n "$SF_INJECTOR" ] && [ -e "$SF_INJECTOR" ]; then
+        local owner mode
+        owner="$(stat -c %u "$SF_INJECTOR" 2>/dev/null)"
+        mode="$(stat -c %a "$SF_INJECTOR" 2>/dev/null)"
+        if [ "$owner" != "0" ] || { [ -n "$mode" ] && [ $((0$mode & 022)) -ne 0 ]; }; then
+            wd_log "sf: refusing injector $SF_INJECTOR (owner=$owner mode=$mode; must be root-owned, not group/other-writable)"
+            SF_DISABLED=1
+            return 0
+        fi
+    fi
 
     id="$(wd_sf_pid)"
     if [ -z "$id" ]; then
@@ -541,6 +571,15 @@ wd_state_write() {
     return 0
 }
 
+# Rotate when the log has grown past its budget, at most once per N samples: a long-running
+# observe-only watchdog used to append with no rotation at all (~5 MB/day).
+WD_LOG_CHECKS=0
+wd_maybe_rotate_log() {
+    WD_LOG_CHECKS=$((WD_LOG_CHECKS + 1))
+    [ $((WD_LOG_CHECKS % 100)) -eq 0 ] || return 0
+    wd_rotate_log
+}
+
 wd_rotate_log() {
     local size
     [ -f "$WD_LOG" ] || return 0
@@ -588,6 +627,8 @@ wd_restore_governors() {
 }
 
 wd_recover() {
+    # Refuse to act when a stop is already pending (see the trap comment in `main`).
+    [ "${WD_STOPPING:-0}" = "1" ] && return 1
     # This path kills things: work off a fresh sweep, never off the cache (the cache is
     # what broke, so what it holds is exactly what cannot be trusted).
     wd_scan
@@ -685,6 +726,7 @@ main() {
     WD_LAST_WRITTEN=""
     WD_DRY_RUN=0
     WD_GAVE_UP=0
+    WD_STOPPING=0
     [ "${UPERF_WATCHDOG_DRY_RUN:-0}" = "1" ] && WD_DRY_RUN=1
     [ "$WD_DRY_RUN" = "1" ] && WD_OBSERVE_ONLY=1
     WD_SUP=""
@@ -696,11 +738,29 @@ main() {
 
     wd_rotate_log
 
+    # The restart budget is documented "per boot", but it was process-local: a watchdog
+    # restarted by `uperf_start` started from 0 again, so a daemon that dies right after every
+    # start was restarted forever. Load the previous count only when it belongs to this boot.
+    if [ -f "$WD_STATE" ]; then
+        local prev_boot prev_restarts
+        prev_boot="$(sed -n 's/^boot_id=//p' "$WD_STATE" 2>/dev/null | head -n 1)"
+        prev_restarts="$(sed -n 's/^restarts=//p' "$WD_STATE" 2>/dev/null | head -n 1)"
+        case "$prev_restarts" in '' | *[!0-9]*) prev_restarts=0 ;; esac
+        if [ -n "$prev_boot" ] && [ "$prev_boot" = "$WD_BOOT_ID" ] && [ "$prev_restarts" -gt 0 ]; then
+            WD_RESTARTS="$prev_restarts"
+            [ "$WD_RESTARTS" -ge "$WD_MAX_RESTARTS" ] && WD_OBSERVE_ONLY=1 && WD_GAVE_UP=1
+        fi
+    fi
+
     if ! wd_lock_acquire; then
         wd_log "another watchdog owns the lock ($(wd_lock_owner)) — exiting"
         exit 0
     fi
-    trap 'wd_shutdown "signalled"' TERM INT
+    # The flag is what `wd_recover` checks before it starts a daemon: a trap fires only after
+    # the current foreground command returns, so a TERM during `wd_recover` could otherwise
+    # spawn a daemon *after* `uperf_stop`'s killall had already run — an explicit stop that
+    # leaves a live, takeover-armed daemon behind.
+    trap 'WD_STOPPING=1; wd_shutdown "signalled"' TERM INT
 
     wd_log "watchdog started pid=$$ boot=$(echo "$WD_BOOT_ID" | cut -c1-8) interval=${WD_INTERVAL}s retry=${WD_RETRY_INTERVAL}s grace=${WD_GRACE} max_restarts=${WD_MAX_RESTARTS} dry_run=$WD_DRY_RUN exe=$DAEMON_EXE"
     wd_state_write "starting" "watchdog up, waiting for the daemon"
@@ -754,7 +814,12 @@ main() {
             wd_sleep "$WD_INTERVAL"
         else
             WD_MISS=$((WD_MISS + 1))
-            wd_log "unhealthy sample $WD_MISS/$WD_GRACE: sup_n=$sup_n work_n=$work_n armed=[$WD_LAST_ARMED]"
+            # Log the transition, not every sample: at a 3 s retry interval an unhealthy (or
+            # observe-only) daemon wrote a line every 3 s for the rest of the boot.
+            if [ "$WD_MISS" -eq 1 ] || [ "$WD_MISS" -ge "$WD_GRACE" ]; then
+                wd_log "unhealthy sample $WD_MISS/$WD_GRACE: sup_n=$sup_n work_n=$work_n armed=[$WD_LAST_ARMED]"
+            fi
+            wd_maybe_rotate_log
             WD_STATE_CUR="unhealthy"
             if [ "$WD_OBSERVE_ONLY" = "1" ]; then
                 # Dry run (or a spent budget): report the verdict, change nothing.
