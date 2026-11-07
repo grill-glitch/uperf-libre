@@ -16,7 +16,9 @@
 
 #pragma once
 
+#include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -54,8 +56,24 @@ public:
     Inotify();
     ~Inotify();
 
+    // Thread-safe: `Add` may be called from any thread while the watcher thread is inside
+    // WaitAndHandle(). Copy/move are deleted because both would duplicate `fd_` (double
+    // close) and the watch descriptors.
+    Inotify(const Inotify &) = delete;
+    Inotify &operator=(const Inotify &) = delete;
+    Inotify(Inotify &&) = delete;
+    Inotify &operator=(Inotify &&) = delete;
+
     void Add(const std::string &path, int mask, Notifier notifier);
+    /// Stop watching `path` (and forget its callback). Returns false when it was unwatched.
+    bool Remove(const std::string &path);
+    /// Wait up to `timeoutMs` for an event. `false` = timeout (no event pending).
+    bool WaitForEvent(int timeoutMs);
+    /// Read and dispatch one batch. Safe to call only when WaitForEvent() returned true
+    /// (the descriptor is non-blocking, so an empty read is a no-op).
     void WaitAndHandle(void);
+    /// The underlying descriptor, so a caller can poll it together with other fds.
+    int Fd(void) const { return fd_; }
 
 private:
     struct WatchItem {
@@ -64,7 +82,25 @@ private:
         int mask;
     };
 
+    /// A watch the kernel dropped (`IN_IGNORED`/`*_SELF`) whose path is not back yet.
+    /// Re-adding is retried from the watcher loop instead of sleeping inside the event
+    /// dispatch: a 500 ms sleep there held up every other watch and could overflow the
+    /// kernel queue.
+    struct PendingReadd {
+        WatchItem item;
+        int64_t nextTryUs;
+        int attempts;
+    };
+
+    /// Retry the due `pendingReadd_` entries. Watcher thread only (also called on poll
+    /// timeout), so no extra locking beyond `mutex_` for the table itself.
+    void ProcessPendingReadd(void);
+
     int fd_;
     std::unordered_map<int, WatchItem> items_;
+    std::vector<PendingReadd> pendingReadd_;
     std::vector<uint8_t> buf_;
+    // Serialises the watch table: `Add()` inserts while the watcher thread looks up and
+    // erases. Never held while a notifier runs (a notifier may call `Add`).
+    std::mutex mutex_;
 };

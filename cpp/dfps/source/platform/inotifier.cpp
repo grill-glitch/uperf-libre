@@ -16,21 +16,49 @@
 
 #include "inotifier.h"
 #include "utils/misc.h"
+#include <spdlog/spdlog.h>
 
 constexpr char MODULE_NAME[] = "Inotifier";
 constexpr int64_t INOTIFY_EVT_MIN_INTERVAL_MS = 10;
+// Long enough to keep the CPU idle, short enough that Stop() is prompt.
+constexpr int INOTIFY_POLL_TIMEOUT_MS = 100;
 
 Inotifier::Inotifier() {
+    running_ = true;
     th_ = std::thread([this]() {
         SetSelfThreadName(MODULE_NAME);
-        for (;;) {
-            inoti_.WaitAndHandle();
+        while (running_) {
+            // An exception escaping this thread calls std::terminate and takes the daemon
+            // down. A failed read or a throwing notifier must not.
+            try {
+                if (!inoti_.WaitForEvent(INOTIFY_POLL_TIMEOUT_MS)) {
+                    continue;
+                }
+                inoti_.WaitAndHandle();
+            } catch (const std::exception &e) {
+                SPDLOG_ERROR("Inotifier: {}", e.what());
+                Sleep(MsToUs(1000)); // bound the log rate on a persistent error
+            }
             Sleep(MsToUs(INOTIFY_EVT_MIN_INTERVAL_MS));
         }
     });
-    th_.detach();
+}
+
+Inotifier::~Inotifier() { Stop(); }
+
+void Inotifier::Stop(void) {
+    if (!running_.exchange(false)) {
+        return;
+    }
+    // Joinable, not detached: the loop captures `this`, so a detached thread kept calling
+    // into a destroyed Inotify (and closing its fd) when the singleton was ever torn down.
+    if (th_.joinable()) {
+        th_.join();
+    }
 }
 
 void Inotifier::Add(const std::string &path, int mask, Inotify::Notifier notifier) {
     return inoti_.Add(path, mask, notifier);
 }
+
+bool Inotifier::Remove(const std::string &path) { return inoti_.Remove(path); }

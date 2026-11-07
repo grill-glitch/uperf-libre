@@ -16,17 +16,32 @@
 
 #pragma once
 
-#include "utils/inotify.h"
 #include "singleton.h"
+#include "utils/inotify.h"
+#include <atomic>
 #include <string>
 #include <thread>
 
 class Inotifier : public Singleton<Inotifier> {
 public:
+private:
+    // Only Singleton<Inotifier> may construct it: a second instance would bypass the shared
+    // state (the subscriber table / worker slots) the class exists to provide.
+    friend class Singleton<Inotifier>;
     Inotifier();
+
+public:
+    ~Inotifier();
+    /// Register a watch. Thread-safe (Add may run while the watcher thread is dispatching).
     void Add(const std::string &path, int mask, Inotify::Notifier notifier);
+    /// Remove the watch on `path`, so a callback bound to a module instance cannot fire
+    /// after that module is destroyed.
+    bool Remove(const std::string &path);
+    /// Stop and join the watcher thread. Idempotent.
+    void Stop(void);
 
 private:
     Inotify inoti_;
     std::thread th_;
+    std::atomic<bool> running_{false};
 };
