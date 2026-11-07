@@ -69,10 +69,17 @@ pub fn sym_file_offset(elf: &[u8], symbol: &str) -> Result<u64, String> {
     let e_shentsize = u16at(elf, 0x3a).ok_or("truncated header")? as usize;
     let e_shnum = u16at(elf, 0x3c).ok_or("truncated header")? as usize;
 
+    // Every offset below is derived from attacker/garbage-controllable header values: a
+    // truncated library used to panic ("attempt to add with overflow") or silently misparse
+    // in release. Checked arithmetic rejects it instead.
+    let checked = |base: usize, idx: usize, ent: usize| -> Option<usize> {
+        idx.checked_mul(ent).and_then(|o| base.checked_add(o))
+    };
+
     // the loadable segments, for the address -> offset mapping
     let mut loads: Vec<(u64, u64, u64)> = Vec::new(); // (vaddr, offset, filesz)
     for i in 0..e_phnum {
-        let p = e_phoff + i * e_phentsize;
+        let p = checked(e_phoff, i, e_phentsize).ok_or("bad phdr offset")?;
         if u32at(elf, p) == Some(1) {
             loads.push((
                 u64at(elf, p + 16).ok_or("bad phdr")?,
@@ -85,7 +92,7 @@ pub fn sym_file_offset(elf: &[u8], symbol: &str) -> Result<u64, String> {
     // SHT_DYNSYM = 11
     let mut found: Option<(usize, usize, usize, usize, u64)> = None; // (off, size, entsize, strtab_off, strtab_size)
     for i in 0..e_shnum {
-        let sh = e_shoff + i * e_shentsize;
+        let sh = checked(e_shoff, i, e_shentsize).ok_or("bad shdr offset")?;
         if u32at(elf, sh + 4) != Some(11) {
             continue;
         }
@@ -387,11 +394,29 @@ impl UprobeTask {
                     let target = match pinned_pid {
                         Some(pid) => Some(("pinned".to_string(), pid)),
                         None => pkg.as_deref().and_then(|p| {
-                            pids_for_package(p).into_iter().next().map(|pid| (p.to_string(), pid))
+                            // Only the *first* pid used to be probed. For an app with a
+                            // `:remote` process (or a separate renderer) that pid may never
+                            // call queueBuffer, and the leg reported 0 fps for a rendering
+                            // app. Prefer the pid that actually owns a RenderThread.
+                            let pids = pids_for_package(p);
+                            let pid = pids
+                                .iter()
+                                .copied()
+                                .find(|pid| {
+                                    let pid = *pid as i32;
+                                    crate::procfs::thread_ids(pid).into_iter().any(|tid| {
+                                        crate::procfs::comm_of(pid, tid).contains("RenderThread")
+                                    })
+                                })
+                                .or_else(|| pids.first().copied());
+                            pid.map(|pid| (p.to_string(), pid))
                         }),
                     };
                     match (&counter, &target) {
-                        (Some(_), Some((p, pid))) if open_for.as_ref() == Some(&(p.clone(), *pid)) => {}
+                        (Some(_), Some((p, pid)))
+                            if open_for
+                                .as_ref()
+                                .is_some_and(|(op, opid)| op == p && opid == pid) => {}
                         _ => {
                             counter = None;
                             open_for = None;
@@ -409,6 +434,10 @@ impl UprobeTask {
                                         c.reset_and_enable();
                                         counter = Some(c);
                                         open_for = Some((p.clone(), *pid));
+                                        // A fresh probe starts with a fresh silence count;
+                                        // otherwise two silent windows from the previous
+                                        // target tore down the new one immediately.
+                                        zero_windows = 0;
                                     }
                                     Err(e) => {
                                         log(&format!("Rust: sf-uprobe attach failed: {e}"));
@@ -420,7 +449,9 @@ impl UprobeTask {
                         }
                     }
 
-                    std::thread::sleep(Duration::from_millis(window_ms));
+                    let window_start = std::time::Instant::now();
+                    std::thread::sleep(Duration::from_millis(window_ms.max(1)));
+                    // A zero window spins the loop and makes the fps division inf/NaN.
                     let window = counter.as_ref().map(|c| {
                         // `disable_and_sum` returns the count since the last RESET, i.e.
                         // exactly this window's frames.
@@ -429,7 +460,15 @@ impl UprobeTask {
                         (frames, c.events.len(), open_for.clone().unwrap_or_default())
                     });
                     if let Some((frames, tids, (p, pid))) = window {
-                        let fps = frames as f64 * 1000.0 / window_ms as f64;
+                        // Measure the real interval: the counters keep running through the
+                        // proc walks above and the sleep, so dividing by `window_ms` alone
+                        // systematically inflated the published rate.
+                        let elapsed_ms = window_start.elapsed().as_secs_f64() * 1000.0;
+                        let fps = if elapsed_ms > 0.5 {
+                            frames as f64 * 1000.0 / elapsed_ms
+                        } else {
+                            0.0
+                        };
                         set_state(true, fps, frames);
                         log(&format!(
                             "Rust: sf-uprobe {p} pid={pid} events={tids} frames={frames} fps={fps:.1}"

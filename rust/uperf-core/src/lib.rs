@@ -70,21 +70,32 @@ fn log_buf() -> &'static Mutex<Vec<u8>> {
     LOG_BUF.get_or_init(|| Mutex::new(Vec::with_capacity(256)))
 }
 
-/// SAFETY: see AGENT.md §5.1.
+/// SAFETY: see AGENT.md §5.1. `topic` must be non-null and NUL-terminated; `data` is
+/// borrowed only for the duration of the call (`data == null` is allowed iff `len == 0`).
 #[no_mangle]
 pub(crate) unsafe extern "C" fn uperf_rs_on_event(
     topic: *const libc::c_char,
     data: *const libc::c_void,
     len: usize,
 ) {
+    // A NULL topic would be immediate UB in CStr::from_ptr; this is a plain function
+    // pointer reachable from C++, so guard it instead of trusting the caller.
+    if topic.is_null() {
+        return;
+    }
     let topic = match unsafe { CStr::from_ptr(topic) }.to_str() {
         Ok(s) => s,
         Err(_) => return,
     };
-    let payload: &[u8] = if data.is_null() || len == 0 {
+    if data.is_null() && len != 0 {
+        // Contract violation: a length without a buffer. Dropping it beats inventing an
+        // empty payload that looks like a real event body.
+        return;
+    }
+    let payload: &[u8] = if data.is_null() {
         &[]
     } else {
-        // SAFETY: contract.
+        // SAFETY: contract — `data` points to `len` readable bytes for this call.
         unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) }
     };
 
@@ -103,10 +114,18 @@ pub(crate) unsafe extern "C" fn uperf_rs_on_event(
 /// diagnostic for a broken caller, not a substitute for this contract.
 #[no_mangle]
 pub(crate) unsafe extern "C" fn uperf_rs_init(bridge: *const Bridge) {
-    assert!(!bridge.is_null(), "bridge pointer must be non-null");
+    // `assert!` inside `extern "C"` aborts the whole process (a panic cannot unwind across
+    // the C ABI): reject a broken caller instead of taking the daemon down with it.
+    if bridge.is_null() {
+        log_msg("uperf_rs_init: null bridge pointer, ignoring");
+        return;
+    }
     // SAFETY: contract — `bridge` points to a live, process-lifetime `Bridge`.
     let b = unsafe { (*bridge).clone() };
-    let _ = BRIDGE.set(b);
+    if BRIDGE.set(b).is_err() {
+        // Distinguish a real double-init from the documented no-op.
+        log_msg("uperf_rs_init: bridge already initialized, keeping the first one");
+    }
 }
 
 /// Reset the `SIGCHLD` disposition so `std::process::Command` works from the
@@ -146,13 +165,19 @@ pub(crate) unsafe extern "C" fn uperf_rs_start(
     let cfg = unsafe { CStr::from_ptr(config_path) };
     let log = unsafe { CStr::from_ptr(log_path) };
 
+    // `to_string_lossy` would replace invalid UTF-8 with U+FFFD and hand a *different*
+    // (non-existent) path to every consumer, surfacing far away as "config not found".
+    let (Ok(cfg_str), Ok(log_str)) = (cfg.to_str(), log.to_str()) else {
+        return -1;
+    };
+
     // The one place the environment is read (`settings.rs`). Parsing it here — at the
     // outermost edge, before any thread exists — is what lets the rest of the crate
     // take its knobs as parameters, and what removes the `set_var` calls this
     // function used to make to publish derived paths: writing `environ` while the
     // previous generation's threads are still alive is exactly the data race Rust
     // 2024 marks `set_var` unsafe for.
-    let settings = settings::Settings::from_env(&cfg.to_string_lossy(), &log.to_string_lossy());
+    let settings = settings::Settings::from_env(cfg_str, log_str);
     *settings_slot().lock() = Some(settings.clone());
 
     // A re-start must not leave the previous generation running beside the new one.
@@ -166,22 +191,28 @@ pub(crate) unsafe extern "C" fn uperf_rs_start(
     // `state` / `takeover` / `armed` are observable without parsing the log, and so a
     // stale `state=running` with no live process is the documented signature of a kill
     // (which no in-process path survives).
-    if let Some(target) = settings.status.as_ref() {
+    let cfg_path = settings.config_path.clone();
+    let log_path_shown = settings.log_path.clone();
+    let loaded = settings.config_dir.is_some();
+    let status_target = settings.status.clone();
+    let take_over = settings.cpu_governor;
+    *daemon_slot().lock() = Some(Daemon::start(settings));
+
+    // Publish `state=running` only now that a daemon is really in the slot. Writing it
+    // first meant a startup panic (or a signal before the listener exists) left a status
+    // file claiming a live, armed daemon while none existed — the signature the module's
+    // watchdog interprets as a kill.
+    if let Some(target) = status_target.as_ref() {
         status::write(
             &target.path,
             &status::Snapshot {
                 state: "running",
-                takeover: settings.cpu_governor,
+                takeover: take_over,
                 armed: &[],
                 config: &target.config,
             },
         );
     }
-
-    let cfg_path = settings.config_path.clone();
-    let log_path_shown = settings.log_path.clone();
-    let loaded = settings.config_dir.is_some();
-    *daemon_slot().lock() = Some(Daemon::start(settings));
 
     // Only now, with a daemon in the slot: a signal that arrived during startup stayed
     // pending (the worker blocks the teardown set before creating any thread), so it is

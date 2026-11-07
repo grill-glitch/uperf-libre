@@ -89,7 +89,10 @@ impl ForegroundFile {
             self.last = None;
             return None;
         };
-        if now_ms.saturating_sub(ts) > self.max_age_ms {
+        // A timestamp *ahead* of our clock is stale, not fresh: the helper writes a
+        // boot-relative uptime, so a file left over from the previous boot has a `ts`
+        // larger than the new monotonic clock and saturating_sub would clamp it to 0.
+        if ts > now_ms || now_ms - ts > self.max_age_ms {
             self.last = None;
             return None;
         }

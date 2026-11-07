@@ -76,6 +76,14 @@ pub trait Sink {
     fn write(&mut self, w: &SysfsWrite);
 }
 
+/// Prefix of the pseudo-write the no-config path queues to represent a hint transition.
+pub const SYNTHETIC_MARKER_PREFIX: &str = "__hint_transition__";
+
+/// True for the no-config marker: it is not a filesystem path and no sink may write it.
+pub fn is_synthetic_marker(path: &str) -> bool {
+    path.starts_with(SYNTHETIC_MARKER_PREFIX)
+}
+
 /// In-memory sink (tests, parity runs).
 #[derive(Default, Debug)]
 pub struct CollectingSink {
@@ -118,15 +126,36 @@ impl UnderRootSink {
         }
     }
 
-    fn mapped(&self, path: &str) -> PathBuf {
-        self.root.join(path.trim_start_matches('/'))
+    /// Map a configured path under the fake root. `None` when the path is relative or
+    /// contains `..`: the knob table comes from a user-editable config, and joining an
+    /// escaping path would write outside the validation root.
+    fn mapped(&self, path: &str) -> Option<PathBuf> {
+        if !path.starts_with('/') || path.split('/').any(|c| c == "..") {
+            return None;
+        }
+        Some(self.root.join(path.trim_start_matches('/')))
     }
 }
 impl Sink for UnderRootSink {
     fn write(&mut self, w: &SysfsWrite) {
-        let target = self.mapped(&w.path);
+        // The no-config marker is not a path: creating a file for it pollutes the root.
+        if is_synthetic_marker(&w.path) {
+            self.written.push(w.clone());
+            return;
+        }
+        let Some(target) = self.mapped(&w.path) else {
+            self.failed
+                .push((w.path.clone(), "path escapes the fake root".to_string()));
+            return;
+        };
         if let Some(parent) = target.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            // Without this the ledger recorded "written, no readable original" for a path
+            // whose directory never existed, and the write failed with a bare OS error.
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                self.failed
+                    .push((w.path.clone(), format!("create {} : {e}", parent.display())));
+                return;
+            }
         }
         crate::sysfs_ledger::record_before_write(&mut self.ledger, &w.path, &target);
         match std::fs::write(&target, w.payload()) {
@@ -269,7 +298,9 @@ impl Orchestrator {
                 self.generation += 1;
             }
         }
-        let incoming = event_to_hint(ev);
+        let Some(incoming) = event_to_hint(ev) else {
+            return;
+        };
         if let Some(transition) = self.hint.process(incoming) {
             let new_scene = Self::scene_for_hint(transition.to);
             if new_scene != self.scene {
@@ -282,8 +313,11 @@ impl Orchestrator {
 
     fn plan_current_scene(&mut self) {
         let Some(cfg) = self.cfg.as_ref() else {
+            // Internal marker for the no-config smoke path. It is queued like a sysfs write,
+            // so the sinks must skip it (`is_synthetic_marker`) instead of creating a file
+            // named `__hint_transition__<scene>` under the fake root (or the cwd).
             self.pending.push(SysfsWrite::new(
-                format!("__hint_transition__{}", self.scene),
+                format!("{}{}", SYNTHETIC_MARKER_PREFIX, self.scene),
                 self.scene.clone(),
             ));
             return;
@@ -344,12 +378,22 @@ impl Orchestrator {
     }
 }
 
-fn event_to_hint(ev: &crate::topic_dispatch::Event) -> SfHint {
+/// Map an event to a hint, or `None` when the event is not a hint source at all.
+///
+/// AGENT.md §8.1 defines `idle -> touch : touch / key press`. Mapping every `Btn` event
+/// (release *and* press) to `Idle` meant a key press could never enter the touch scene and
+/// actively downgraded a running touch/gesture/switch hint.
+///
+/// `Topapp` / `CgroupList` / `CgroupUpdate` are not hint sources: cgroup topics fire on every
+/// membership change (including our own cpuset writes) and forced the FSM back to `idle`,
+/// cutting a scene short.
+fn event_to_hint(ev: &crate::topic_dispatch::Event) -> Option<SfHint> {
     use crate::topic_dispatch::Event::*;
-    match ev {
+    Some(match ev {
         Touch(true) => SfHint::Touch,
         Touch(false) => SfHint::Trigger,
-        Btn(_) => SfHint::Idle,
+        Btn(true) => SfHint::Touch,
+        Btn(false) => SfHint::Trigger,
         InputState {
             hold: true,
             swipe: false,
@@ -358,11 +402,10 @@ fn event_to_hint(ev: &crate::topic_dispatch::Event) -> SfHint {
         InputState { swipe: true, .. } => SfHint::Trigger,
         InputState { gesture: true, .. } => SfHint::Gesture,
         InputState { .. } => SfHint::Idle,
-        Topapp(_) => SfHint::Idle,
         Offscreen(true) => SfHint::Switch,
         Offscreen(false) => SfHint::Touch,
-        CgroupList { .. } | CgroupUpdate(_) => SfHint::Idle,
-    }
+        Topapp(_) | CgroupList { .. } | CgroupUpdate(_) => return None,
+    })
 }
 
 #[cfg(test)]

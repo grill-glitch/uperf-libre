@@ -45,15 +45,25 @@ pub fn spawn_termination_listener() -> bool {
 }
 
 fn spawn_blocking_listener() -> bool {
-    // SAFETY: `sigset_t` is a plain C struct; `sigemptyset`/`sigaddset` initialise it
-    // and the set outlives every use below (it is moved into the thread).
-    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // `sigset_t` is opaque and `sigemptyset` initialises it: build it in `MaybeUninit` so
+    // the safety argument is local instead of relying on "all-zero is valid on this libc".
+    let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: `sigemptyset` initialises the whole value before it is read.
     unsafe {
-        libc::sigemptyset(&mut set);
+        libc::sigemptyset(set.as_mut_ptr());
+    }
+    // SAFETY: initialised above.
+    let mut set = unsafe { set.assume_init() };
+    unsafe {
         for sig in TEARDOWN_SIGNALS {
             libc::sigaddset(&mut set, sig);
         }
     }
+
+    // A copy for the failure path: `set` is moved into the closure (and dropped with the
+    // builder when the spawn fails), so the unblock below needs its own.
+    // SAFETY: initialised above; both copies are plain values.
+    let set_copy = unsafe { std::ptr::read(&set) };
 
     // Also block them here, in the caller's thread. Normally the C++ side already did
     // it (the worker blocks before creating any thread, and this runs inside the
@@ -65,19 +75,39 @@ fn spawn_blocking_listener() -> bool {
     let spawned = std::thread::Builder::new()
         .name("uperf-signal".into())
         .spawn(move || {
+            let mut errors = 0u32;
             loop {
                 let mut sig: libc::c_int = 0;
                 // SAFETY: `sigwait` only reads the set and writes one int.
                 let rc = unsafe { libc::sigwait(&set, &mut sig) };
                 if rc != 0 {
-                    // EINTR/EINVAL: not a teardown signal. Keep waiting rather than
-                    // exiting without disarming.
+                    // `sigwait` does not report EINTR, so a non-zero return is a real error
+                    // (EINVAL); retrying it forever spun the listener at 100% CPU and teardown
+                    // never ran. Give up loudly after a bounded number of attempts.
+                    errors += 1;
+                    crate::log_msg(&format!(
+                        "Rust: sigwait failed (rc={rc}), attempt {errors}/3"
+                    ));
+                    if errors >= 3 {
+                        // Nothing can stop the daemon any more: make the failure terminal.
+                        unsafe { libc::_exit(1) };
+                    }
                     continue;
                 }
                 crate::log_msg(&format!(
                     "Rust: caught signal {sig} on the listener thread; stopping"
                 ));
-                crate::uperf_rs_stop();
+                // A panic here used to kill the listener thread while the C++ main thread
+                // stayed parked in `Sleep(UINT32_MAX)` with every teardown signal still
+                // blocked — an unkillable process, exactly what this module exists to prevent.
+                let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::uperf_rs_stop()
+                }))
+                .is_ok();
+                if !stopped {
+                    crate::log_msg("Rust: uperf_rs_stop panicked; exiting without a clean stop");
+                    unsafe { libc::_exit(1) };
+                }
                 // The C++ main thread is parked in `Sleep(UINT32_MAX)` and will never
                 // return; every thread that mattered has been joined or detached by
                 // the stop above, and spdlog flushes at info level, so exiting here
@@ -90,6 +120,12 @@ fn spawn_blocking_listener() -> bool {
 
     if !spawned {
         restore_default_handlers();
+        // The disposition alone is not enough: these signals are still *blocked* here (and
+        // in every thread the C++ side created before us), and a blocked signal with SIG_DFL
+        // stays pending instead of terminating the process. Unblock them so a SIGTERM is
+        // actually delivered — otherwise the fallback produced an unkillable daemon.
+        // SAFETY: valid set, no output pointer.
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set_copy, std::ptr::null_mut()) };
         crate::log_msg(
             "Rust: could not start the signal listener; teardown signals restored to their \
              default disposition (a SIGTERM will now kill without disarming)",
@@ -115,11 +151,17 @@ fn restore_default_handlers() {
 mod tests {
     use super::*;
 
-    /// The mask the listener relies on must be expressible without touching the
-    /// process: this asserts the set contents, which is what the C++ side blocks too
-    /// (`app_main.cpp` uses the same three).
+    /// What the listener actually depends on: the same three signals the C++ side blocks,
+    /// with no duplicates.
     #[test]
-    fn teardown_set_is_standalone_signal_usr1_term_int() {
-        assert_eq!(TEARDOWN_SIGNALS, [libc::SIGTERM, libc::SIGINT, libc::SIGUSR1]);
+    fn teardown_set_is_term_int_usr1_without_duplicates() {
+        let mut seen = std::collections::BTreeSet::new();
+        for sig in TEARDOWN_SIGNALS {
+            assert!(seen.insert(sig), "signal {sig} is listed twice");
+        }
+        assert_eq!(seen.len(), 3);
+        assert!(seen.contains(&libc::SIGTERM));
+        assert!(seen.contains(&libc::SIGINT));
+        assert!(seen.contains(&libc::SIGUSR1));
     }
 }

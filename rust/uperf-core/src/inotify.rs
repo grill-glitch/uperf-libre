@@ -76,13 +76,22 @@ impl Inotify {
                 // events — a 17x difference, and on a phone that is a core spinning
                 // plus continuous storage writes. Content changes to the files we
                 // actually care about are covered by their own watches.
-                let dmask = libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_DELETE;
+                // IN_DELETE is deliberately absent: its child name is in `ev.name`, which
+                // this reader ignores, so it matched neither branch and was dropped — while
+                // IN_CREATE already wakes us for the same directory and the per-file watches
+                // report IN_DELETE_SELF/IN_IGNORED.
+                let dmask = libc::IN_CREATE | libc::IN_MOVED_TO;
                 // SAFETY: `dc` is a NUL-terminated directory path that outlives the
                 // call and `self.fd` is the live inotify fd owned by this struct.
                 let dwd = unsafe { libc::inotify_add_watch(self.fd, dc.as_ptr(), dmask) };
-                if dwd >= 0 {
-                    self.paths.insert(dwd, dir.to_path_buf());
+                if dwd < 0 {
+                    // Without the directory watch a file that does not exist yet never
+                    // produces an event, and `arm_file` reports Ok on ENOENT — so `watch()`
+                    // claimed success while nothing was armed at all ("the hint byte is
+                    // silently ignored", the failure this module exists to fix).
+                    return Err(io::Error::last_os_error());
                 }
+                self.paths.insert(dwd, dir.to_path_buf());
             }
         }
         self.arm_file(path)
@@ -90,10 +99,10 @@ impl Inotify {
 
     /// Add the watch on the file itself, if it exists right now.
     fn arm_file(&mut self, path: &Path) -> io::Result<()> {
-        let mask = libc::IN_CLOSE_WRITE
-            | libc::IN_MODIFY
-            | libc::IN_DELETE_SELF
-            | libc::IN_MOVE_SELF;
+        // `IN_MODIFY` fires as soon as the writer touches the file (possibly mid-write) and
+        // duplicates every `echo x > f` with a second `IN_CLOSE_WRITE` event. The close event
+        // already covers the documented "written and closed" contract.
+        let mask = libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
         let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
         // SAFETY: `c` is a NUL-terminated path alive for the call; `self.fd` is the
@@ -153,17 +162,30 @@ impl Inotify {
             }
             let mut off = 0usize;
             let n = n as usize;
-            while off + std::mem::size_of::<libc::inotify_event>() <= n {
+            let hdr = std::mem::size_of::<libc::inotify_event>();
+            while off + hdr <= n {
                 // SAFETY: reading a copy of the header out of the byte buffer.
                 let ev: libc::inotify_event = unsafe {
                     std::ptr::read_unaligned(buf[off..].as_ptr().cast::<libc::inotify_event>())
                 };
-                off += std::mem::size_of::<libc::inotify_event>() + ev.len as usize;
+                let rec = hdr + ev.len as usize;
+                // The whole record must be inside the buffer: advancing by a variable `len`
+                // without this check lets `off` overshoot and silently drops the events that
+                // followed a truncated one.
+                if off + rec > n {
+                    return Ok(out);
+                }
+                off += rec;
                 let Some(path) = self.paths.get(&ev.wd).cloned() else { continue };
                 let m = ev.mask;
-                if m & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_IGNORED) != 0 {
+                if m & libc::IN_IGNORED != 0 {
+                    // The kernel dropped the watch: forget the wd (it is reusable) and report
+                    // the loss once, not twice (the `*_SELF` event precedes IN_IGNORED).
+                    self.paths.remove(&ev.wd);
                     out.push(WatchEvent::WatchLost(path));
-                } else if m & (libc::IN_CLOSE_WRITE | libc::IN_MODIFY | libc::IN_MOVED_TO | libc::IN_CREATE) != 0 {
+                } else if m & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
+                    out.push(WatchEvent::WatchLost(path));
+                } else if m & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE) != 0 {
                     out.push(WatchEvent::Written(path));
                 }
             }
@@ -288,14 +310,18 @@ mod tests {
         let d = tmpdir("sibling");
         let f = d.join("cur_powermode.txt");
         std::fs::write(&f, "balance\n").unwrap();
+        // Create the sibling *before* arming: `fs::write` creates the file, and the creation
+        // is reported as `Written(parent_dir)` by the directory watch (IN_CREATE). Creating it
+        // afterwards made this test pass for the wrong reason — the old assertion only
+        // excluded events whose path equals the sibling.
+        let sibling = d.join("uperf_log.txt");
+        std::fs::write(&sibling, "line 1\n").unwrap();
         let mut ino = Inotify::new().unwrap();
         ino.watch(&f).unwrap();
         // drain anything from arming
         let _ = ino.poll(Duration::from_millis(50));
 
         // a sibling that the daemon also writes (its log)
-        let sibling = d.join("uperf_log.txt");
-        std::fs::write(&sibling, "line 1\n").unwrap();
         for i in 0..5 {
             let mut fh = std::fs::OpenOptions::new()
                 .append(true)

@@ -59,18 +59,29 @@ pub fn set_sched(tid: i32, policy: SchedPolicy) -> io::Result<()> {
         SchedPolicy::Normal { .. } | SchedPolicy::NormalDefault | SchedPolicy::Batch
         | SchedPolicy::Idle => (class_of(policy), 0),
     };
+    // Apply nice *first*: the two syscalls are not atomic, and committing the SCHED class
+    // before a nice change that then fails (very common without CAP_SYS_NICE) left the
+    // thread half-mutated even though the caller saw an error and assumes "nothing applied".
+    let prev_nice = if let Some(nice) = nice_of(policy) {
+        // SAFETY: plain integer argument, no pointers.
+        if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, nice) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Some(nice)
+    } else {
+        None
+    };
     let param = libc::sched_param { sched_priority: prio };
     // SAFETY: `param` outlives the call; the kernel copies it.
     unsafe {
         if libc::sched_setscheduler(tid, class, &param) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    if let Some(nice) = nice_of(policy) {
-        // SAFETY: plain integer argument, no pointers.
-        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, nice) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            // Best-effort rollback so the thread is not left with a nice value nobody asked
+            // for while its SCHED class stayed as it was.
+            if prev_nice.is_some() {
+                let _ = libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, 0);
+            }
+            return Err(err);
         }
     }
     Ok(())
@@ -169,8 +180,16 @@ pub fn thread_sched(tid: i32) -> io::Result<(i32, i32)> {
     let after = stat.rfind(')').ok_or_else(|| io::Error::other("malformed stat"))?;
     let rest = stat[after + 1..].trim();
     let f: Vec<&str> = rest.split_whitespace().collect();
-    let nice = f.get(16).and_then(|x| x.parse().ok()).unwrap_or(0);
-    let policy = f.get(38).and_then(|x| x.parse().ok()).unwrap_or(0);
+    // Defaulting a missing field to 0 turned a truncated/garbled stat into "SCHED_NORMAL,
+    // nice 0" and still returned Ok — the false verification this function exists to avoid.
+    let nice = f
+        .get(16)
+        .and_then(|x| x.parse().ok())
+        .ok_or_else(|| io::Error::other("malformed stat: missing nice field"))?;
+    let policy = f
+        .get(38)
+        .and_then(|x| x.parse().ok())
+        .ok_or_else(|| io::Error::other("malformed stat: missing policy field"))?;
     Ok((policy, nice))
 }
 
@@ -208,7 +227,14 @@ pub fn resolve_home_package_with(
     // blank value must fall through to the probe, which is what made the empty
     // pattern bug possible in the first place.
     if let Some(t) = explicit.map(str::trim).filter(|t| !t.is_empty()) {
-        return Some(t.to_string());
+        // The value is substituted unescaped into a rule regex: `.*` or `a/b` would
+        // over-match (or corrupt the pattern), so only a real package name is accepted.
+        let looks_like_package = t.split('.').count() >= 2
+            && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+        if looks_like_package {
+            return Some(t.to_string());
+        }
+        log(&format!("Rust: ignoring invalid home package override {t:?}"));
     }
     // `cmd` is at /system/bin/cmd; try the absolute path first because the
     // process may be started with a minimal PATH.

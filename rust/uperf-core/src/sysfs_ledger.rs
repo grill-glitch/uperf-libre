@@ -71,10 +71,27 @@ impl SysfsLedger {
                 }
                 match line.split_once(' ') {
                     Some((p, v)) => {
-                        entries.insert(p.to_string(), v.to_string());
+                        // Same rules as `record`: whitespace in the path or a tab in the
+                        // value cannot be rendered unambiguously, so such a line is corrupt
+                        // rather than an entry (else load() invents restore writes).
+                        if p.is_empty()
+                            || p.contains(char::is_whitespace)
+                            || v.contains('\t')
+                            || v.chars().any(|c| c == '\n' || c == '\r')
+                        {
+                            corrupt += 1;
+                            continue;
+                        }
+                        // First write wins (the same contract as `record`): a later duplicate
+                        // — a concatenated/appended ledger — must not overwrite the original.
+                        entries.entry(p.to_string()).or_insert_with(|| v.to_string());
                     }
                     // Path with no value: written but no readable original.
                     None => {
+                        if line.contains(char::is_whitespace) {
+                            corrupt += 1;
+                            continue;
+                        }
                         unknown.insert(line.to_string());
                     }
                 }
@@ -177,9 +194,10 @@ impl SysfsLedger {
         Ok(())
     }
 
-    /// Remove the ledger, after a restore that left nothing owed. Never called by the
-    /// daemon: a daemon that clears its own ledger would be erasing the record of what
-    /// it still has to put back.
+    /// `true` when the ledger owes nothing: no recorded originals and no unknowns. Corrupt
+    /// lines are counted separately (`corrupt_lines`) and are not owed state. The ledger is
+    /// never cleared by the daemon from here — that would erase the record of what it still
+    /// has to put back; the shell-side restore removes the file.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.unknown.is_empty()
     }
@@ -198,9 +216,12 @@ pub fn record_before_write(
     let current = std::fs::read_to_string(target).ok();
     let added = l.record(path, current.as_deref());
     if added {
-        // A failed flush must not stop the write: the ledger is the safety net, not
-        // the operation. It stays dirty and the next write tries again.
-        let _ = l.flush();
+        // A failed flush must not stop the write: the ledger is the safety net, not the
+        // operation. It stays dirty and the next write tries again — but a broken ledger has
+        // to be visible, or the daemon reports success while the original is not persisted.
+        if let Err(e) = l.flush() {
+            eprintln!("uperf: cannot persist sysfs ledger {}: {e}", l.path().display());
+        }
     }
     added
 }

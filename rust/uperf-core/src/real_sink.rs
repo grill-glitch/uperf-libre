@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::orchestrator::{Sink, SysfsWrite};
@@ -34,8 +34,10 @@ use crate::sysfs_ledger::SysfsLedger;
 /// offline one, so `apply_pending` does not care which it got.
 #[derive(Default)]
 pub struct RealSink {
-    /// path -> open fd, kept across writes.
-    fds: BTreeMap<String, File>,
+    /// path -> open fd, kept across writes. Opened read+write where the node allows it, so
+    /// the read-back and the next write share one handle instead of paying two more opens
+    /// per knob (on this device an open costs more than the write).
+    fds: BTreeMap<String, CachedFd>,
     /// path -> the value this sink last wrote successfully.
     last: BTreeMap<String, String>,
     ledger: Option<SysfsLedger>,
@@ -46,6 +48,13 @@ pub struct RealSink {
     pub failed: Vec<(String, String)>,
     /// (path, wrote, read back) — the kernel kept something else.
     pub ineffective: Vec<(String, String, String)>,
+}
+
+/// One cached knob handle. `readable` records whether the open-for-read half worked: a
+/// write-only node (`uevent`) falls back to a separate read.
+pub struct CachedFd {
+    file: File,
+    readable: bool,
 }
 
 impl RealSink {
@@ -66,14 +75,36 @@ impl RealSink {
         )
     }
 
+    /// Read a node back through the cached handle when it was opened read+write. Falls back
+    /// to a separate open (write-only nodes), and reports the error instead of hiding it.
+    fn read_back(&mut self, path: &str) -> std::io::Result<String> {
+        match self.fds.get_mut(path) {
+            Some(CachedFd { file, readable: true }) => {
+                file.seek(SeekFrom::Start(0))?;
+                let mut out = String::new();
+                file.read_to_string(&mut out)?;
+                Ok(out)
+            }
+            _ => std::fs::read_to_string(path),
+        }
+    }
+
     fn write_path(&mut self, path: &str, payload: &str) -> std::io::Result<()> {
         let fd = match self.fds.get_mut(path) {
             Some(fd) => fd,
             None => {
-                let fd = OpenOptions::new().write(true).open(path)?;
-                self.fds.entry(path.to_string()).or_insert(fd)
+                // Try read+write first (read-back on the same handle); fall back to
+                // write-only for nodes that refuse to be opened for reading.
+                let (file, readable) = match OpenOptions::new().read(true).write(true).open(path) {
+                    Ok(f) => (f, true),
+                    Err(_) => (OpenOptions::new().write(true).open(path)?, false),
+                };
+                self.fds
+                    .entry(path.to_string())
+                    .or_insert(CachedFd { file, readable })
             }
         };
+        let fd = &mut fd.file;
         // A sysfs store runs per write(2) regardless of offset, but /proc entries are
         // seq_files: without the rewind a second write lands at the old offset and is
         // silently short.
@@ -105,11 +136,14 @@ impl Sink for RealSink {
             Ok(()) => {
                 self.written += 1;
                 self.last.insert(w.path.clone(), w.value.clone());
-                if let Ok(now) = std::fs::read_to_string(&w.path) {
-                    if !readback_matches(&payload, &now) {
-                        self.ineffective
-                            .push((w.path.clone(), w.value.clone(), now.trim().to_string()));
-                    }
+                match self.read_back(&w.path) {
+                    Ok(now) if !readback_matches(&payload, &now) => self
+                        .ineffective
+                        .push((w.path.clone(), w.value.clone(), now.trim().to_string())),
+                    Ok(_) => {}
+                    // Unverifiable is not the same as verified: keep it visible instead of
+                    // counting it as applied.
+                    Err(e) => self.failed.push((w.path.clone(), format!("read-back: {e}"))),
                 }
             }
             Err(e) => {

@@ -91,19 +91,28 @@ impl Registry {
     /// The daemon uses this for the CPU governor: an armed `userspace` takeover is the
     /// one piece of state that must not survive a slow shutdown, so it is stopped
     /// before the other tasks even when it was started after them.
-    pub fn take_and_stop(&mut self, name: &str) -> bool {
-        let Some(idx) = self.tasks.iter().position(|t| t.name() == name) else {
-            return false;
-        };
+    /// `None` when no such task exists; `Some(true)` when it stopped cleanly; `Some(false)`
+    /// when its thread is still alive (detached). The old `bool` said "found", so a stuck
+    /// task was reported as a clean stop.
+    pub fn take_and_stop(&mut self, name: &str) -> Option<bool> {
+        let idx = self.tasks.iter().position(|t| t.name() == name)?;
         let mut task = self.tasks.remove(idx);
-        stop_one(task.as_mut());
-        true
+        Some(stop_one(task.as_mut()))
     }
 
-    /// Stop everything in reverse start order.
+    /// Stop everything in reverse start order. Resilient: a task whose `stop` panics must
+    /// not leave the remaining tasks running (an armed CPU governor is unrecoverable).
     pub fn stop_all(&mut self) {
         while let Some(mut task) = self.tasks.pop() {
-            stop_one(task.as_mut());
+            let name = task.name();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                stop_one(task.as_mut())
+            }));
+            if result.is_err() {
+                crate::log_msg(&format!(
+                    "Rust: task '{name}' panicked while stopping; continuing with the rest"
+                ));
+            }
         }
     }
 }
@@ -111,15 +120,28 @@ impl Registry {
 /// Stop, then check. A task that still reports running after its stop has been
 /// detached (its thread is stuck); say so by name rather than letting the daemon exit
 /// while claiming a clean shutdown.
-fn stop_one(task: &mut dyn Task) {
+fn stop_one(task: &mut dyn Task) -> bool {
     let name = task.name();
     task.stop();
     if task.is_running() {
         crate::log_msg(&format!(
             "Rust: task '{name}' did not stop (thread detached); it dies with the process"
         ));
+        false
     } else {
         crate::log_msg(&format!("Rust: task '{name}' stopped"));
+        true
+    }
+}
+
+/// Backstop: a `Registry` dropped without an explicit `stop_all` must not silently leak live
+/// tasks. `stop_all` is idempotent (it empties the vector).
+impl Drop for Registry {
+    fn drop(&mut self) {
+        if !self.tasks.is_empty() {
+            crate::log_msg("Rust: task registry dropped without stop_all; stopping the rest");
+            self.stop_all();
+        }
     }
 }
 
@@ -177,9 +199,9 @@ mod tests {
         let mut r = Registry::new();
         r.push(Fake { name: "cpu", running: true, stops: 0 });
         r.push(Fake { name: "watch", running: true, stops: 0 });
-        assert!(r.take_and_stop("cpu"));
+        assert_eq!(r.take_and_stop("cpu"), Some(true));
         assert_eq!(r.names(), vec!["watch"]);
-        assert!(!r.take_and_stop("cpu"), "a task is only taken once");
+        assert_eq!(r.take_and_stop("cpu"), None, "a task is only taken once");
         r.stop_all();
         assert!(r.is_empty());
     }

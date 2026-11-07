@@ -80,36 +80,44 @@ impl Default for HintDurations {
 
 impl HintDurations {
     pub fn from_modules(modules: &Map<String, Value>) -> Self {
-        let mut d = HintDurations {
-            idle_ms: 0,
-            touch_ms: 4_000,
-            trigger_ms: 30,
-            gesture_ms: 100,
-            switch_ms: 400,
-            junk_ms: 60,
-        };
+        // Build on the defaults instead of repeating them: two copies of the numbers would
+        // drift, and `HintDurations::default()` is what the no-config path uses.
+        let mut d = Self::default();
+        let mut junk_explicit: Option<u64> = None;
+        let mut swjunk_ms: Option<u64> = None;
         if let Some(sw) = modules.get("switcher").and_then(|m| m.as_object()) {
             if let Some(h) = sw.get("hintDuration").and_then(|d| d.as_object()) {
                 for (k, v) in h {
-                    let ms = v
-                        .as_f64()
-                        .map(|f| (f * 1000.0) as u64)
-                        .or_else(|| v.as_u64())
-                        .unwrap_or(0);
+                    // The values are *seconds* (`"touch": 4.0` == 4 s) — including the
+                    // integer spellings (`"touch": 4`), so `as_f64` is the only conversion
+                    // needed. A missing/non-numeric/negative entry keeps the default instead
+                    // of collapsing the timeout to 0.
+                    let Some(secs) = v.as_f64().filter(|f| f.is_finite() && *f >= 0.0) else {
+                        continue;
+                    };
+                    let ms = (secs * 1000.0).round() as u64;
                     match k.as_str() {
                         "idle" => d.idle_ms = ms,
                         "touch" => d.touch_ms = ms,
                         "trigger" => d.trigger_ms = ms,
                         "gesture" => d.gesture_ms = ms,
                         "switch" => d.switch_ms = ms,
-                        "junk" => d.junk_ms = ms,
-                        // UGT-specific extra (m1-static-reverse §1.1 strings):
-                        "swjunk" => d.junk_ms = d.junk_ms.min(ms.max(1)),
+                        "junk" => junk_explicit = Some(ms),
+                        // UGT-specific extra (m1-static-reverse §1.1 strings). Merged with
+                        // `junk` deterministically after the loop: `min` applied inside the
+                        // loop made the result depend on the map's iteration order.
+                        "swjunk" => swjunk_ms = Some(ms.max(1)),
                         _ => {}
                     }
                 }
             }
         }
+        d.junk_ms = match (junk_explicit, swjunk_ms) {
+            (Some(j), Some(s)) => j.min(s),
+            (Some(j), None) => j,
+            (None, Some(s)) => s,
+            (None, None) => d.junk_ms,
+        };
         d
     }
     pub fn for_hint(&self, h: SfHint) -> Duration {
@@ -120,7 +128,9 @@ impl HintDurations {
             SfHint::Gesture => self.gesture_ms,
             SfHint::Switch => self.switch_ms,
             SfHint::Junk => self.junk_ms,
-            SfHint::Unknown => self.touch_ms,
+            // An out-of-range vendor hint is "idle" upstream (see the module header and
+            // `Orchestrator::scene_for_hint`), not a touch that expires after 4 s.
+            SfHint::Unknown => self.idle_ms,
         })
     }
 }
@@ -156,11 +166,13 @@ impl HintState {
     /// the timer is reset to the new hint's duration. The exact edge semantics are
     /// documented in AGENT.md §8.1.
     pub fn process(&mut self, incoming: SfHint) -> Option<HintTransition> {
-        self.transitions += 1;
         if incoming == self.current {
+            // Same hint = a refresh, not a transition: counting it here inflated the
+            // counter that parity logging compares against emitted transitions.
             self.bound_at = Instant::now();
             return None;
         }
+        self.transitions += 1;
         let from = self.current;
         let to = incoming;
         self.current = incoming;
@@ -171,13 +183,16 @@ impl HintState {
     /// Has the current hint expired? Caller polls this and triggers a re-bind on
     /// idle/scene transition.
     pub fn expired(&self) -> bool {
-        if matches!(self.current, SfHint::Idle) {
-            // Idle is unbounded by default (idle_ms == 0 means "no expiry" upstream).
-            return false;
-        }
+        let dur = match self.current {
+            // Idle is unbounded by default (idle_ms == 0 means "no expiry" upstream); an
+            // explicit idle duration still applies. An out-of-range hint is idle upstream,
+            // so it follows the same rule instead of expiring after the touch timeout.
+            SfHint::Idle | SfHint::Unknown if self.durations.idle_ms == 0 => return false,
+            _ => self.durations.for_hint(self.current),
+        };
         Instant::now()
             .checked_duration_since(self.bound_at)
-            .map(|d| d >= self.durations.for_hint(self.current))
+            .map(|d| d >= dur)
             .unwrap_or(false)
     }
 }

@@ -170,10 +170,15 @@ impl Settings {
     /// status file, the governor record, the ledger and the token all land in the
     /// module's `USER_PATH` without threading that path through each caller.
     pub fn from_env(config_path: &str, log_path: &str) -> Self {
+        // A bare relative config path (`uperf.json`, which is what the daemon gets when it
+        // runs with its cwd set to USER_PATH) has `parent() == Some("")`: dropping it left
+        // every derived path None, so the governor record and the sysfs ledger were
+        // silently not written — exactly the state needed to recover after a SIGKILL.
         let config_dir = Path::new(config_path)
             .parent()
             .filter(|d| !d.as_os_str().is_empty())
-            .map(Path::to_path_buf);
+            .map(Path::to_path_buf)
+            .or_else(|| (!config_path.is_empty()).then(|| PathBuf::from(".")));
 
         let derived = |name: &str| config_dir.as_ref().map(|d| d.join(name));
         // Materialise every derived path before `config_dir` is moved into the struct:
@@ -213,7 +218,7 @@ impl Settings {
             config_dir,
 
             fake_root: env_str("UPERF_FAKE_ROOT").filter(|s| !s.is_empty()),
-            cpu_governor: env_str("UPERF_CPU_GOVERNOR").as_deref() == Some("1"),
+            cpu_governor: env_on("UPERF_CPU_GOVERNOR"),
             thermal_root: env_path("UPERF_THERMAL_ROOT")
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_THERMAL_ROOT)),
             thermal: ThermalPolicy::from_values(
@@ -221,7 +226,7 @@ impl Settings {
                 env_f64("UPERF_THERMAL_SPAN_C"),
                 env_f64("UPERF_THERMAL_FLOOR"),
             ),
-            sched_dry_run: env_str("UPERF_SCHED_DRY_RUN").as_deref() == Some("1"),
+            sched_dry_run: env_on("UPERF_SCHED_DRY_RUN"),
             sched_only: env_str("UPERF_SCHED_ONLY").filter(|s| !s.is_empty()),
             home_package: env_str("UPERF_HOME_PACKAGE")
                 .map(|s| s.trim().to_string())
@@ -240,7 +245,8 @@ impl Settings {
                 window_ms: env_u64("UPERF_SF_UPROBE_WINDOW_MS", 1000),
             }),
             sf_binder: env_on("UPERF_SF_BINDER").then(|| BinderCfg {
-                tick_ms: env_u64("UPERF_SF_BINDER_TICK_MS", 1000),
+                // Floor every interval: a 0 makes the task spin (or divide by zero).
+                tick_ms: env_u64("UPERF_SF_BINDER_TICK_MS", 1000).max(50),
                 window_ms: env_u64("UPERF_SF_BINDER_WINDOW_MS", 1000),
                 hint_stale_ms: env_u64("UPERF_SF_BINDER_HINT_STALE_MS", 3000),
                 layer: env_str("UPERF_SF_BINDER_LAYER").filter(|s| !s.is_empty()),
@@ -255,7 +261,7 @@ impl Settings {
             record: env_on("UPERF_RECORD").then(|| RecordCfg {
                 min_session_ms: env_u64("UPERF_RECORD_MIN_MS", MIN_SESSION_MS),
                 sample_ms: env_u64("UPERF_RECORD_SAMPLE_MS", 1000),
-                tick_ms: env_u64("UPERF_RECORD_TICK_MS", 1000),
+                tick_ms: env_u64("UPERF_RECORD_TICK_MS", 1000).max(50),
             }),
         }
     }

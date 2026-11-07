@@ -129,14 +129,21 @@ fn decode_input_state(payload: &[u8]) -> Option<(bool, bool, bool)> {
 
 fn decode_pid_list(payload: &[u8]) -> Option<Vec<i32>> {
     // C layout: uperf_pid_list_t { const int32_t* pids, size_t len }.
-    // On arm64 that is 8 + 8 = 16 bytes.
-    if payload.len() < 16 {
+    // Width from the target, not a hardcoded 8+8: a 32-bit build would read garbage.
+    const PTR_BYTES: usize = std::mem::size_of::<usize>();
+    if payload.len() < 2 * PTR_BYTES {
         return None;
     }
-    let pids_ptr = u64::from_ne_bytes(payload[0..8].try_into().unwrap()) as *const i32;
-    let len = u64::from_ne_bytes(payload[8..16].try_into().unwrap()) as usize;
+    let pids_ptr = usize::from_ne_bytes(payload[0..PTR_BYTES].try_into().ok()?) as *const i32;
+    let len = usize::from_ne_bytes(payload[PTR_BYTES..2 * PTR_BYTES].try_into().ok()?);
     if pids_ptr.is_null() || len == 0 {
         return Some(Vec::new());
+    }
+    // A corrupt length must not drive an unbounded read/allocation, and `from_raw_parts`
+    // requires the pointer to satisfy the alignment of `i32`.
+    const MAX_PIDS: usize = 1 << 16;
+    if len > MAX_PIDS || (pids_ptr as usize) % std::mem::align_of::<i32>() != 0 {
+        return None;
     }
     // SAFETY: the C++ bridge guarantees `pids` points to `len` valid i32s whose
     // lifetime outlives this call.
@@ -171,13 +178,14 @@ pub(crate) fn spawn(
     let (tx, rx): (Sender<Event>, Receiver<Event>) = std::sync::mpsc::channel();
     // Install a clone so the FFI entry point can also send events. Replaces any
     // previous generation's sender: its receiver died with that dispatcher.
-    crate::ffi::install_dispatch_tx(tx.clone());
+    let generation = crate::ffi::install_dispatch_tx(tx.clone());
     let thread = thread::Builder::new()
         .name("uperf-rs".into())
         .spawn(move || run(rx, orch, dfps, foreground, settings, sink))
         .expect("spawn uperf-rs dispatcher");
     Dispatcher {
         _keep_alive: tx,
+        generation,
         thread: Some(thread),
     }
 }
@@ -187,6 +195,8 @@ pub(crate) struct Dispatcher {
     /// `ffi::DISPATCH_TX` keeps the FFI entry point usable; once both are dropped the
     /// receiver hits `RecvError` and the thread exits.
     _keep_alive: Sender<Event>,
+    /// The generation this dispatcher installed in `ffi::DISPATCH_TX`.
+    generation: u64,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -195,7 +205,7 @@ impl Dispatcher {
         // Every sender must go: the FFI one lives in `ffi::DISPATCH_TX`, so dropping
         // only this one leaves the receiver connected and the thread parked in
         // `recv_timeout` until the whole budget is spent.
-        crate::ffi::clear_dispatch_tx();
+        crate::ffi::clear_dispatch_tx(self.generation);
         drop(std::mem::replace(&mut self._keep_alive, dummy_sender()));
         let start = Instant::now();
         if let Some(t) = self.thread.take() {
@@ -226,19 +236,36 @@ fn run(
     // when that source is armed, otherwise a full second — long enough to notice a
     // dropped sender promptly, since the join path waits at most two seconds.
     let tick = settings.dispatcher_tick();
+    // Poll the file at most once per tick, independent of how busy the channel is. The old
+    // code only polled on `Timeout`, so a steady stream of C++ events (a touch storm shorter
+    // than the tick) returned `Ok` every iteration and the top-app file was never re-read —
+    // contradicting the documented "every tick" behaviour.
+    let mut next_foreground_poll = std::time::Instant::now();
+    let poll_foreground = |foreground: &mut Option<crate::foreground::ForegroundFile>,
+                           orch: &std::sync::Arc<parking_lot::Mutex<crate::orchestrator::Orchestrator>>,
+                           dfps: Option<&crate::dfps_rs::DfpsScheduler>,
+                           settings: &crate::settings::Settings,
+                           sink: Option<&std::sync::Arc<parking_lot::Mutex<crate::real_sink::RealSink>>>| {
+        // A stale/absent file yields nothing and the C++ monitor's own `topapp.pkgName`
+        // events carry on.
+        if let Some(pkg) = foreground.as_mut().and_then(|f| f.poll()) {
+            handle(&Event::Topapp(pkg), orch, dfps, settings, sink.map(|s| s.as_ref()));
+        }
+    };
     loop {
-        match rx.recv_timeout(tick) {
+        // Never block longer than the next foreground deadline.
+        let wait = next_foreground_poll
+            .saturating_duration_since(std::time::Instant::now())
+            .min(tick);
+        let received = rx.recv_timeout(if wait.is_zero() { std::time::Duration::from_millis(0) } else { wait });
+        match received {
             Ok(ev) => handle(&ev, &orch, dfps.as_ref(), &settings, sink.as_deref()),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // The top-app file, if any. A stale/absent file yields nothing and
-                // the C++ monitor's own `topapp.pkgName` events carry on.
-                if let Some(f) = foreground.as_mut() {
-                    if let Some(pkg) = f.poll() {
-                        handle(&Event::Topapp(pkg), &orch, dfps.as_ref(), &settings, sink.as_deref());
-                    }
-                }
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if std::time::Instant::now() >= next_foreground_poll {
+            next_foreground_poll = std::time::Instant::now() + tick;
+            poll_foreground(&mut foreground, &orch, dfps.as_ref(), &settings, sink.as_ref());
         }
     }
 }

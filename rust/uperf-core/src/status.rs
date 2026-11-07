@@ -46,7 +46,9 @@ pub struct Snapshot<'a> {
 /// must not produce a relative path or overwrite the real file. `None` when neither
 /// is available, in which case status reporting is simply skipped.
 pub fn path_for(config_path: &str, override_file: Option<&Path>) -> Option<PathBuf> {
-    if let Some(p) = override_file {
+    // Filter here as well: `path_for` is public, and a blank override used to produce an
+    // empty relative path that silently redirected the write.
+    if let Some(p) = override_file.filter(|p| !p.as_os_str().is_empty()) {
         return Some(p.to_path_buf());
     }
     Path::new(config_path)
@@ -84,7 +86,9 @@ pub fn write(path: &Path, snap: &Snapshot<'_>) {
     let _ = writeln!(out, "state={}", snap.state);
     let _ = writeln!(out, "takeover={}", if snap.takeover { "on" } else { "off" });
     let _ = writeln!(out, "armed={}", snap.armed.len());
-    let _ = writeln!(out, "policies={}", snap.armed.join(" "));
+    // One record per line: a newline in config path or policy name would inject a fake
+    // `state=running` record that the watchdog's reader happily interprets.
+    let _ = writeln!(out, "policies={}", sanitize(&snap.armed.join(" ")));
     let _ = writeln!(out, "pid={}", std::process::id());
     if let Some((ppid, start_ticks)) = std::fs::read_to_string("/proc/self/stat")
         .ok()
@@ -94,13 +98,19 @@ pub fn write(path: &Path, snap: &Snapshot<'_>) {
         let _ = writeln!(out, "ppid={ppid}");
         let _ = writeln!(out, "start_ticks={start_ticks}");
     }
-    let _ = writeln!(
-        out,
-        "boot_id={}",
-        read_trim("/proc/sys/kernel/random/boot_id")
-    );
-    let _ = writeln!(out, "uptime_ms={}", uptime_ms());
-    let _ = writeln!(out, "config={}", snap.config);
+    // `unknown` rather than an empty value: an empty boot id / a 0 uptime is a
+    // valid-looking measurement the freshness checks cannot tell from a real one.
+    let boot_id = read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_else(|| "unknown".into());
+    let _ = writeln!(out, "boot_id={boot_id}");
+    match uptime_ms() {
+        Some(ms) => {
+            let _ = writeln!(out, "uptime_ms={ms}");
+        }
+        None => {
+            let _ = writeln!(out, "uptime_ms=unknown");
+        }
+    }
+    let _ = writeln!(out, "config={}", sanitize(&snap.config));
     write_atomic(path, out.as_bytes());
 }
 
@@ -113,6 +123,10 @@ pub fn write(path: &Path, snap: &Snapshot<'_>) {
 /// new daemon never writes again, leaving `state=stopped` beside a running daemon for
 /// the rest of the session. Observed on device right after a `webui.sh restart`.
 pub fn write_if_owner(path: &Path, snap: &Snapshot<'_>) {
+    // Read-then-write is not atomic: a new worker can claim the file between the two steps,
+    // which is exactly the stale `state=stopped` this function exists to prevent. Serialize
+    // the claim+write with an advisory lock on a companion file.
+    let _guard = lock_companion(path);
     let mine = std::process::id().to_string();
     let owned = std::fs::read_to_string(path)
         .ok()
@@ -124,6 +138,34 @@ pub fn write_if_owner(path: &Path, snap: &Snapshot<'_>) {
     if owned {
         write(path, snap);
     }
+}
+
+/// `<path>.lock`: flock()ed for the duration of a claim+write. Best effort — a failure just
+/// means the (rare) restart race is not serialized.
+fn lock_companion(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .ok()?;
+    // SAFETY: valid fd for the lifetime of `file`; LOCK_EX blocks until the other writer is done.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return None;
+    }
+    Some(file)
+}
+
+/// Strip anything that would break the one-record-per-line protocol.
+fn sanitize(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect()
 }
 
 /// `(ppid, start_ticks)` from a `/proc/<pid>/stat` line.
@@ -148,19 +190,21 @@ fn stat_fields(stat: &str) -> Option<(i32, u64)> {
 ///
 /// Monotonic, so it cannot be fooled by a clock change — the same reason the
 /// watchdog's owner lock stores it instead of a wall-clock timestamp.
-fn uptime_ms() -> u64 {
+/// Device uptime in ms. `None` when it cannot be read: a 0 looks like "just booted" to the
+/// freshness checks.
+fn uptime_ms() -> Option<u64> {
     std::fs::read_to_string("/proc/uptime")
         .ok()
         .and_then(|t| t.split_whitespace().next().map(str::to_string))
         .and_then(|s| s.parse::<f64>().ok())
         .map(|secs| (secs * 1000.0) as u64)
-        .unwrap_or(0)
 }
 
-fn read_trim(path: &str) -> String {
+fn read_trim(path: &str) -> Option<String> {
     std::fs::read_to_string(path)
+        .ok()
         .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+        .filter(|s| !s.is_empty())
 }
 
 /// Write through a same-directory temp file so a reader never sees a half-written
@@ -170,8 +214,11 @@ fn read_trim(path: &str) -> String {
 /// (docs/records/m6b-evidence.md §6), so `rename` is not assumed to work — but reporting
 /// the state must not depend on it either.
 fn write_atomic(path: &Path, data: &[u8]) {
+    // Unique per writer: the stopping worker and a freshly started one can write
+    // concurrently, and a shared `<path>.new` let one read the other's partial bytes (or
+    // delete the temp file the other had just written).
     let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".new");
+    tmp.push(format!(".{}.new", std::process::id()));
     let tmp = PathBuf::from(tmp);
 
     if std::fs::write(&tmp, data).is_ok() && std::fs::rename(&tmp, path).is_ok() {

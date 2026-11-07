@@ -36,13 +36,16 @@ pub struct ThreadInfo {
 /// `cmdline`'s first field, NUL-truncated. `None` for a kernel thread (empty cmdline)
 /// and for a process that is gone.
 pub fn cmdline_argv0(pid: i32) -> Option<String> {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    // cmdline is NUL-separated; the first field is the executable/package.
-    let name = String::from_utf8_lossy(&raw)
-        .split('\0')
-        .next()
-        .unwrap_or("")
-        .to_string();
+    // Read only the first NUL-terminated field: `list_procs`/`pids_for_package` call this for
+    // every pid, and a long command line was read and converted in full each time.
+    use std::io::BufRead;
+    let file = std::fs::File::open(format!("/proc/{pid}/cmdline")).ok()?;
+    let mut buf = Vec::with_capacity(64);
+    std::io::BufReader::new(file).read_until(0, &mut buf).ok()?;
+    if buf.last() == Some(&0) {
+        buf.pop();
+    }
+    let name = String::from_utf8_lossy(&buf).into_owned();
     if name.is_empty() {
         None
     } else {
@@ -73,21 +76,31 @@ pub fn thread_ids(pid: i32) -> Vec<i32> {
 /// Callers read [`comm_of`] lazily, and only for threads they have not already decided.
 pub fn read_proc(pid: i32) -> Option<ProcInfo> {
     let name = cmdline_argv0(pid)?;
-    let threads = thread_ids(pid)
+    let threads: Vec<ThreadInfo> = thread_ids(pid)
         .into_iter()
         .map(|tid| ThreadInfo {
             tid,
             is_main: tid == pid,
         })
         .collect();
+    // A live process always has at least its main thread. An empty list means it exited
+    // between the cmdline read and this walk (or the pid was recycled): reporting
+    // `Some { threads: [] }` contradicts the documented "gone" contract and can pair one
+    // process's name with another's threads.
+    if threads.is_empty() {
+        return None;
+    }
     Some(ProcInfo { pid, name, threads })
 }
 
 /// A thread's `comm` (`/proc/<pid>/task/<tid>/comm`), trimmed.
 pub fn comm_of(pid: i32, tid: i32) -> String {
-    std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm"))
-        .map(|s| s.trim_end_matches('\n').to_string())
-        .unwrap_or_default()
+    // `comm` is arbitrary bytes (a non-UTF-8 name is legal), and `read_to_string` collapsed
+    // that to an empty string — indistinguishable from a gone thread.
+    match std::fs::read(format!("/proc/{pid}/task/{tid}/comm")) {
+        Ok(raw) => String::from_utf8_lossy(&raw).trim_end_matches('\n').to_string(),
+        Err(_) => String::new(),
+    }
 }
 
 /// A thread's `comm` when only the tid is known (`/proc/<tid>/comm` resolves for

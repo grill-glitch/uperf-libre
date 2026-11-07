@@ -77,6 +77,8 @@ const K_HEADER_BINDER: u32 = 0x5359_5354;
 const BINDER_TYPE_HANDLE: u32 = 0x7368_2a85;
 const BINDER_TYPE_FD: u32 = 0x6664_2a85;
 const DUMP_TRANSACTION: u32 = 0x5f44_4d50;
+/// `IBinder::FLAG_ONEWAY`: the driver does not expect a reply (see `transact`).
+const TF_ONE_WAY: u32 = 0x1;
 const READ_AREA: usize = 64 * 1024;
 
 #[repr(C)]
@@ -220,9 +222,14 @@ impl Binder {
     fn transact(&mut self, handle: u32, code: u32, data: &[u8], offsets: &[u64]) -> Result<Vec<u8>, String> {
         let mut wb: Vec<u8> = Vec::new();
         push_u32(&mut wb, BC_TRANSACTION as u32);
+        // `flags` is 0 (synchronous) by default, but the dump is issued with
+        // `bwr(&wb, false)` — nothing ever reads the resulting BR_TRANSACTION_COMPLETE /
+        // BR_REPLY, so the reply stayed in the read queue and a later `--latency` call could
+        // receive the previous dump's payload. Mark it one-way.
         let txn = BinderTransactionData {
             handle,
             code,
+            flags: TF_ONE_WAY,
             data_size: data.len() as u64,
             data_buffer: data.as_ptr() as u64,
             offsets_size: (offsets.len() * 8) as u64,
@@ -262,6 +269,13 @@ impl Binder {
                     unsafe { std::ptr::read_unaligned(buf[off..].as_ptr() as *const BinderTransactionData) };
                 off += TXN_SIZE;
                 if t.data_size > 0 && t.data_buffer != 0 {
+                    // Bound the kernel-reported size against the mapping before building a
+                    // slice: every other unsafe access here is length-checked, and a driver
+                    // bug / layout mismatch (32-bit binder_size_t) would otherwise be an
+                    // out-of-bounds read.
+                    if t.data_size as usize > READ_AREA || t.offsets_size as usize > READ_AREA {
+                        return Err("binder transaction exceeds the mapped area".into());
+                    }
                     // SAFETY: `data_buffer` was written by the kernel as an address
                     // inside this process' binder mapping (`Binder::open` maps 256 KiB
                     // read-only, and the kernel never reports a transaction buffer
@@ -355,6 +369,8 @@ impl Binder {
         // bytes (asserted), and `read_unaligned` skips the alignment requirement; the
         // read stays inside `reply`.
         let obj: FlatBinderObject =
+            // The reply layout is a 4-byte status word followed by the flat object; this is
+            // the native `IServiceManager::getService` shape. `reply` is length-checked above.
             unsafe { std::ptr::read_unaligned(reply[4..].as_ptr() as *const FlatBinderObject) };
         if obj.kind != BINDER_TYPE_HANDLE {
             return Err(format!("no handle for '{name}' (kind=0x{:08x})", obj.kind));
@@ -396,10 +412,10 @@ impl Binder {
             out
         });
 
-        let mut data = Vec::new();
-        while data.len() % 8 != 0 {
-            data.push(0);
-        }
+        // `data` is empty here, so the offset 0 of the fd object is already 8-byte aligned.
+        // (The old loop could never run; it read like an alignment guard that did nothing.)
+        let mut data: Vec<u8> = Vec::new();
+        debug_assert_eq!(data.len() % 8, 0);
         let offsets = vec![data.len() as u64];
         let obj = FlatBinderObject { kind: BINDER_TYPE_FD, flags: 0, binder: wfd as u64, cookie: 0 };
         data.extend_from_slice(as_bytes(&obj));
@@ -584,7 +600,11 @@ pub fn pick_layer(list_text: &str, package: &str) -> Option<String> {
             line
         };
         let inner = inner.trim_end_matches('}');
-        if inner.contains(package) && !inner.contains("InputSink") {
+        // Match on the package *component*: `contains(package)` also selected
+        // `com.foobar/com.foobar.Main` when measuring `com.foo`, and a wrong layer yields an
+        // empty table which was then reported as an idle app.
+        let layer_prefix = format!("{package}/");
+        if inner.contains(&layer_prefix) && !inner.contains("InputSink") {
             names.push(inner.to_string());
         }
     }
@@ -750,8 +770,12 @@ impl FrameTask {
                                 Some(l) => match client.latency(&l) {
                                     Ok(text) => {
                                         let (refresh, frames) = parse_latency(&text);
-                                        let fps = fps_in_window(&frames, monotonic_ns(), window_ms * 1_000_000);
-                                        let in_win = frames_in_window(&frames, monotonic_ns(), window_ms * 1_000_000);
+                                        // One clock reading: two samples meant fps and
+                                        // in_win described slightly different windows (and
+                                        // two extra syscalls per tick).
+                                        let now = monotonic_ns();
+                                        let fps = fps_in_window(&frames, now, window_ms * 1_000_000);
+                                        let in_win = frames_in_window(&frames, now, window_ms * 1_000_000);
                                         log(&format!(
                                             "Rust: sf-binder layer={l} refresh_ns={} frames={} in_window={in_win} fps={fps:.1}",
                                             refresh.unwrap_or(0),
@@ -759,7 +783,11 @@ impl FrameTask {
                                         ));
                                         crate::frame_state::publish_binder(true, fps);
                                         publish(FrameSource::Fps, age, Some(fps), frames.len(), Some(&l), refresh);
-                                        if let Some(h) = frame_hint(in_win) {
+                                        // `in_win == 0` is produced both by a genuinely idle
+                                        // UI and by every failed measurement (wrong layer, an
+                                        // SF error string, an unparsable table): only a real
+                                        // table (refresh line parsed) is evidence of idleness.
+                                        if let Some(h) = refresh.and_then(|_| frame_hint(in_win)) {
                                             if last_derived != Some(h) {
                                                 last_derived = Some(h);
                                                 log(&format!(

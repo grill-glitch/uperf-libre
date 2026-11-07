@@ -86,7 +86,11 @@ impl Daemon {
         };
         // dfps is its own crate and has no opinion about the log sink; install ours
         // before its first line could be emitted.
-        crate::dfps_rs::set_logger(crate::log_msg);
+        if crate::dfps_rs::set_logger(crate::log_msg).is_err() {
+            // A second Daemon::start in one process: the first sink stays in use, so the dfps
+            // lines are not lost — say so rather than silently ignoring the failure.
+            crate::log_msg("Rust: dfps logger was already installed (keeping the first sink)");
+        }
         d.start_dfps();
         d.start_dispatcher();
         d.start_bridge_consumers();
@@ -112,22 +116,30 @@ impl Daemon {
     /// Tear down in the documented order. Idempotent: every step takes its field, so a
     /// second call is a no-op (the C++ supervisor can deliver the signal twice).
     pub fn stop(&mut self) {
+        // The armed CPU takeover goes first. Joining the dispatcher can block for up to
+        // STOP_TIMEOUT, and a policy left in `userspace` across that window is the one
+        // state this module documents as unrecoverable — so the old order (join, then
+        // disarm) defeated the whole point of stopping "the frequency takeover first".
+        // By name, not by position.
+        match self.tasks.take_and_stop("cpu") {
+            None => crate::log_msg("Rust: cpu governor was not running, nothing to disarm"),
+            Some(false) => crate::log_msg(
+                "Rust: cpu governor did not stop cleanly; its disarm was run by the stop path",
+            ),
+            Some(true) => {}
+        }
+        self.tasks.stop_all();
+        if let Some(dfps) = self.dfps.take() {
+            dfps.stop();
+        }
         if let Some(mut dispatch) = self.dispatcher.take() {
             dispatch.join_timeout(STOP_TIMEOUT);
         }
-        // By name, not by position: the frequency takeover is the state that must not
-        // survive a slow shutdown.
-        if self.tasks.take_and_stop("cpu") && !self.settings.cpu_governor {
-            crate::log_msg("Rust: cpu governor stopped (was idle, nothing to disarm)");
-        }
-        self.tasks.stop_all();
         if let Some(sink) = self.sink.take() {
-            // Final tally: the sink outlives no thread that uses it.
+            // Final tally, after the dispatcher is gone: it holds its own Arc of the sink
+            // and could still write through it while winding down.
             let s = sink.lock();
             crate::log_msg(&format!("Rust: sysfs sink at stop: {}", s.summary()));
-        }
-        if let Some(dfps) = self.dfps.take() {
-            dfps.stop();
         }
         crate::log_msg("Rust: daemon stopped");
     }
@@ -239,8 +251,13 @@ impl Daemon {
     /// The userspace CPU governor (`UPERF_CPU_GOVERNOR=1`; off by default — see the
     /// note on `CpuTask::spawn`).
     fn start_governor(&mut self) {
-        let Some(cfg) = self.config.clone() else { return };
-        match crate::cpu_task::CpuTask::spawn(&cfg, &self.mode, "idle", &self.settings) {
+        // Borrow, do not clone: `CpuTask::spawn` only reads the config, and a deep copy of
+        // every mask/rule table at each start is pure waste.
+        let spawned = match self.config.as_ref() {
+            Some(cfg) => crate::cpu_task::CpuTask::spawn(cfg, &self.mode, "idle", &self.settings),
+            None => return,
+        };
+        match spawned {
             Some(task) => {
                 self.tasks.push(task);
                 crate::log_msg("Rust: cpu governor started");
@@ -251,14 +268,17 @@ impl Daemon {
 
     /// The context scheduler (`modules.sched`).
     fn start_scheduler(&mut self) {
-        let Some(cfg) = self.config.clone() else { return };
-        if cfg.modules_map().is_none() {
-            return;
-        }
-        let mut log_fn = |m: &str| crate::log_msg(m);
-        let Some(planner) = crate::sched_task::SchedTask::planner_for(&cfg, &self.settings, &mut log_fn)
-        else {
-            return;
+        let planner = {
+            let Some(cfg) = self.config.as_ref() else { return };
+            if cfg.modules_map().is_none() {
+                return;
+            }
+            let mut log_fn = |m: &str| crate::log_msg(m);
+            let Some(planner) = crate::sched_task::SchedTask::planner_for(cfg, &self.settings, &mut log_fn)
+            else {
+                return;
+            };
+            planner
         };
         let Some(orch) = self.orchestrator.clone() else {
             // Unreachable: `start_dispatcher` runs first and always sets it. Kept
@@ -382,11 +402,11 @@ impl Daemon {
     /// and the single-byte `sfanalysis.hint` feed. Last, because nothing depends on it
     /// and it is the task most likely to be idle.
     fn start_watcher(&mut self) {
-        let (Some(cfg), Some(orch)) = (self.config.clone(), self.orchestrator.clone()) else {
+        let (Some(cfg), Some(orch)) = (self.config.as_ref(), self.orchestrator.clone()) else {
             return;
         };
         let plan = crate::watch_task::WatchPlan::from_config(
-            &cfg,
+            cfg,
             std::path::Path::new(&self.settings.config_path),
         );
         self.tasks.push(crate::watch_task::WatchTask::spawn(

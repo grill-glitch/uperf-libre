@@ -33,13 +33,21 @@ pub fn stop_and_join(
     on_timeout: impl FnOnce(),
 ) -> bool {
     flag.store(true, Ordering::Relaxed);
-    let deadline = Instant::now() + timeout;
-    while !handle.is_finished() {
-        if Instant::now() >= deadline {
+    // checked_add: a caller-supplied huge Duration used to panic the shutdown path.
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        if handle.is_finished() {
+            break;
+        }
+        let now = Instant::now();
+        let Some(deadline) = deadline else { break };
+        if now >= deadline {
             on_timeout();
             return false;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        // Never overshoot the caller's timeout by a full poll interval.
+        let remaining = deadline.saturating_duration_since(now);
+        std::thread::sleep(remaining.min(Duration::from_millis(20)));
     }
     let _ = handle.join();
     true

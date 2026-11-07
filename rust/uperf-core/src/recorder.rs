@@ -47,9 +47,23 @@ pub struct Session {
 
 impl Session {
     /// The dedupe key (also the file name stem).
+    ///
+    /// `sanitize` is lossy (`a/b` and `a_b` both become `a_b`), so a short hash of the raw
+    /// package name is appended: without it two distinct packages foregrounded at the same
+    /// epoch collided and the second session was dropped as a duplicate.
     pub fn key(&self) -> String {
-        format!("{}-{}", sanitize(&self.pkg), self.epoch_ms)
+        format!("{}-{}-{:04x}", sanitize(&self.pkg), self.epoch_ms, fnv1a(&self.pkg))
     }
+}
+
+/// FNV-1a, 16 bits: a discriminator for sanitized names, not a security primitive.
+fn fnv1a(s: &str) -> u16 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in s.as_bytes() {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    (h & 0xffff) as u16
 }
 
 /// A package name is not a safe path component as-is; keep the characters that are, and
@@ -112,7 +126,14 @@ impl Recorder {
         if let Some(d) = dir.as_deref() {
             if let Ok(rd) = std::fs::read_dir(history_dir(d)) {
                 for e in rd.flatten() {
-                    if let Some(stem) = e.path().file_stem().and_then(|s| s.to_str()) {
+                    let p = e.path();
+                    // Only `<key>.dfl` is a session: a crash leaves `<key>.dfl.tmp`, whose
+                    // stem is `<key>.dfl`, and foreign files have other extensions. Those
+                    // bogus "keys" consumed memory forever and hid the leftover temp file.
+                    if p.extension().and_then(|x| x.to_str()) != Some("dfl") {
+                        continue;
+                    }
+                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
                         seen.insert(stem.to_string());
                     }
                 }
@@ -211,8 +232,13 @@ impl Recorder {
         std::fs::create_dir_all(&hd).map_err(|e| format!("mkdir {}: {e}", hd.display()))?;
         let path = hd.join(format!("{key}.dfl"));
         let bytes = encode(std::slice::from_ref(s))?;
-        // write through a temp file so a reader never sees half a record
-        let tmp = hd.join(format!("{key}.dfl.tmp"));
+        // Write through a temp file so a reader never sees half a record. Unique per writer:
+        // a detached recorder from the previous generation could still be inside this write,
+        // and a shared temp name let the two clobber each other's bytes.
+        let tmp = hd.join(format!(
+            "{key}.dfl.{}.tmp",
+            std::process::id()
+        ));
         std::fs::write(&tmp, &bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
         if std::fs::rename(&tmp, &path).is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -234,13 +260,15 @@ fn history_dir(dir: &Path) -> PathBuf {
 
 // ---------------------------------------------------------------- daemon task
 
-fn mono_ms() -> u64 {
+fn mono_ms() -> Option<u64> {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: `ts` is a valid writable out-parameter; a failure is reported as 0.
+    // SAFETY: `ts` is a valid writable out-parameter.
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
-        return 0;
+        // `0` is a valid timestamp (boot), so returning it made a failure look like an
+        // epoch at boot and put every sample in that epoch.
+        return None;
     }
-    (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
+    Some((ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000)
 }
 
 /// The recording task. Opt-in: `UPERF_RECORD=1`. Ticks at 1 Hz (the sample cadence),
@@ -287,7 +315,8 @@ impl RecorderTask {
                         std::thread::sleep(std::time::Duration::from_millis(50));
                         slept += 50;
                     }
-                    let now = mono_ms();
+                    // A clock failure skips the tick: `0` would look like an epoch at boot.
+                    let Some(now) = mono_ms() else { continue };
                     if stop_thread.load(Ordering::SeqCst) {
                         // close whatever is open before leaving
                         if let Some(s) = rec.observe(now, None, "idle", 0.0) {
@@ -336,7 +365,10 @@ fn commit_and_log(rec: &mut Recorder, s: &Session, log: &impl Fn(&str)) {
             s.samples.len(),
             p.display()
         )),
-        Ok(None) => log(&format!("Rust: recorder session {}/{} already recorded", s.pkg, s.epoch_ms)),
+        Ok(None) => log(&format!(
+            "Rust: recorder session {}/{} skipped (already recorded, or no store directory)",
+            s.pkg, s.epoch_ms
+        )),
         Err(e) => log(&format!("Rust: recorder write failed: {e}")),
     }
 }
@@ -439,7 +471,11 @@ mod tests {
         assert!(p1.is_some(), "the first write lands");
         let path = p1.unwrap();
         assert!(path.exists());
-        assert!(path.to_string_lossy().ends_with("com.a-999.dfl"), "{path:?}");
+        // The key carries a discriminator hash (`com.a-999-<hash>`) so sanitize() aliasing
+        // cannot merge two packages; assert on the file *name*, not the whole path.
+        let file = path.file_name().unwrap_or_default().to_string_lossy();
+        assert!(file.starts_with("com.a-999-"), "the key carries a discriminator hash: {file}");
+        assert!(file.ends_with(".dfl"), "{file}");
         // the same pkg+epoch again is skipped
         assert_eq!(r.commit(&s).unwrap(), None);
         // a different epoch of the same package is a different session
@@ -460,7 +496,10 @@ mod tests {
         assert_eq!(sanitize("com.example/app:1"), "com.example_app_1");
         assert_eq!(sanitize(""), "_");
         let s = Session { pkg: "a/b".into(), epoch_ms: 7, duration_ms: 0, samples: vec![] };
-        assert_eq!(s.key(), "a_b-7");
+        assert!(s.key().starts_with("a_b-7-"), "{}", s.key());
+        // Two packages that sanitize to the same stem must not share a key.
+        let other = Session { pkg: "a_b".into(), ..s.clone() };
+        assert_ne!(s.key(), other.key(), "sanitize() aliasing must not merge sessions");
     }
 
     #[test]

@@ -86,32 +86,39 @@ mod slots {
 /// from this window (it is reset at the start of every window, so the value read at the
 /// end *is* that window's count).
 pub fn publish_uprobe(healthy: bool, fps: f64, frames: u64) {
-    slots::UPROBE_HEALTHY.store(healthy, Ordering::Relaxed);
     slots::UPROBE_FPS_X100.store((fps.max(0.0) * 100.0) as u64, Ordering::Relaxed);
     slots::UPROBE_FRAMES.store(frames, Ordering::Relaxed);
+    // `healthy` last, and released: a reader takes `healthy` first with acquire, so it never
+    // sees "healthy" paired with the previous window's fps/frames (the old order made that
+    // window observable).
+    slots::UPROBE_HEALTHY.store(healthy, Ordering::Release);
 }
 
 pub fn uprobe() -> LegReading {
+    // Acquire pairs with the release store in `publish_uprobe`: once `healthy` reads as
+    // true, the fps/frames of the same window are visible.
+    let healthy = slots::UPROBE_HEALTHY.load(Ordering::Acquire);
     LegReading {
         source: FrameSource::Uprobe,
         fps: slots::UPROBE_FPS_X100.load(Ordering::Relaxed) as f64 / 100.0,
         frames: slots::UPROBE_FRAMES.load(Ordering::Relaxed),
-        healthy: slots::UPROBE_HEALTHY.load(Ordering::Relaxed),
+        healthy,
     }
 }
 
 /// ⑤ reports its last window (and whether its binder link is up).
 pub fn publish_binder(connected: bool, fps: f64) {
-    slots::BINDER_CONNECTED.store(connected, Ordering::Relaxed);
     slots::BINDER_FPS_X100.store((fps.max(0.0) * 100.0) as u64, Ordering::Relaxed);
+    slots::BINDER_CONNECTED.store(connected, Ordering::Release);
 }
 
 pub fn binder() -> LegReading {
+    let healthy = slots::BINDER_CONNECTED.load(Ordering::Acquire);
     LegReading {
         source: FrameSource::Fps,
         fps: slots::BINDER_FPS_X100.load(Ordering::Relaxed) as f64 / 100.0,
         frames: 0,
-        healthy: slots::BINDER_CONNECTED.load(Ordering::Relaxed),
+        healthy,
     }
 }
 
@@ -127,10 +134,17 @@ pub fn publish_hint(live: bool) {
 /// while the uprobe leg owns the number does not silently store the fallback's 0.0.
 pub fn active() -> LegReading {
     if slots::HINT_LIVE.load(Ordering::Relaxed) {
+        // `healthy: true, fps: 0.0` conflated "the hint leg has no reading" with "the measured
+        // frame rate is zero", so a session recorded while the hint was live lost the real fps.
+        // A hint is one byte of scene, not a frame count: reporting 0.0 fps unconditionally
+        // threw away a perfectly good uprobe measurement (the recorder then stored 0 fps for
+        // a session that was running fine). Keep `source = Hint`, expose the count when the
+        // probe has one.
+        let u = uprobe();
         return LegReading {
             source: FrameSource::Hint,
-            fps: 0.0,
-            frames: 0,
+            fps: if u.healthy { u.fps } else { 0.0 },
+            frames: if u.healthy { u.frames } else { 0 },
             healthy: true,
         };
     }

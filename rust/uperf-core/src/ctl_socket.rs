@@ -65,7 +65,9 @@ impl Hello {
         let (mut v, mut pid, mut uid) = (None, None, None);
         let mut token = None;
         for kv in it {
-            let (k, val) = kv.split_once('=')?;
+            // A token without `=` used to return None for the *whole* parse, contradicting
+            // "unknown keys are ignored" and rejecting a forward-compatible `HELLO ... FLAG`.
+            let Some((k, val)) = kv.split_once('=') else { continue };
             match k {
                 "v" => v = val.parse::<u32>().ok(),
                 "pid" => pid = val.parse::<u32>().ok(),
@@ -130,28 +132,34 @@ pub fn token_from_urandom() -> Option<String> {
 pub fn load_or_create_token(path: &Path) -> Option<String> {
     if let Ok(s) = std::fs::read_to_string(path) {
         let t = s.trim().to_string();
-        if !t.is_empty() {
+        // Interior whitespace would break the `HELLO ... token=<hex>` framing on the peer.
+        if !t.is_empty() && t.chars().all(|c| c.is_ascii_hexdigit()) {
             return Some(t);
         }
     }
-    let t = token_from_urandom()?;
-    write_private(path, &format!("{t}\n"));
-    Some(t)
-}
-
-fn write_private(path: &Path, data: &str) {
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let t = token_from_urandom()?;
+    // Create exclusively: two processes starting at once used to each mint a token and the
+    // loser silently overwrote the winner, so the two sides no longer shared a secret. If
+    // the file exists now, its content is authoritative.
+    match std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)
     {
-        let _ = f.write_all(data.as_bytes());
+        Ok(mut f) => {
+            use std::io::Write as _;
+            let _ = f.write_all(format!("{t}\n").as_bytes());
+            Some(t)
+        }
+        Err(_) => std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|t| !t.is_empty()),
     }
 }
 
@@ -274,6 +282,14 @@ pub struct CtlTask {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+impl Drop for CtlTask {
+    fn drop(&mut self) {
+        // Without this, dropping the task leaks a thread that keeps retrying forever
+        // because nobody will ever set the stop flag.
+        self.stop();
+    }
+}
+
 impl CtlTask {
     /// `cfg` (and the token path) come from `Settings`; this module reads no
     /// environment variable.
@@ -314,6 +330,13 @@ impl CtlTask {
                                 Ok(c) => BufReader::new(c),
                                 Err(e) => {
                                     log(&format!("Rust: ctl-socket: clone failed: {e}"));
+                                    // `continue` skipped the retry sleep at the bottom of the
+                                    // loop, so persistent fd exhaustion spun this thread.
+                                    let mut slept = 0u64;
+                                    while slept < retry_ms && !stop_thread.load(Ordering::SeqCst) {
+                                        std::thread::sleep(std::time::Duration::from_millis(50));
+                                        slept += 50;
+                                    }
                                     continue;
                                 }
                             };
@@ -422,11 +445,18 @@ fn serve(
     log: &impl Fn(&str),
 ) -> Result<(), String> {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    // A write timeout too: a peer that accepts the connection but stops draining its receive
+    // buffer would otherwise block `write_all(PING)` forever, making the stop check and the
+    // `unanswered` liveness guard unreachable.
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
     // The reader comes from the handshake: it may already hold the peer's next line.
     let _ = rd.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let _ = rd.get_ref().set_write_timeout(Some(std::time::Duration::from_millis(500)));
     let mut pongs = 0u64;
     let mut unanswered = 0u32;
     let mut last_ping = std::time::Instant::now();
+    // Keep partial bytes across a read timeout: `line.clear()` at the top of each iteration
+    // discarded them, so a command split by the 500 ms timeout was never answered.
     let mut line = String::new();
     while !stop.load(Ordering::SeqCst) {
         if last_ping.elapsed() >= std::time::Duration::from_millis(ping_every) {
@@ -438,11 +468,15 @@ fn serve(
             unanswered += 1;
             last_ping = std::time::Instant::now();
         }
-        line.clear();
         match rd.read_line(&mut line) {
             Ok(0) => return Err("peer closed".into()),
             Ok(_) => {
-                let l = line.trim();
+                // A line without its terminator is still incomplete: keep reading.
+                if !line.ends_with('\n') {
+                    continue;
+                }
+                let owned = std::mem::take(&mut line);
+                let l = owned.trim();
                 if l == "PONG" {
                     unanswered = 0;
                     pongs += 1;

@@ -46,17 +46,41 @@ use std::collections::BTreeMap;
 /// `/dev/cpuset/<group>/cpus`, where upstream warns but this device accepts the write
 /// (`echo 0-7 > /dev/cpuset/top-app/cpus` succeeds). See docs/records/m7-evidence.md §6.
 pub fn is_writeable(path: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false; // missing
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    // One handle for the whole probe: separate metadata/read/write calls are three path
+    // lookups, so the checks and the write can land on different inodes (a symlink swapped
+    // into a writable directory), and the mode check would then guard nothing.
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return false; // missing, a symlink, or not writable
     };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    // FIFOs and character devices can block or stream forever; sysfs attributes are regular
+    // files, so anything else is not a knob we can probe.
+    if !meta.file_type().is_file() {
+        return false;
+    }
     if meta.permissions().mode() & 0o200 == 0 {
         return false; // read-only at the mode level: the driver-locked case
     }
-    let Ok(current) = std::fs::read_to_string(path) else {
+    // Read the current bytes (a knob may return non-UTF-8) and write them back. No truncate:
+    // `fs::write` would empty a regular file if the write-back failed.
+    let mut current = Vec::new();
+    if file.read_to_end(&mut current).is_err() {
         return false;
-    };
-    std::fs::write(path, current).is_ok()
+    }
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    file.write_all(&current).is_ok()
 }
 
 /// `Config '<name>' by '<author>'` — the first line upstream prints after the banner.
@@ -68,8 +92,9 @@ pub fn config_line(meta_name: &str, meta_author: &str) -> String {
 /// for writing, in the knob table's (sorted) order — the order `BTreeMap` gives,
 /// which is also the order the upstream log showed for sdm888.
 ///
-/// Returns `(lines, probe_failures)`. `probe` is injectable so the host can test
-/// the formatting and the ordering without a device.
+/// Returns the warning lines only. A failed probe and a genuine "not writeable" verdict are
+/// indistinguishable here by design (the probe is mode-bit + write-back), so the caller
+/// prints one line per unwritable knob.
 pub fn knob_warnings(
     knob_table: &BTreeMap<String, String>,
     probe: &dyn Fn(&str) -> bool,
@@ -181,8 +206,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&d);
             return;
         }
-        // As root, mode bits do not stop the open nor the write, so this documents
-        // that the probe is write-based rather than permission-based.
+        // As root the open and the write-back both succeed on a 0444 file, so the *mode
+        // bit* is what has to reject it: the old assertion here ("root's write-back succeeds")
+        // could never hold once the mode check runs first, and its message documented the
+        // opposite of what the probe does.
         let d = std::env::temp_dir().join(format!("uperf_ro_{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let f = d.join("ro");
@@ -191,8 +218,8 @@ mod tests {
         p.set_mode(0o444);
         std::fs::set_permissions(&f, p).unwrap();
         assert!(
-            is_writeable(f.to_str().unwrap()),
-            "root's write-back succeeds even on mode 444, which is why the kernel              refusing the write is the only signal that matters"
+            !is_writeable(f.to_str().unwrap()),
+            "the owner write bit is clear, so the mode-bit check must report not writeable"
         );
         let _ = std::fs::remove_dir_all(&d);
     }

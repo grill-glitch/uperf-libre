@@ -29,6 +29,13 @@ struct Applied {
     policy: SchedPolicy,
 }
 
+impl Default for Applied {
+    fn default() -> Self {
+        // "Nothing to do": no affinity change, no priority change (Skip).
+        Self { cpus: None, policy: SchedPolicy::Skip }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ScanReport {
     /// Every process walked in `/proc` (whether or not a rule matched it).
@@ -132,19 +139,20 @@ impl SchedApplier {
     /// One pass over `/proc`.
     pub fn scan(&mut self) -> ScanReport {
         let mut report = ScanReport::default();
-        for p in sched_apply::list_procs() {
+        // One enumeration: the second walk (`list_procs` reads every pid's cmdline and lists
+        // every task dir) existed only to garbage-collect the cache below. Reuse the first.
+        let procs = sched_apply::list_procs();
+        let live: std::collections::HashSet<i32> =
+            procs.iter().flat_map(|p| p.threads.iter().map(|t| t.tid)).collect();
+        for p in &procs {
             if let Some(only) = &self.only {
                 if !p.name.contains(only.as_str()) {
                     continue;
                 }
             }
-            report.merge(&self.apply_proc(&p));
+            report.merge(&self.apply_proc(p));
         }
         // Forget tids that no longer exist so the map cannot grow forever.
-        let live: std::collections::HashSet<i32> = sched_apply::list_procs()
-            .into_iter()
-            .flat_map(|p| p.threads.into_iter().map(|t| t.tid))
-            .collect();
         self.applied.retain(|tid, _| live.contains(tid));
         report
     }
@@ -152,21 +160,25 @@ impl SchedApplier {
     fn apply_proc(&mut self, p: &ProcInfo) -> ScanReport {
         let mut r = ScanReport { procs_seen: 1, ..Default::default() };
         let is_top = self.top_app.as_deref() == Some(p.name.as_str());
-        // The main thread's `comm` is what `/MAIN_THREAD/` substitutes to. Read it
-        // once per process rather than once per thread.
+
+        // Does any rule match this process? (A `"."` catch-all rule means yes for almost
+        // everything, but be explicit.) Checked *before* reading `comm`: the per-process
+        // `comm` read used to be paid for every process, matched or not.
+        let matches = self.planner.match_process(&p.name).is_some();
+        if !matches {
+            return r;
+        }
+
+        // The main thread's `comm` is what `/MAIN_THREAD/` substitutes to. Read it once per
+        // process rather than once per thread. A failed read yields "" which, substituted
+        // into a pattern, matches *every* thread — fall back to the process name.
         let main_comm = p
             .threads
             .iter()
             .find(|t| t.is_main)
             .map(|t| sched_apply::comm_of(p.pid, t.tid))
+            .filter(|c| !c.is_empty())
             .unwrap_or_else(|| p.name.clone());
-
-        // Does any rule match this process? (A `"."` catch-all rule means yes for
-        // almost everything, but be explicit.)
-        let matches = self.planner.match_process(&p.name).is_some();
-        if !matches {
-            return r;
-        }
         r.procs_matched = 1;
 
         // Resolve the scene once per process: it only depends on the rule's
@@ -192,6 +204,11 @@ impl SchedApplier {
                 &main_comm,
                 &comm,
             ) else {
+                // The process matched but no thread rule does: cache that as "nothing to
+                // do", or every later scan re-reads `comm` and re-runs the whole match for
+                // this thread — the per-thread cost the cache exists to avoid.
+                self.applied.insert(t.tid, Applied::default());
+                r.unchanged += 1;
                 continue;
             };
             let want = Applied { cpus: d.cpus.clone(), policy: d.policy };
@@ -201,21 +218,28 @@ impl SchedApplier {
             }
             if self.dry_run {
                 if want.cpus.is_some() || want.policy != SchedPolicy::Skip {
-                    r.would_change += 1;
+                        r.would_change += 1;
                     log_line(&format!(
                         "Rust: sched[DRY] pid={} {:?} tid={} {:?} rule={:?} scene={} ac={} pc={} -> cpus={:?} policy={:?}",
                         p.pid, p.name, t.tid, comm, d.rule, d.scene, d.ac, d.pc, d.cpus, d.policy
                     ));
+                } else {
+                    // "Already in effect" — only when nothing would change; counting it in
+                    // both buckets made a harness unable to tell the two apart.
+                    r.unchanged += 1;
                 }
-                r.unchanged += 1;
                 continue;
             }
             let mut changed = false;
+            // Tracked per field so the cache reflects what really happened.
+            let mut affinity_ok = d.cpus.is_none();
+            let mut policy_ok = d.policy == SchedPolicy::Skip;
             if let Some(cpus) = &d.cpus {
                 match sched_apply::set_affinity(t.tid, cpus) {
                     Ok(()) => {
                         r.affinity_changes += 1;
                         changed = true;
+                        affinity_ok = true;
                         // The syscall can be accepted and still not be what the
                         // thread ends up with: the cpuset cgroup can constrain it
                         // (a target outside the cpuset comes back EINVAL), and
@@ -249,6 +273,7 @@ impl SchedApplier {
                     Ok(()) => {
                         r.policy_changes += 1;
                         changed = true;
+                        policy_ok = true;
                     }
                     Err(e) => {
                         r.errors += 1;
@@ -264,7 +289,14 @@ impl SchedApplier {
                     "Rust: sched pid={} {:?} tid={} {:?} rule={:?} scene={} ac={} pc={} -> cpus={:?} policy={:?}",
                     p.pid, p.name, t.tid, comm, d.rule, d.scene, d.ac, d.pc, d.cpus, d.policy
                 ));
-                self.applied.insert(t.tid, want);
+                // Cache only the fields that actually took effect. Caching the whole `want`
+                // after one of the two syscalls failed meant the failed half was never
+                // retried and the thread stayed silently misconfigured.
+                let cached = Applied {
+                    cpus: if affinity_ok { d.cpus.clone() } else { None },
+                    policy: if policy_ok { d.policy } else { SchedPolicy::Skip },
+                };
+                self.applied.insert(t.tid, cached);
             }
         }
         r
@@ -302,8 +334,16 @@ impl SchedTask {
         settings: &crate::settings::Settings,
         log: &mut dyn FnMut(&str),
     ) -> Option<SchedPlanner> {
-        let modules = cfg.modules_map()?;
-        let sc = uperf_config::SchedConfig::from_modules(modules)?;
+        // Both `?`s used to return None with no line, so "not configured" and "config
+        // unreadable / rule compilation failed" looked identical in the log.
+        let Some(modules) = cfg.modules_map() else {
+            log("Rust: sched disabled (config has no 'modules' block)");
+            return None;
+        };
+        let Some(sc) = uperf_config::SchedConfig::from_modules(modules) else {
+            log("Rust: sched disabled (config has no 'modules.sched' block)");
+            return None;
+        };
         if !sc.enable {
             log("Rust: context scheduler disabled by config");
             return None;
@@ -342,7 +382,7 @@ impl SchedTask {
         let only = settings.sched_only.clone();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_child = stop.clone();
-        let thread = std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("uperf-sched".into())
             .spawn(move || {
                 let mut applier = SchedApplier::new(planner, dry_run, only);
@@ -390,8 +430,17 @@ impl SchedTask {
                 }
                 log_line("Rust: context scheduler stopped");
             })
-            .expect("spawn uperf-sched");
-        Self { stop, thread: Some(thread) }
+            ;
+        // A spawn failure is recoverable (thread limit): degrade without the task instead of
+        // panicking, which would be UB reached from the FFI callers.
+        let thread = match handle {
+            Ok(t) => Some(t),
+            Err(e) => {
+                log_line(&format!("Rust: spawn uperf-sched failed: {e}"));
+                None
+            }
+        };
+        Self { stop, thread }
     }
 
     pub fn stop(&mut self) {

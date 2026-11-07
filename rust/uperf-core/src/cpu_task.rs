@@ -149,8 +149,18 @@ impl UserspaceWriter {
                 let name = dir.rsplit('/').next().unwrap_or(dir);
                 out.push_str(&format!("{name} {prev}\n"));
             }
-            if !out.is_empty() {
-                let _ = std::fs::write(path, out);
+            // Atomic: a SIGKILL mid-write used to leave a truncated record, and the stop
+            // script then restored only part of the governors. Written even when empty so a
+            // previous run's stale record cannot be replayed against policies this run never
+            // touched.
+            let tmp = path.with_extension("new");
+            if std::fs::write(&tmp, out.as_bytes())
+                .and_then(|_| std::fs::rename(&tmp, path))
+                .is_err()
+            {
+                // FUSE can refuse the rename; fall back to a direct write.
+                let _ = std::fs::remove_file(&tmp);
+                let _ = std::fs::write(path, out.as_bytes());
             }
         }
         self.write_status("running");
@@ -163,7 +173,16 @@ impl UserspaceWriter {
         for (t, f) in targets.iter().zip(freqs_khz.iter()) {
             let FreqTarget::Userspace { policy_dir } = t else { continue };
             let path = apply_root(&format!("{policy_dir}/scaling_setspeed"), &root);
-            if std::fs::write(&path, format!("{}", *f as i64)).is_ok() {
+            // No `format!` per tick: this runs for every cluster every sample period.
+            let mut buf = [0u8; 24];
+            let text = {
+                use std::io::Write;
+                let mut cursor = std::io::Cursor::new(&mut buf[..]);
+                let _ = write!(cursor, "{}", *f as i64);
+                let len = cursor.position() as usize;
+                std::str::from_utf8(&buf[..len]).unwrap_or("0")
+            };
+            if std::fs::write(&path, text).is_ok() {
                 n += 1;
             }
         }
@@ -195,7 +214,7 @@ impl UserspaceWriter {
     }
 }
 
-use crate::orchestrator::{CollectingSink, Sink, SysfsWrite};
+use crate::orchestrator::{Sink, SysfsWrite};
 
 /// What the governor thread needs beyond the policy itself (paths, test seams,
 /// thermal bounds). One struct instead of six positional arguments, and every field
@@ -252,16 +271,24 @@ pub fn read_opps_for_policy(policy_dir: &str) -> Vec<f64> {
     if opps.is_empty() {
         let mut two = read_list("cpuinfo_min_freq");
         two.extend(read_list("cpuinfo_max_freq"));
-        two.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // total_cmp: partial_cmp().unwrap() panics on a NaN from a malformed OPP table.
+        two.sort_by(f64::total_cmp);
         two.dedup();
         opps = two;
     }
-    opps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    opps.sort_by(f64::total_cmp);
     opps
 }
 
 /// OPPs for every cluster, in `powerModel` order.
 pub fn read_opps_for_config(cfg: &Config) -> Vec<Vec<f64>> {
+    read_opps_for_config_with(cfg, None)
+}
+
+/// Same, with `UPERF_FAKE_ROOT` honoured: with a fake root set, reading the host's real
+/// `/sys` made `spawn()` bail out with "no OPP tables readable", so the governor could not be
+/// exercised against a fake tree at all.
+pub fn read_opps_for_config_with(cfg: &Config, fake_root: Option<&str>) -> Vec<Vec<f64>> {
     let Some(modules) = cfg.modules_map() else {
         return Vec::new();
     };
@@ -270,7 +297,8 @@ pub fn read_opps_for_config(cfg: &Config) -> Vec<Vec<f64>> {
         .iter()
         .map(|cores| {
             let first = cores.first().copied().unwrap_or(0);
-            read_opps_for_policy(&format!("/sys/devices/system/cpu/cpufreq/policy{first}"))
+            let dir = format!("/sys/devices/system/cpu/cpufreq/policy{first}");
+            read_opps_for_policy(&apply_root(&dir, &fake_root.map(str::to_string)))
         })
         .collect()
 }
@@ -283,6 +311,15 @@ pub struct CpuTask {
     /// path can restore the kernel's original governors even if the task thread
     /// is stuck and never reaches its own `disarm()`.
     writer: Arc<std::sync::Mutex<UserspaceWriter>>,
+}
+
+impl Drop for CpuTask {
+    fn drop(&mut self) {
+        // Dropping without stop() detaches the governor thread and leaves every policy in
+        // `userspace` at the last published frequency — the one state this module cannot
+        // recover from on its own. `stop()` is idempotent.
+        self.stop();
+    }
 }
 
 impl CpuTask {
@@ -303,17 +340,32 @@ impl CpuTask {
         let thread = std::thread::Builder::new()
             .name("uperf-cpu".into())
             .spawn(move || {
-                let mut writer = writer_child.lock().expect("writer lock");
-                writer.state_file(rt.state_file.clone());
-                writer.status(rt.status.clone());
-                writer.root(rt.fake_root.clone());
-                writer.arm(&targets);
-                if writer.is_armed() {
-                    log_line(&format!(
-                        "Rust: cpu governor armed {} userspace cluster(s)",
-                        writer.armed.len()
-                    ));
+                // Arm under a short-lived guard. Holding this mutex for the whole loop is
+                // what made the `stop()` fallback (writer.lock().disarm()) block forever
+                // when the thread was stuck — the one path that must always work.
+                {
+                    let mut writer = writer_child.lock().expect("writer lock");
+                    writer.state_file(rt.state_file.clone());
+                    writer.status(rt.status.clone());
+                    writer.root(rt.fake_root.clone());
+                    writer.arm(&targets);
+                    if writer.is_armed() {
+                        log_line(&format!(
+                            "Rust: cpu governor armed {} userspace cluster(s)",
+                            writer.armed.len()
+                        ));
+                    }
                 }
+                // Config-declared knobs (scaling_max_freq / msm_performance) are written
+                // through the live sink; it is built once so the fd cache and the loaded
+                // ledger survive across ticks.
+                let mut live_sink = if rt.fake_root.is_none() {
+                    Some(crate::real_sink::RealSink::new(
+                        rt.ledger.clone().map(crate::sysfs_ledger::SysfsLedger::load),
+                    ))
+                } else {
+                    None
+                };
                 // Prime the sampler and throw away the first span: it covers the
                 // interval from boot to process start, which reads as a full-load
                 // blip and would kick every cluster to max once. Sample, wait one
@@ -370,7 +422,7 @@ impl CpuTask {
                         log_cpu_tick(&gov, &freqs);
                     }
                     // Userspace clusters first: they need a target every cycle.
-                    writer.apply(&targets, &freqs);
+                    writer_child.lock().expect("writer lock").apply(&targets, &freqs);
 
                     // Config-declared knobs (scaling_max_freq / msm_performance)
                     // as a secondary path, so a device that supports them gets
@@ -403,17 +455,19 @@ impl CpuTask {
                                 }
                             }
                             None => {
-                                let mut sink = CollectingSink::default();
-                                for w in &writes {
-                                    sink.write(w);
+                                // The production path: these writes must reach sysfs, not a
+                                // collecting sink (a device that resolves to PolicyMax /
+                                // MsmPerformance got nothing before).
+                                if let Some(sink) = live_sink.as_mut() {
+                                    for w in &writes {
+                                        sink.write(w);
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                // Drop the lock before disarming so a stuck *caller* cannot
-                // deadlock us; disarm is idempotent.
-                drop(writer);
+                // disarm is idempotent: the stop() fallback may already have run it.
                 writer_child.lock().expect("writer lock").disarm();
                 log_line("Rust: cpu governor disarmed (original governor restored)");
             })
@@ -452,7 +506,7 @@ impl CpuTask {
             );
             return None;
         }
-        let opps = read_opps_for_config(cfg);
+        let opps = read_opps_for_config_with(cfg, settings.fake_root.as_deref());
         if opps.iter().all(|o| o.is_empty()) {
             log_line("Rust: cpu governor skipped (no OPP tables readable)");
             return None;
