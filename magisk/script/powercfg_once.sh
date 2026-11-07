@@ -333,3 +333,8 @@ stop miuibooster
 stop mcd_service
 
 killall -9 mi_thermald
+
+# The last command's status is not this script's verdict: every step above logs its own
+# failure (a missing node, a HAL that refused to stop). Exiting with it made initsvc report
+# "powercfg_once.sh failed" for a run that had done its work.
+exit 0

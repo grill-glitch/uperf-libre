@@ -166,3 +166,6 @@ mask_val "0" /proc/oplus_scheduler/sched_assist/sched_assist_enabled
 for i in 0 1 2;do
     mask_val "$i,0,5,3000,3,2000,3,2000" /sys/module/cpufreq_bouncing/parameters/config
 done
+
+# The last command's status is not this script's verdict: every step logs its own failure.
+exit 0

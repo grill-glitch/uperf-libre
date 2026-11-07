@@ -37,11 +37,14 @@ set_cpufreq_min() {
     for kv in $1; do
         # An entry without `:` (or with an empty value) used to write a bogus value into a
         # non-existent path; `$1` unquoted would also glob.
-        case "$kv" in
-            *:*[!0-9]* | *:* | :* | *[!0-9]*:*) echo "uperf: bad cpu freq entry '$kv'" >&2; continue ;;
-        esac
-        key=${kv%:*}
+        # Split first, then require *both* halves to be numeric. The glob form
+        # (`*:*`) matched every well-formed entry, so `1:0` was rejected along with
+        # genuinely malformed ones and no min-frequency was ever written.
+        case "$kv" in *:*:*) echo "uperf: bad cpu freq entry '$kv'" >&2; continue ;; esac
+        key=${kv%%:*}
         val=${kv#*:}
+        case "$key" in '' | *[!0-9]*) echo "uperf: bad cpu freq entry '$kv'" >&2; continue ;; esac
+        case "$val" in '' | *[!0-9]*) echo "uperf: bad cpu freq entry '$kv'" >&2; continue ;; esac
         lock_val "$val" /sys/devices/system/cpu/cpu$key/cpufreq/scaling_min_freq
     done
 }
