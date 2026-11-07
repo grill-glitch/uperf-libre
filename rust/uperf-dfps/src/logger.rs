@@ -14,10 +14,15 @@ type Sink = fn(&str);
 
 static SINK: OnceLock<Sink> = OnceLock::new();
 
-/// Install the sink. The first call wins; later calls are ignored (the host has exactly
-/// one log file).
-pub fn set_logger(f: Sink) {
-    let _ = SINK.set(f);
+/// Install the sink. The first call wins; later calls are ignored (the host has exactly one
+/// log file). Returns `Err(existing)` when a sink was already installed, so a host can tell
+/// "my sink is in use" from "my sink was silently dropped".
+///
+/// Contract for the sink: it is called on the caller's thread (any thread), so it must be
+/// thread-safe; it must not itself log through this crate (that recurses without a guard);
+/// and a panic inside it propagates into the library code that was merely emitting a line.
+pub fn set_logger(f: Sink) -> Result<(), Sink> {
+    SINK.set(f)
 }
 
 pub(crate) fn log(s: &str) {

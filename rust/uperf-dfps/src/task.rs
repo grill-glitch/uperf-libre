@@ -164,18 +164,33 @@ impl DfpsTask {
         self.switch_refresh_rate(hz, force)
     }
 
+    /// Roll the dedupe state back after a failed emission. The switch is committed here but
+    /// actually applied later by the sink (`settings put` + `dfps_cur.txt`); without this a
+    /// failed write suppressed every later non-forced retry and the device kept the old rate
+    /// while `cur_hz` claimed the new one.
+    pub fn note_switch_failed(&mut self, attempted: i32) {
+        if self.cur_hz == Some(attempted) {
+            // Unknown, not "already in effect": the next non-forced tick re-emits.
+            self.cur_hz = None;
+        }
+    }
+
     /// True when the 10 s brightness sample interval has elapsed — upstream
     /// `BRIGHTNESS_SAMPLE_INTERVAL_S` (`dynamic_fps.cpp:31`, `:294`).
     pub fn needs_brightness_sample(&self, now: Instant) -> bool {
         now.duration_since(self.last_brightness_sample) > BRIGHTNESS_SAMPLE_INTERVAL
     }
 
-    /// Record a brightness sample. `None` (command failed) is treated as `-1`,
-    /// which upstream's `brightness < enableMinBrightness_` maps to "low" — a
-    /// failed read keeps the active rate rather than dropping to idle.
+    /// Record a brightness sample. A failed read (`None`) is *not* a measurement: collapsing it
+    /// to `-1` made it a confident "low brightness" verdict, pinned the active rate and blocked
+    /// a retry for the whole 10 s interval. Keep the previous verdict and retry on the next
+    /// scheduler tick instead.
     pub fn note_brightness_sample(&mut self, now: Instant, brightness: Option<i32>) {
+        let Some(b) = brightness else {
+            return;
+        };
         self.last_brightness_sample = now;
-        self.low_brightness = brightness.unwrap_or(-1) < self.tunables.enable_min_brightness;
+        self.low_brightness = b < self.tunables.enable_min_brightness;
     }
 
     pub fn low_brightness(&self) -> bool {
@@ -193,6 +208,12 @@ impl DfpsTask {
         }
         if let Some(b) = btn {
             self.btn_pressed = b;
+        }
+        // A press must take effect on its own: `tick()` reads `active`, not `pressed()`, so
+        // requiring the caller to also call `set_active(true)` was an easy-to-miss two-call
+        // invariant that let the two flags drift apart. The idle timeout stays the caller's.
+        if self.touch_pressed || self.btn_pressed {
+            self.active = true;
         }
     }
 

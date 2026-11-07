@@ -45,7 +45,9 @@ use crate::task::DfpsTask;
 /// `dfps_cur.txt`; tests record and return a fixed brightness.
 pub trait RefreshSink: Send + Sync {
     /// Called once per *actual* change (the dedupe gate already ran).
-    fn on_switch(&self, from: Option<i32>, to: i32);
+    /// Apply a switch. Returns `false` when the emission failed (the scheduler then rolls the
+    /// dedupe state back so the next tick retries).
+    fn on_switch(&self, from: Option<i32>, to: i32) -> bool;
 
     /// `screen_brightness` for the anti-flicker gate. `None` means the read
     /// failed; the task maps that to upstream's `-1` (treated as "low").
@@ -56,7 +58,7 @@ pub trait RefreshSink: Send + Sync {
 pub struct RealSink;
 
 impl RefreshSink for RealSink {
-    fn on_switch(&self, from: Option<i32>, to: i32) {
+    fn on_switch(&self, from: Option<i32>, to: i32) -> bool {
         crate::log(&format!(
             "Dfps: switch {} -> {to} Hz",
             match from {
@@ -65,12 +67,16 @@ impl RefreshSink for RealSink {
             }
         ));
         // Order mirrors upstream: notify file, then the settings writes.
+        let mut ok = true;
         if let Err(e) = crate::notifier::write_cur_hz(to) {
             crate::log(&format!("Dfps: notify write failed: {e}"));
+            ok = false;
         }
         if crate::sys_settings::write_peak_refresh_rate(to) == 0 {
             crate::log("Dfps: settings put did not spawn (no /system/bin/cmd?)");
+            ok = false;
         }
+        ok
     }
 
     fn screen_brightness(&self) -> Option<i32> {
@@ -95,8 +101,9 @@ impl Default for RecordingSink {
 }
 
 impl RefreshSink for RecordingSink {
-    fn on_switch(&self, from: Option<i32>, to: i32) {
+    fn on_switch(&self, from: Option<i32>, to: i32) -> bool {
         self.events.lock().push((from, to));
+        true
     }
     fn screen_brightness(&self) -> Option<i32> {
         *self.brightness.lock()
@@ -170,12 +177,20 @@ impl DfpsScheduler {
 
     /// Spawn the timer thread; returns its join handle. Takes `&self` so the
     /// caller keeps using the scheduler.
-    pub fn spawn(&self) -> std::thread::JoinHandle<()> {
+    /// Spawn the timer thread. Returns `None` when the OS refuses to create one (a
+    /// recoverable environment error) instead of panicking on the production path.
+    pub fn spawn(&self) -> Option<std::thread::JoinHandle<()>> {
         let inner = Arc::clone(&self.inner);
-        std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("uperf-dfps".into())
             .spawn(move || timer_loop(inner))
-            .expect("spawn dfps timer thread")
+        {
+            Ok(h) => Some(h),
+            Err(e) => {
+                crate::log(&format!("Dfps: cannot spawn the timer thread: {e}"));
+                None
+            }
+        }
     }
 
     /// Signal the timer thread to exit.
@@ -199,8 +214,9 @@ impl DfpsScheduler {
     pub fn on_touch(&self, pressed: bool) {
         let mut s = self.inner.state.lock();
         s.task.set_pressed(Some(pressed), None);
-        apply_press(&mut s, &*self.inner.sink);
+        let ev = apply_press(&mut s, &*self.inner.sink);
         drop(s);
+        dispatch(&*self.inner.sink, &self.inner.state, ev);
         self.inner.cv.notify_all();
     }
 
@@ -208,36 +224,45 @@ impl DfpsScheduler {
     pub fn on_btn(&self, pressed: bool) {
         let mut s = self.inner.state.lock();
         s.task.set_pressed(None, Some(pressed));
-        apply_press(&mut s, &*self.inner.sink);
+        let ev = apply_press(&mut s, &*self.inner.sink);
         drop(s);
+        dispatch(&*self.inner.sink, &self.inner.state, ev);
         self.inner.cv.notify_all();
     }
 
     /// `input.state` — upstream `OnInputScene`.
     pub fn on_input_state(&self, gesture: bool) {
         let mut s = self.inner.state.lock();
+        let mut ev = None;
         if gesture {
-            // Gesture start: universal override, active, no idle timer.
+            // Gesture start: universal override, active, no idle timer — and cancel any
+            // pending gesture END timer. A deadline left over from the previous gesture
+            // survives into the new one and later clears this gesture's override early.
             s.input_deadline = None;
+            s.gesture_deadline = None;
             s.task.set_override(UNIVERSAL_PKG);
             s.task.set_active(true);
-            tick_with_brightness(&mut s, &*self.inner.sink, false);
+            ev = tick_locked(&mut s, &*self.inner.sink, false);
         } else {
             let slack = s.task.tunables().gesture_slack_ms;
             s.gesture_deadline = Some(Instant::now() + ms(slack));
         }
         drop(s);
+        dispatch(&*self.inner.sink, &self.inner.state, ev);
         self.inner.cv.notify_all();
     }
 
     /// `topapp.pkgName` — upstream `OnTopAppSwitch`.
     pub fn on_top_app(&self, pkg: &str) {
         let mut s = self.inner.state.lock();
-        if s.task.set_top_app(pkg) {
+        let ev = if s.task.set_top_app(pkg) {
             // upstream :259 SwitchRefreshRate(true)
-            tick_with_brightness(&mut s, &*self.inner.sink, true);
-        }
+            tick_locked(&mut s, &*self.inner.sink, true)
+        } else {
+            None
+        };
         drop(s);
+        dispatch(&*self.inner.sink, &self.inner.state, ev);
         self.inner.cv.notify_all();
     }
 
@@ -247,15 +272,17 @@ impl DfpsScheduler {
         if !s.task.set_offscreen_state(off) {
             return;
         }
+        let mut ev = None;
         if off {
             s.wakeup_deadline = None;
             s.task.set_override(OFFSCREEN_PKG);
-            tick_with_brightness(&mut s, &*self.inner.sink, true);
+            ev = tick_locked(&mut s, &*self.inner.sink, true);
         } else {
             let slack = s.task.tunables().gesture_slack_ms;
             s.wakeup_deadline = Some(Instant::now() + ms(slack));
         }
         drop(s);
+        dispatch(&*self.inner.sink, &self.inner.state, ev);
         self.inner.cv.notify_all();
     }
 
@@ -289,33 +316,37 @@ impl DfpsScheduler {
     fn run_due(&self, now: Instant) -> usize {
         let mut s = self.inner.state.lock();
         let mut fired = 0;
+        let mut events = Vec::new();
         for handle in [Handle::Input, Handle::Gesture, Handle::Wakeup] {
             let slot = deadline_mut(&mut s, handle);
             if !matches!(*slot, Some(d) if d <= now) {
                 continue;
             }
             *slot = None;
-            match handle {
-                Handle::Input => {
-                    if !s.task.pressed() {
-                        s.task.set_active(false);
-                        tick_with_brightness(&mut s, &*self.inner.sink, false);
-                        fired += 1;
-                    }
+            let ev = match handle {
+                Handle::Input if !s.task.pressed() => {
+                    s.task.set_active(false);
+                    Some(tick_locked(&mut s, &*self.inner.sink, false))
                 }
-                Handle::Gesture => {
-                    if s.task.clear_override_if(UNIVERSAL_PKG) {
-                        tick_with_brightness(&mut s, &*self.inner.sink, false);
-                        fired += 1;
-                    }
-                }
-                Handle::Wakeup => {
-                    if s.task.clear_override_if(OFFSCREEN_PKG) {
-                        tick_with_brightness(&mut s, &*self.inner.sink, true);
-                        fired += 1;
-                    }
-                }
+                Handle::Gesture => s
+                    .task
+                    .clear_override_if(UNIVERSAL_PKG)
+                    .then(|| tick_locked(&mut s, &*self.inner.sink, false)),
+                Handle::Wakeup => s
+                    .task
+                    .clear_override_if(OFFSCREEN_PKG)
+                    .then(|| tick_locked(&mut s, &*self.inner.sink, true)),
+                _ => None,
+            };
+            if let Some(Some(ev)) = ev {
+                events.push(ev);
+                fired += 1;
             }
+        }
+        drop(s);
+        // Blocking sink I/O happens outside the state lock.
+        for ev in events {
+            dispatch(&*self.inner.sink, &self.inner.state, Some(ev));
         }
         fired
     }
@@ -328,11 +359,16 @@ impl DfpsScheduler {
     }
 }
 
-/// Run a tick with upstream's brightness gate: only when the task is idle
-/// (not active, not offscreen) does it sample `screen_brightness`, and only
-/// every 10 s. Mirrors the `else` branch of `SwitchRefreshRate(bool)`
-/// (`dynamic_fps.cpp:291-300`) without moving the I/O into the state machine.
-fn tick_with_brightness(s: &mut State, sink: &dyn RefreshSink, force: bool) {
+/// Run a tick with upstream's brightness gate: only when the task is idle (not active, not
+/// offscreen) does it sample `screen_brightness`, and only every 10 s. Mirrors the `else`
+/// branch of `SwitchRefreshRate(bool)` (`dynamic_fps.cpp:291-300`).
+///
+/// Returns the transition instead of dispatching it — see the caller contract below.
+///
+/// The event is *dispatched by the caller after dropping the guard*: the sink writes
+/// `dfps_cur.txt` and spawns `/system/bin/cmd settings put`, i.e. blocking I/O, and doing it
+/// while holding the state mutex stalled every event handler and the timer thread.
+fn tick_locked(s: &mut State, sink: &dyn RefreshSink, force: bool) -> Option<(Option<i32>, i32)> {
     if !s.task.active() && !s.task.is_offscreen() {
         let now = Instant::now();
         if s.task.needs_brightness_sample(now) {
@@ -340,27 +376,32 @@ fn tick_with_brightness(s: &mut State, sink: &dyn RefreshSink, force: bool) {
             s.task.note_brightness_sample(now, b);
         }
     }
-    let ev = s.task.tick(force);
-    dispatch(sink, ev);
+    s.task.tick(force)
 }
 
 /// Upstream `OnInput()`: press -> active now; release -> idle after slack.
-fn apply_press(s: &mut State, sink: &dyn RefreshSink) {
+fn apply_press(s: &mut State, sink: &dyn RefreshSink) -> Option<(Option<i32>, i32)> {
     if s.task.pressed() {
         // A new press cancels the pending release timeout
         // (upstream `DwSetWork(dwInput_, nullptr, SLEEP_TS)`).
         s.input_deadline = None;
         s.task.set_active(true);
-        tick_with_brightness(s, sink, false);
+        tick_locked(s, sink, false)
     } else {
         let slack = s.task.tunables().touch_slack_ms;
         s.input_deadline = Some(Instant::now() + ms(slack));
+        None
     }
 }
 
-fn dispatch(sink: &dyn RefreshSink, ev: Option<(Option<i32>, i32)>) {
+/// Emit a planned switch. The sink runs *outside* the state lock (it does blocking I/O), so a
+/// failed emission re-locks only to roll the dedupe state back: otherwise the device kept the
+/// old rate while `cur_hz` claimed the new one until a forced event.
+fn dispatch(sink: &dyn RefreshSink, state: &parking_lot::Mutex<State>, ev: Option<(Option<i32>, i32)>) {
     if let Some((from, to)) = ev {
-        sink.on_switch(from, to);
+        if !sink.on_switch(from, to) {
+            state.lock().task.note_switch_failed(to);
+        }
     }
 }
 
@@ -372,8 +413,11 @@ fn deadline_mut(s: &mut State, h: Handle) -> &mut Option<Instant> {
     }
 }
 
+/// Milliseconds from a user-editable tunable, clamped on both sides: a huge value makes
+/// `Instant::now() + Duration` overflow and panics the handler thread.
 fn ms(v: i64) -> Duration {
-    Duration::from_millis(v.max(0) as u64)
+    const MAX_SLACK_MS: i64 = 24 * 60 * 60 * 1000;
+    Duration::from_millis(v.clamp(0, MAX_SLACK_MS) as u64)
 }
 
 fn timer_loop(inner: Arc<Inner>) {
@@ -389,6 +433,12 @@ fn timer_loop(inner: Arc<Inner>) {
         // … then compute the wait and sleep on the *same* lock, so an event
         // that arrives between the two cannot be lost.
         let mut s = inner.state.lock();
+        // Re-check inside the guard we are about to wait on: `stop()` can take the lock
+        // between the check at the top of the loop and this wait, and its `notify_all()`
+        // would then be lost — leaving the timer to sleep out the 60 s fallback after a stop.
+        if s.shutting_down {
+            return;
+        }
         let now = Instant::now();
         let next: Option<Instant> = s.earliest();
         let wait = next
@@ -398,6 +448,9 @@ fn timer_loop(inner: Arc<Inner>) {
             .unwrap_or(Duration::from_secs(60));
         if !wait.is_zero() {
             inner.cv.wait_for(&mut s, wait);
+        }
+        if s.shutting_down {
+            return;
         }
     }
 }

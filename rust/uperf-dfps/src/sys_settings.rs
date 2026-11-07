@@ -67,13 +67,17 @@ pub fn write_peak_refresh_rate(hz: i32) -> usize {
 }
 
 fn put(namespace: &str, key: &str, value: &str) -> bool {
+    // `.status()` waits and reaps: `spawn()` returns a Child that `drop` does not reap, so
+    // every call left a zombie until the daemon exited (and the exit status — the only signal
+    // that the write was denied — was discarded).
     Command::new(CMD_BIN)
         .args(["settings", "put", namespace, key, value])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .is_ok()
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Read `settings get system screen_brightness` — upstream
@@ -89,12 +93,32 @@ fn put(namespace: &str, key: &str, value: &str) -> bool {
 /// Upstream notes this costs ~100 ms, hence the 10 s sample interval. It runs
 /// on the dfps timer thread, never on the dispatcher's hot path.
 pub fn get_screen_brightness() -> Option<i32> {
-    let out = Command::new(CMD_BIN)
+    // `output()` has no timeout: if `cmd` (or SettingsProvider) hangs, this blocks the dfps
+    // timer thread and every refresh-rate update stops — far worse than the documented
+    // ~100 ms. Run it on a worker with a bound and treat a timeout as "unknown".
+    let mut child = Command::new(CMD_BIN)
         .args(["settings", "get", "system", "screen_brightness"])
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+    let out = child.wait_with_output().ok()?;
     if !out.status.success() {
         return None;
     }

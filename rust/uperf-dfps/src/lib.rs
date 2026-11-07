@@ -25,14 +25,18 @@
 //! * [`FpsRule`], [`Tunables`], [`RuleTable`] from the `config` submodule.
 //! * [`OFFSCREEN_PKG`], [`UNIVERSAL_PKG`] — special pkg name constants.
 
+// Only `config` is part of the published surface: the host names
+// `config::RuleTable`/`ParseError` directly, and the curated re-exports below are the
+// contract for everything else. The other modules stay crate-private so an internal rename is
+// not a cross-crate breakage.
 pub mod config;
-pub mod logger;
-pub mod notifier;
-pub mod scheduler;
-pub mod sys_settings;
-pub mod task;
+pub(crate) mod logger;
+pub(crate) mod notifier;
+pub(crate) mod scheduler;
+pub(crate) mod sys_settings;
+pub(crate) mod task;
 
-pub use config::{FpsRule, RuleTable, Tunables, OFFSCREEN_PKG, UNIVERSAL_PKG};
+pub use config::{FpsRule, ParseError, RuleTable, Tunables, OFFSCREEN_PKG, UNIVERSAL_PKG};
 pub use logger::set_logger;
 // Crate-internal alias for the four call sites that report to the host's log.
 pub(crate) use logger::log;
@@ -41,6 +45,13 @@ pub use scheduler::{DfpsScheduler, RealSink, RecordingSink, RefreshSink};
 pub use task::DfpsTask;
 
 /// T06: reuse uperf-rs's USER_PATH so dfps state lives next to uperf state.
+///
+/// This hardcodes the *whole* user directory, while `DFPS_CONFIG_FILE` below keeps only a
+/// basename and lets the host resolve the directory. The literal cannot track uperf's
+/// `USER_PATH` (which the module scripts and the host's `UPERF_WEBUI_USER_PATH` seam can
+/// change): if it ever diverges, `write_cur_hz` writes into a directory nobody watches, with
+/// no error path. A host that relocates USER_PATH must also set `UPERF_DFPS_NOTIFY` (the
+/// host's settings resolve this), which is what keeps the two in sync.
 pub const DFPS_NOTIFY_PATH: &str = "/sdcard/Android/yc/uperf/dfps_cur.txt";
 
 /// Basename of the dfps rule table. Lives in the same directory as
@@ -48,9 +59,11 @@ pub const DFPS_NOTIFY_PATH: &str = "/sdcard/Android/yc/uperf/dfps_cur.txt";
 /// config path, so only the name lives here.
 pub const DFPS_CONFIG_FILE: &str = "dfps.txt";
 
-/// Parse `dfps.txt` text into a table. The one entry point uperf-rs uses when
-/// the inotify watcher reports a write, so the boot and reload paths cannot
-/// drift.
+/// Parse `dfps.txt` text into a table.
+///
+/// This is the *reload* entry point. The host's boot path calls
+/// `RuleTable::parse` directly (`uperf-core/src/daemon.rs`), so this wrapper and that call
+/// must stay equivalent — it is a convenience, not a single funnel that prevents drift.
 pub fn parse_config(text: &str) -> Result<config::RuleTable, config::ParseError> {
     config::RuleTable::parse(text)
 }

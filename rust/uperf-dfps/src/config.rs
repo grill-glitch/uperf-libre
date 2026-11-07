@@ -35,6 +35,10 @@ pub const DEFAULT_GESTURE_SLACK_MS: i64 = 4000;
 pub const DEFAULT_ENABLE_MIN_BRIGHTNESS: i32 = 8;
 
 const MIN_TOUCH_SLACK_MS: i64 = 100;
+/// Upper bound for the slack tunables: `Instant::now() + Duration` overflows beyond this and
+/// panics the handler thread.
+const MAX_SLACK_MS: i64 = 24 * 60 * 60 * 1000;
+
 const MAX_ENABLE_MIN_BRIGHTNESS: i32 = 255;
 
 /// One rule row: `idle` Hz and `active` Hz.
@@ -51,8 +55,13 @@ impl FpsRule {
         self.idle == -1 && self.active == -1
     }
 
-    /// True iff this rule's `idle < 20 && active < 20`, the upstream marker
-    /// for "this rule is only valid with `useSfBackdoor=true`".
+    /// True iff this rule's `0 <= idle < 20 && 0 <= active < 20`, the upstream marker for
+    /// "this rule is only valid with `useSfBackdoor=true`".
+    ///
+    /// The `>= 0` guards are this implementation's addition: upstream's `FindInvalidRule`
+    /// only tests `< 20`, so a `-5 -5` rule is accepted there (and is the sentinel here).
+    /// Negative non-sentinel values (`-5 60`) are therefore rejected rather than silently
+    /// resolved as an FPS pair.
     pub const fn is_sf_backdoor_rule(self) -> bool {
         self.idle >= 0 && self.idle < 20 && self.active >= 0 && self.active < 20
     }
@@ -138,6 +147,16 @@ impl RuleTable {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            // A trailing `# comment` is allowed on a data line: upstream `sscanf`s the first
+            // fields and ignores the rest, while this parser used to keep "4000 # hold ms" as
+            // the value (silently falling back to the default) or reject the whole line.
+            let line = match line.find('#') {
+                Some(pos) => trim(&line[..pos]),
+                None => line,
+            };
+            if line.is_empty() {
+                continue;
+            }
             if let Some(rest) = line.strip_prefix('/') {
                 Self::parse_tunable(rest, &mut tunables);
                 continue;
@@ -210,12 +229,16 @@ impl RuleTable {
             }
             "gestureSlackMs" => {
                 if let Ok(n) = value.parse::<i64>() {
-                    t.gesture_slack_ms = n;
+                    // Clamped on both sides like touchSlackMs: a negative or absurd value used
+                    // to reach `Instant::now() + Duration` and panic the handler thread.
+                    t.gesture_slack_ms = n.clamp(MIN_TOUCH_SLACK_MS, MAX_SLACK_MS);
                 }
             }
             "enableMinBrightness" => {
                 if let Ok(n) = value.parse::<i32>() {
-                    t.enable_min_brightness = n.min(MAX_ENABLE_MIN_BRIGHTNESS);
+                    // Lower clamp too: a negative threshold escaped [0,255] and disabled the
+                    // brightness guard entirely.
+                    t.enable_min_brightness = n.clamp(0, MAX_ENABLE_MIN_BRIGHTNESS);
                 }
             }
             _ => {} // upstream SPDLOG_WARNs; we silently drop unknown names.
@@ -250,7 +273,12 @@ impl RuleTable {
 }
 
 fn parse_rule_line(line: &str) -> Option<(&str, FpsRule)> {
-    // <pkg> <idle> <active>
+    // <pkg> <idle> <active> [ # comment ]
+    //
+    // Trailing comments are stripped first: upstream `sscanf` reads the three fields and
+    // ignores the rest, so `com.a 60 120   # game` was rejected as a BadLine here (and the
+    // rule silently not applied).
+    let line = strip_trailing_comment(line);
     let mut it = line.split_whitespace();
     let pkg = it.next()?;
     let idle: i32 = it.next()?.parse().ok()?;
@@ -261,17 +289,20 @@ fn parse_rule_line(line: &str) -> Option<(&str, FpsRule)> {
     Some((pkg, FpsRule { idle, active }))
 }
 
-fn trim(s: &str) -> String {
-    let start = s.find(|c: char| !c.is_whitespace()).unwrap_or(s.len());
-    let end = s
-        .rfind(|c: char| !c.is_whitespace())
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    if start >= end {
-        String::new()
-    } else {
-        s[start..end].to_string()
+/// Drop a trailing `# ...` comment. A `#` inside a token (there are none today: package
+/// names and integers) is kept.
+fn strip_trailing_comment(line: &str) -> &str {
+    match line.find('#') {
+        Some(i) if i == 0 || line.as_bytes()[i - 1].is_ascii_whitespace() => &line[..i],
+        _ => line,
     }
+}
+
+fn trim(s: &str) -> String {
+    // `s.rfind(..)` returns a *byte* index and `i + 1` is only the end of the character
+    // when that character is one byte long: a line whose last non-space char is multi-byte
+    // (any CJK comment) sliced in the middle of it and panicked.
+    s.trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
