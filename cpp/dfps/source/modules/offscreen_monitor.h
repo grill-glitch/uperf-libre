@@ -18,14 +18,24 @@
 
 #include "cobridge_type.h"
 #include "platform/module_base.h"
+#include <atomic>
 
 class OffscreenMonitor : public ModuleBase {
 public:
     OffscreenMonitor();
-    ~OffscreenMonitor();
+    ~OffscreenMonitor() override;
     void Start(void) override;
+    void Stop(void) override;
+
+    // A registered callback captures `this` and the bridge keeps it for the process
+    // lifetime, so copying/moving would leave a second object with different state.
+    OffscreenMonitor(const OffscreenMonitor &) = delete;
+    OffscreenMonitor &operator=(const OffscreenMonitor &) = delete;
 
 private:
     void OnRestrictedList(const void *data);
-    bool prevOffscreen_;
+    // Written by the publisher thread (cgroup.re.list), read-modify-written for edge
+    // detection: atomic so the transition is exactly once.
+    std::atomic<bool> prevOffscreen_{false};
+    bool started_ = false;
 };

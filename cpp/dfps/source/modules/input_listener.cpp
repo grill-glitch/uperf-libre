@@ -30,26 +30,21 @@ constexpr int POLL_RETRY_US = MsToUs(1000);
 constexpr float SWIPE_INC_LIMIT = 0.2;
 constexpr int DEV_DIR_WATCH_FLAG = Inotify::CREATE | Inotify::DELETE;
 
-struct InputListenerDef {
-    bool enable;
-    double swipeThd;
-    double gestureThdX;
-    double gestureThdY;
-    double gestureDelayTime;
-    double holdEnterTime;
-};
-
 void ReadUnused(int fd) {
     char unusedBuf[1024];
     read(fd, unusedBuf, sizeof(unusedBuf));
 }
 
 InputListener::InputListener() : cancelPollFd_(-1), prevBtn_(0), swipeDist_(0.0), startX_(0.5), startY_(0.5) {
-    swipeThd_ = 0.01;
-    gestureThdX_ = 0.03;
-    gestureThdY_ = 0.03;
-    gestureDelayUs_ = 2.0;
-    holdDelayUs_ = 1.0;
+    swipeThd_ = 0.01f;
+    gestureThdX_ = 0.03f;
+    gestureThdY_ = 0.03f;
+    // The config documents `gestureDelayTime`/`holdEnterTime` in *seconds* (2.0 / 1.0),
+    // and these members are microseconds: the double literals were assigned straight into
+    // an int, so the gesture window was 2 us (a gesture could never be observed) and a hold
+    // began 1 us after the press. Convert.
+    gestureDelayUs_ = static_cast<int>(SToUs(2.0));
+    holdDelayUs_ = static_cast<int>(SToUs(1.0));
 
     InitReaders();
 
@@ -58,31 +53,64 @@ InputListener::InputListener() : cancelPollFd_(-1), prevBtn_(0), swipeDist_(0.0)
     btnHandler_ = std::bind(&InputListener::HandleBtnInput, this, _1);
 }
 
-InputListener::~InputListener() {}
+InputListener::~InputListener() { Stop(); }
 
 // ADDED FOR THE UPERF REWRITE — see the declaration in the header and
 // cpp/dfps/DFPS_VENDOR.md. Values come from `modules.input` in the config.
+// Clamped: <= 0 disables the check, > 0.5 makes every position a gesture start.
 void InputListener::SetThresholds(float swipeThd, float gestureThdX, float gestureThdY) {
-    swipeThd_ = swipeThd;
-    gestureThdX_ = gestureThdX;
-    gestureThdY_ = gestureThdY;
+    // Clamped to a usable range: a value <= 0 disables the check, > 0.5 makes every
+    // position a gesture start.
+    swipeThd_ = Cap(swipeThd, 0.0f, 0.5f);
+    gestureThdX_ = Cap(gestureThdX, 0.0f, 0.5f);
+    gestureThdY_ = Cap(gestureThdY, 0.0f, 0.5f);
 }
 
 void InputListener::Start(void) {
+    // A second Start() used to spawn a second poll thread over the same device set.
+    if (running_.exchange(true)) {
+        return;
+    }
     using namespace std::placeholders;
     auto inoti = Inotifier::GetInstance();
     inoti->Add(INPUT_DEV_DIR, DEV_DIR_WATCH_FLAG, std::bind(&InputListener::OnInputDevUpdated, this, _1, _2));
 
+    // Joinable, not detached: a detached thread outlived the object and touched
+    // `readers_`/`pollfds_` after destruction.
     th_ = std::thread(std::bind(&InputListener::TouchEventThread, this));
-    th_.detach();
+}
+
+void InputListener::Stop(void) {
+    if (!running_.exchange(false)) {
+        return;
+    }
+    // Wake the poll thread (the cancel pipe is polled like any other fd) and let it exit.
+    CancelPoll();
+    if (th_.joinable()) {
+        th_.join();
+    }
+    Inotifier::GetInstance()->Remove(INPUT_DEV_DIR);
+    // Only the write end is ours: the read end lives in `pollfds_` and is closed with it.
+    if (cancelPollFd_ >= 0) {
+        close(cancelPollFd_);
+        cancelPollFd_ = -1;
+    }
 }
 
 void InputListener::TouchEventThread(void) {
     SetSelfThreadName(MODULE_NAME);
-    for (;;) {
+    while (running_) {
         FlushPendingReaders();
         int nr = poll(pollfds_.data(), pollfds_.size(), -1);
-        if (nr <= 0) {
+        if (nr < 0) {
+            // EINTR is benign (a signal was delivered); a real error is not a reason to
+            // sleep a full second and delay every input event.
+            if (errno != EINTR) {
+                Sleep(POLL_RETRY_US);
+            }
+            continue;
+        }
+        if (nr == 0) {
             Sleep(POLL_RETRY_US);
             continue;
         }
@@ -120,6 +148,12 @@ void InputListener::InitReaders(void) {
     PreparePoll();
 
     DIR *dirFp = opendir(INPUT_DEV_DIR);
+    if (dirFp == nullptr) {
+        // opendir() failure (restricted namespace, missing /dev/input) used to reach
+        // readdir(nullptr) and crash the daemon at start-up.
+        SPDLOG_WARN("Failed to open {} errno={}", INPUT_DEV_DIR, errno);
+        return;
+    }
     struct dirent *dp;
     while ((dp = readdir(dirFp))) {
         if (strchr(dp->d_name, '.')) {
@@ -144,9 +178,9 @@ void InputListener::AddReader(const std::string &path) {
         const auto &prop = reader->GetProp();
         readers_.emplace(prop.fd, std::move(reader));
         AddPoll(prop.fd);
-        SPDLOG_DEBUG("Add {} '{}'", std::to_string(prop.devType), prop.name);
+        SPDLOG_DEBUG("Add {} '{}'", DevTypeName(prop.devType), prop.name);
     } catch (const std::exception &e) {
-        // SPDLOG_INFO("Unknown input device '{}'", path);
+        SPDLOG_DEBUG("Failed to open input device '{}': {}", path, e.what());
     }
 }
 
@@ -169,7 +203,7 @@ void InputListener::RemoveReader(const std::string &path) {
             default:
                 break;
         }
-        SPDLOG_DEBUG("Remove {} '{}'", std::to_string(prop.devType), prop.name);
+        SPDLOG_DEBUG("Remove {} '{}'", DevTypeName(prop.devType), prop.name);
         RemovePoll(fd);
         readers_.erase(fd);
         return;
@@ -177,18 +211,30 @@ void InputListener::RemoveReader(const std::string &path) {
 }
 
 void InputListener::FlushPendingReaders(void) {
-    std::lock_guard _(mut_);
-    for (const auto &p : removePending_) {
+    // Swap the pending work out under the lock and process it after releasing it: the old
+    // version held `mut_` across blocking open()/ioctl() and across CoPublish() (a callback
+    // into the bridge), and it never cleared the vectors, so every flush replayed every
+    // path ever queued.
+    std::vector<std::string> toRemove;
+    std::vector<std::string> toAdd;
+    {
+        std::lock_guard _(mut_);
+        toRemove.swap(removePending_);
+        toAdd.swap(addPending_);
+    }
+    for (const auto &p : toRemove) {
         RemoveReader(p);
     }
-    for (const auto &p : addPending_) {
+    for (const auto &p : toAdd) {
         AddReader(p);
     }
 }
 
 void InputListener::PreparePoll(void) {
     int fdPair[2];
-    auto ret = pipe2(fdPair, O_CLOEXEC);
+    // O_NONBLOCK on both ends: the write end is used from OnInputDevUpdated while it holds
+    // `mut_`, so a full pipe must return EAGAIN instead of blocking the inotify thread.
+    auto ret = pipe2(fdPair, O_CLOEXEC | O_NONBLOCK);
     if (ret) {
         throw FmtException("Failed to init InputListener event pipe");
     }
@@ -224,7 +270,13 @@ void InputListener::RemovePoll(int fd) {
     }
 }
 
-void InputListener::CancelPoll(void) { write(cancelPollFd_, &cancelPollFd_, sizeof(cancelPollFd_)); }
+void InputListener::CancelPoll(void) {
+    ssize_t n;
+    do {
+        n = write(cancelPollFd_, &cancelPollFd_, sizeof(cancelPollFd_));
+    } while (n < 0 && errno == EINTR);
+    // EAGAIN means a wake-up is already pending: nothing to do.
+}
 
 void InputListener::HandleInput(int fd) {
     auto it = readers_.find(fd);
@@ -249,17 +301,13 @@ void InputListener::HandleInput(int fd) {
 }
 
 float Distance2D(float x1, float y1, float x2, float y2) {
-    return std::sqrt(std::pow(x1 - x2, 2) + std::pow(y1 - y2, 2));
+    return std::hypot(x1 - x2, y1 - y2);
 }
 
 void InputListener::HandleTouchInput(const InputReader::Info &info) {
-    auto distance = [](float x1, float y1, float x2, float y2) {
-        return std::sqrt(std::pow(x1 - x2, 2) + std::pow(y1 - y2, 2));
-    };
-
     if (info.pressed) {
         if (prevTouch_.pressed) {
-            auto dist = distance(info.x, info.y, prevTouch_.x, prevTouch_.y);
+            auto dist = Distance2D(info.x, info.y, prevTouch_.x, prevTouch_.y);
             swipeDist_ += (dist < SWIPE_INC_LIMIT) ? dist : 0.0;
         } else {
             touchTimer_.Reset();
@@ -273,7 +321,7 @@ void InputListener::HandleTouchInput(const InputReader::Info &info) {
     }
     prevTouch_ = info;
 
-    classified_.inSwipe = swipeDist_ > swipeThd_;
+    classified_.inSwipe = swipeDist_ > swipeThd_.load();
     classified_.inHold = info.pressed && touchTimer_.ElapsedUs() > holdDelayUs_;
     classified_.inGesture = gestureTimer_.ElapsedUs() < gestureDelayUs_;
     if (classified_.inGesture == false && classified_.inSwipe && IsGestureStartPos(startX_, startY_)) {
@@ -289,8 +337,14 @@ void InputListener::HandleTouchInput(const InputReader::Info &info) {
 }
 
 void InputListener::HandleBtnInput(const InputReader::Info &info) {
-    auto pressedCnt = prevBtn_ + (info.pressed ? 1 : -1);
-    pressedCnt = Cap(pressedCnt, 0, INT_MAX);
+    // Clamp *before* the arithmetic: `prevBtn_ + 1` overflows (signed overflow, UB) when
+    // prevBtn_ is already INT_MAX.
+    int pressedCnt = prevBtn_;
+    if (info.pressed && pressedCnt < INT_MAX) {
+        ++pressedCnt;
+    } else if (!info.pressed && pressedCnt > 0) {
+        --pressedCnt;
+    }
     if (pressedCnt * prevBtn_ == 0) {
         bool pressed = pressedCnt > 0;
         CoPublish("input.btn", &pressed);
@@ -300,5 +354,5 @@ void InputListener::HandleBtnInput(const InputReader::Info &info) {
 
 bool InputListener::IsGestureStartPos(float x, float y) {
     auto inPadding = [](float x, float thd) { return x < thd || x > (1.0f - thd); };
-    return inPadding(x, gestureThdX_) || inPadding(y, gestureThdY_);
+    return inPadding(x, gestureThdX_.load()) || inPadding(y, gestureThdY_.load());
 }

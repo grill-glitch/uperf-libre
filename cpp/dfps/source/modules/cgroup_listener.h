@@ -19,18 +19,32 @@
 #include "cobridge_type.h"
 #include "platform/module_base.h"
 #include "utils/time_counter.h"
+#include <cstdint>
+#include <string>
 
 class CgroupListener : public ModuleBase {
 public:
     CgroupListener();
-    ~CgroupListener();
+    ~CgroupListener() override;
     void Start(void) override;
+    /// Cancel every updater's queued work and drop the inotify watches.
+    void Stop(void) override;
+
+    // Holds worker handles and registers `this`-bound callbacks: a copy would share the
+    // worker slots and re-register the same object twice.
+    CgroupListener(const CgroupListener &) = delete;
+    CgroupListener &operator=(const CgroupListener &) = delete;
 
 private:
     class Updater {
     public:
         Updater(const std::string &path, const std::string &topic, int64_t delayMs, bool heavy);
         void Start(void);
+        /// Cancel queued work and release the worker handles.
+        void Stop(void);
+
+        Updater(const Updater &) = delete;
+        Updater &operator=(const Updater &) = delete;
 
     private:
         void ReadAndPub(void);

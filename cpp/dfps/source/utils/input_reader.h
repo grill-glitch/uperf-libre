@@ -44,11 +44,15 @@ public:
         std::pair<int, int> yRange;
         std::string name;
         std::string path;
-        DevProp() : fd(0), devType(DevType::TOUCH_PANEL), useEvtKey(false) {}
+        // -1, not 0: descriptor 0 is a valid fd, and `~InputReader` closes this.
+        DevProp() : fd(-1), devType(DevType::TOUCH_PANEL), useEvtKey(false) {}
     };
 
     explicit InputReader(const std::string &path);
     ~InputReader();
+    // Owns `prop_.fd`: a copy would close the same descriptor twice.
+    InputReader(const InputReader &) = delete;
+    InputReader &operator=(const InputReader &) = delete;
 
     const DevProp &GetProp(void) const;
     void Parse(const InfoHandler &handler);
@@ -71,8 +75,6 @@ private:
     std::vector<uint8_t> buf_;
 };
 
-namespace std {
-
-std::string to_string(InputReader::DevType type);
-
-} // namespace std
+/// Display name of a device type. A free function, not a `std::to_string` overload:
+/// adding an overload to namespace std is undefined behaviour ([namespace.std]/1).
+const char *DevTypeName(InputReader::DevType type);

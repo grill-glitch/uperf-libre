@@ -19,18 +19,32 @@
 #include "cobridge_type.h"
 #include "platform/module_base.h"
 #include "utils/time_counter.h"
+#include <atomic>
+#include <string>
 
 class TopappMonitor : public ModuleBase {
 public:
     TopappMonitor();
-    ~TopappMonitor();
+    ~TopappMonitor() override;
     void Start(void) override;
+    /// Cancel the queued dumpsys probe and release the worker handles.
+    void Stop(void) override;
+
+    // The registered callbacks capture `this` and live for the process lifetime.
+    TopappMonitor(const TopappMonitor &) = delete;
+    TopappMonitor &operator=(const TopappMonitor &) = delete;
 
 private:
     void OnTopappList(const void *data);
 
-    int topappNr_;
+    // Written from the publishing thread (cgroup.ta.list) and read on the same path when
+    // the next event arrives: atomic, because those publishes are not guaranteed to be on
+    // one thread.
+    std::atomic<int> topappNr_{0};
+    /// GetNowTs() of the last dumpsys probe (0 = never).
+    std::atomic<int64_t> lastProbeTs_{0};
     std::string prevPkgName_;
     HeavyWorker::Handle hw_;
     DelayedWorker::Handle dw_;
+    bool started_ = false;
 };

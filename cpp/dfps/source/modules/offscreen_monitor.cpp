@@ -22,20 +22,43 @@
 // constexpr char MODULE_NAME[] = "OffscreenMonitor";
 constexpr int RESTRICTED_TASK_NR_MIN = 10;
 
-OffscreenMonitor::OffscreenMonitor() : prevOffscreen_(false) {}
+OffscreenMonitor::OffscreenMonitor() {}
 
-OffscreenMonitor::~OffscreenMonitor() {}
+OffscreenMonitor::~OffscreenMonitor() { Stop(); }
+
+void OffscreenMonitor::Stop(void) {
+    started_ = false;
+    ModuleBase::Stop();
+}
 
 void OffscreenMonitor::Start(void) {
+    // Subscribe appends without de-duplication: a second Start() would run the handler
+    // twice per cgroup update.
+    if (started_) {
+        return;
+    }
+    started_ = true;
     using namespace std::placeholders;
     CoSubscribe("cgroup.re.list", std::bind(&OffscreenMonitor::OnRestrictedList, this, _1));
 }
 
 void OffscreenMonitor::OnRestrictedList(const void *data) {
-    auto pids = CoBridge::Get<PidList>(data);
-    bool isOffscreen = pids.size() > RESTRICTED_TASK_NR_MIN;
-    if (isOffscreen != prevOffscreen_) {
-        prevOffscreen_ = isOffscreen;
+    // The payload is an untyped pointer: a null/malformed publish would otherwise
+    // dereference null inside CoBridge::Get.
+    if (data == nullptr) {
+        SPDLOG_DEBUG("offscreen.state, null pid list");
+        return;
+    }
+    // Reading the restricted cgroup costs 3~8 ms per scan; do not pay it unless someone
+    // consumes the result.
+    if (CoHasSubscriber("offscreen.state") == false) {
+        return;
+    }
+    const auto &pids = CoBridge::Get<PidList>(data);
+    bool isOffscreen = pids.size() > static_cast<size_t>(RESTRICTED_TASK_NR_MIN);
+    // exchange() makes the read-modify-write one step: overlapping timer threads cannot
+    // both publish the same transition.
+    if (prevOffscreen_.exchange(isOffscreen) != isOffscreen) {
         SPDLOG_DEBUG("offscreen.state {}", isOffscreen);
         CoPublish("offscreen.state", &isOffscreen);
     }

@@ -20,17 +20,22 @@
 #include "platform/module_base.h"
 #include "utils/input_reader.h"
 #include "utils/time_counter.h"
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <sys/poll.h>
+#include <poll.h>
+#include <string>
 #include <thread>
+#include <vector>
 
 class InputListener : public ModuleBase {
 public:
     InputListener();
-    ~InputListener();
+    ~InputListener() override;
     void Start(void) override;
+    /// Stop the poll thread, release the device readers and unregister the inotify watch.
+    void Stop(void) override;
 
     // ADDED FOR THE UPERF REWRITE — the only change to this vendored file.
     //
@@ -66,9 +71,11 @@ private:
     void HandleBtnInput(const InputReader::Info &info);
     bool IsGestureStartPos(float x, float y);
 
-    float swipeThd_;
-    float gestureThdX_;
-    float gestureThdY_;
+    // Thresholds are pushed in through the FFI (uperf_bridge_set_input_thresholds) while the
+    // poll thread reads them: atomic, so the cross-thread write is not a data race.
+    std::atomic<float> swipeThd_;
+    std::atomic<float> gestureThdX_;
+    std::atomic<float> gestureThdY_;
     int gestureDelayUs_;
     int holdDelayUs_;
 
@@ -78,6 +85,7 @@ private:
     std::vector<pollfd> pollfds_;
     int cancelPollFd_;
     std::thread th_;
+    std::atomic<bool> running_{false};
     std::mutex mut_;
 
     InputReader::InfoHandler touchHandler_;

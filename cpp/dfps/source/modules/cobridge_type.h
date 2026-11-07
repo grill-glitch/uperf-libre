@@ -17,6 +17,7 @@
 #pragma once
 
 #include <set>
+#include <type_traits>
 #include <vector>
 
 using PidList = std::vector<int>;
@@ -28,7 +29,15 @@ struct InputData {
     bool inGesture;
 
     InputData() : inHold(false), inSwipe(false), inGesture(false) {}
-    bool operator!=(const InputData &rhs) {
-        return inHold != rhs.inHold || inSwipe != rhs.inSwipe || inGesture != rhs.inGesture;
+    // const: subscribers receive `const InputData &` from CoBridge::Get<T>().
+    bool operator==(const InputData &rhs) const {
+        return inHold == rhs.inHold && inSwipe == rhs.inSwipe && inGesture == rhs.inGesture;
     }
+    bool operator!=(const InputData &rhs) const { return !(*this == rhs); }
 };
+
+// `InputData` itself stays internal: bridge.cpp converts it to `int32_t[3]` before handing
+// it to Rust (`decode_input_state` reads 12 bytes of i32). Keep it a plain aggregate so the
+// field set cannot gain a vtable/alignment surprise unnoticed.
+static_assert(sizeof(InputData) == 3 * sizeof(bool), "InputData is a plain 3-flag aggregate");
+static_assert(std::is_trivially_copyable<InputData>::value, "InputData must stay trivially copyable");

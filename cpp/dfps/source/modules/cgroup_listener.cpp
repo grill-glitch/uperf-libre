@@ -36,6 +36,8 @@ constexpr size_t CGROUP_TASKS_MAX_LEN = 32 * 1024;
 constexpr int64_t SCAN_DELAY_LONG_MS = 80;  // read tasklist cost 3~8ms
 constexpr int64_t SCAN_DELAY_SHORT_MS = 20; // wait process create threads
 
+// `delayMs` is milliseconds; the member is microseconds (GetNowTs()'s base). Passing an
+// already-converted value here would be a 1000x timing error.
 CgroupListener::Updater::Updater(const std::string &path, const std::string &topic, int64_t delayMs, bool heavy)
     : hw_(HeavyWorker::GetInstance()->Create(MODULE_NAME)),
       dw_(DelayedWorker::GetInstance()->Create(MODULE_NAME)),
@@ -47,6 +49,13 @@ CgroupListener::Updater::Updater(const std::string &path, const std::string &top
 void CgroupListener::Updater::Start(void) {
     if (CoBridge::GetInstance()->HasSubscriber(topic_) == false) {
         return;
+    }
+    // Re-create the handles if a previous Stop() released them.
+    if (hw_ < 0) {
+        hw_ = HeavyWorker::GetInstance()->Create(MODULE_NAME);
+    }
+    if (dw_ < 0) {
+        dw_ = DelayedWorker::GetInstance()->Create(MODULE_NAME);
     }
 
     // Do not start delayed work too frequently
@@ -65,6 +74,19 @@ void CgroupListener::Updater::Start(void) {
     DelayedWorker::GetInstance()->SetWork(dw_, delayed, GetNowTs() + delayUs_);
 }
 
+void CgroupListener::Updater::Stop(void) {
+    // Destroy (not just clear) the work: a queued lambda captures `this`, and the handle
+    // was otherwise held for the process lifetime.
+    if (hw_ >= 0) {
+        HeavyWorker::GetInstance()->Destroy(hw_);
+        hw_ = -1;
+    }
+    if (dw_ >= 0) {
+        DelayedWorker::GetInstance()->Destroy(dw_);
+        dw_ = -1;
+    }
+}
+
 void CgroupListener::Updater::ReadAndPub(void) {
     AtraceScopeHelper __ash(topic_);
 
@@ -73,6 +95,11 @@ void CgroupListener::Updater::ReadAndPub(void) {
     auto len = ReadFile(path_, &buf, CGROUP_TASKS_MAX_LEN);
     if (len < 0) {
         return;
+    }
+    // ReadFile max_len - 1 bytes are readable: hitting the cap means the list was cut, and
+    // the last entry may be a partial PID. Say so instead of publishing it as complete.
+    if (static_cast<size_t>(len) >= CGROUP_TASKS_MAX_LEN - 1) {
+        SPDLOG_WARN("{} truncated at {} bytes, pid list may be incomplete", path_, CGROUP_TASKS_MAX_LEN);
     }
     scn::scan_list(buf, pl_, '\n');
 
@@ -85,7 +112,7 @@ CgroupListener::CgroupListener()
       bg_(BG_PATH, "cgroup.bg.list", SCAN_DELAY_LONG_MS, true),
       re_(RE_PATH, "cgroup.re.list", SCAN_DELAY_LONG_MS, false) {}
 
-CgroupListener::~CgroupListener() {}
+CgroupListener::~CgroupListener() { Stop(); }
 
 void CgroupListener::Start(void) {
     // some device don't have background cpuset
@@ -109,11 +136,29 @@ void CgroupListener::Start(void) {
     addWatch(RE_PATH2, std::bind(&CgroupListener::OnReModified, this, _1, _2));
 }
 
+void CgroupListener::Stop(void) {
+    ta_.Stop();
+    fg_.Stop();
+    bg_.Stop();
+    re_.Stop();
+    // Remove the watches so an event after teardown cannot call back into a destroyed
+    // CgroupListener (the callbacks are `this`-bound).
+    auto inoti = Inotifier::GetInstance();
+    for (const auto *path : {TOP_PATH, TOP_PATH2, FG_PATH, FG_PATH2, BG_PATH, BG_PATH2, RE_PATH, RE_PATH2}) {
+        inoti->Remove(path);
+    }
+    ModuleBase::Stop();
+}
+
 void CgroupListener::OnTaModified(const std::string &, int) {
     CoPublish("cgroup.ta.update", nullptr);
     ta_.Start();
     fg_.Start();
     bg_.Start();
+    // A task entering top-app necessarily leaves whichever cpuset it was in — possibly
+    // `restricted` — and cgroup files only notify on the destination side. Without this,
+    // `cgroup.re.list` stays stale until some unrelated restricted event happens.
+    re_.Start();
 }
 
 void CgroupListener::OnFgModified(const std::string &, int) {
@@ -129,6 +174,8 @@ void CgroupListener::OnBgModified(const std::string &, int) {
     ta_.Start();
     fg_.Start();
     bg_.Start();
+    // Same reasoning as OnTaModified: the task may have left `restricted`.
+    re_.Start();
 }
 
 void CgroupListener::OnReModified(const std::string &, int) {
