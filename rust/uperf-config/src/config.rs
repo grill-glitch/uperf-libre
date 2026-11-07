@@ -20,9 +20,6 @@
 //! Anything that doesn't match a known knob is **kept** so the `warn` subcommand
 //! can flag it.
 
-#![allow(dead_code)]
-
-use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -51,7 +48,9 @@ pub struct Config {
     pub initials: Map<String, Value>, // dot-keyed (`cpu.margin` → value)
     pub presets: BTreeMap<String, Preset>,
     /// Raw  object (kept for hintDuration + future knob lookups).
-    pub modules_raw: Option<Map<String, Value>>,
+    /// The `modules` object, shared: the typed fields below clone each module body, so a
+    /// plain `Map` here kept a *second* full copy of the config alive for the process.
+    pub modules_raw: Option<std::sync::Arc<Map<String, Value>>>,
 }
 
 /// `meta`: { name, author }
@@ -126,7 +125,10 @@ impl Config {
         }
 
         // Keep the raw modules map for hintDuration and other module-level knobs.
-        c.modules_raw = obj.get("modules").and_then(|m| m.as_object()).cloned();
+        c.modules_raw = obj
+            .get("modules")
+            .and_then(|m| m.as_object())
+            .map(|m| std::sync::Arc::new(m.clone()));
 
         // initials: per-module block (e.g. `{ cpu: { margin: 0.2, ... }, sysfs: {...} }`)
         // OR a flat dotted map (`{ "cpu.margin": 0.2, ... }`). Both shapes appear
@@ -137,24 +139,17 @@ impl Config {
             for (top, body) in init {
                 let key_prefix = top.clone();
                 if let Some(inner) = body.as_object() {
-                    // Heuristic: if every inner key already starts with
-                    // `top.` or doesn't contain `.`, treat this as an already-flat
-                    // map at this top-level only. Otherwise treat as nested per-mod.
-                    let looks_flat = inner.keys().all(|k| !k.contains('.'));
-                    if looks_flat {
-                        // Flat: keys are top-subkey (treat as dotted in their own right).
-                        for (k, v) in inner {
-                            let dotted = if k.contains('.') {
-                                k.clone()
-                            } else {
-                                format!("{key_prefix}.{k}")
-                            };
-                            c.initials.insert(dotted, v.clone());
-                        }
-                    } else {
-                        for (k, v) in inner {
-                            c.initials.insert(format!("{key_prefix}.{k}"), v.clone());
-                        }
+                    // Decide per key, not per block: a nested block may mix already-dotted
+                    // keys with bare ones. The old `looks_flat` heuristic sent a block like
+                    // `{ cpu: { "cpu.margin": 0.2 } }` down the nested path and produced
+                    // `cpu.cpu.margin`, which resolve() and all_sysfs_keys() never look up.
+                    for (k, v) in inner {
+                        let dotted = if k.contains('.') {
+                            k.clone()
+                        } else {
+                            format!("{key_prefix}.{k}")
+                        };
+                        c.initials.insert(dotted, v.clone());
                     }
                 } else {
                     // Scalar at top-level (rare) — treat as `top.<value>`.
@@ -167,7 +162,12 @@ impl Config {
         if let Some(presets) = obj.get("presets").and_then(|m| m.as_object()) {
             for (name, body) in presets {
                 let mut p = Preset::default();
-                if let Some(scenes) = body.as_object() {
+                // A non-object preset body used to be coerced to an empty preset, which
+                // parsed fine and silently dropped every override for that mode.
+                let scenes = body.as_object().ok_or_else(|| {
+                    CfgError::Invalid(format!("presets.{name} not object"))
+                })?;
+                {
                     for (scene, body2) in scenes {
                         let m = body2
                             .as_object()
@@ -194,18 +194,21 @@ impl Config {
     /// 2. `presets[<mode>][*][<dotted>]`   (wildcard)
     /// 3. `initials[<dotted>]`
     pub fn resolve<'a>(&'a self, mode: &str, scene: &str, dotted: &str) -> Option<&'a Value> {
-        let p = self.presets.get(mode)?;
-        if let Some(s) = p.scenes.get(scene) {
-            if let Some(v) = s.get(dotted) {
-                if !v.is_null() {
-                    return Some(v);
+        // An unknown mode must still fall through to `initials`: `?` here returned None for
+        // the whole cascade, so a typo'd preset silently resolved every knob to nothing.
+        if let Some(p) = self.presets.get(mode) {
+            if let Some(s) = p.scenes.get(scene) {
+                if let Some(v) = s.get(dotted) {
+                    if !v.is_null() {
+                        return Some(v);
+                    }
                 }
             }
-        }
-        if let Some(s) = p.scenes.get("*") {
-            if let Some(v) = s.get(dotted) {
-                if !v.is_null() {
-                    return Some(v);
+            if let Some(s) = p.scenes.get("*") {
+                if let Some(v) = s.get(dotted) {
+                    if !v.is_null() {
+                        return Some(v);
+                    }
                 }
             }
         }
@@ -233,8 +236,15 @@ impl Config {
     /// for them are already correct.
     pub fn input_thresholds(&self) -> Option<(f32, f32, f32)> {
         let m = self.modules.input.as_ref()?;
-        let f = |k: &str| m.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
-        Some((f("swipeThd")?, f("gestureThdX")?, f("gestureThdY")?))
+        // Narrowing f64 -> f32 with a bare cast turned a huge config value into inf and let
+        // NaN through; both then propagate into the listener's gesture/swipe comparisons.
+        let g = |k: &str| {
+            m.get(k)
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .filter(|v| v.is_finite() && *v >= 0.0)
+        };
+        Some((g("swipeThd")?, g("gestureThdX")?, g("gestureThdY")?))
     }
 
     /// `modules.atrace.enable`.
@@ -326,7 +336,7 @@ impl Config {
     /// table → empty map (all sysfs knobs then resolve to nothing).
     pub fn sysfs_knob_table(&self) -> std::collections::BTreeMap<String, String> {
         let mut out = std::collections::BTreeMap::new();
-        let Some(m) = self.modules_raw.as_ref() else {
+        let Some(m) = self.modules_raw.as_deref() else {
             return out;
         };
         let Some(knob) = m
@@ -338,16 +348,24 @@ impl Config {
             return out;
         };
         for (name, path) in knob {
-            if let Some(p) = path.as_str() {
-                out.insert(name.clone(), p.to_string());
+            let Some(p) = path.as_str() else { continue };
+            // These paths are written as root by the daemon. The documented contract is
+            // "absolute path"; in practice the shipped configs only use /sys, /proc and
+            // /dev, so anything else (a relative path, `..`, /data/local/tmp) is a config
+            // error and must not be silently accepted.
+            if !is_allowed_knob_path(p) {
+                warn_once(name, p);
+                continue;
             }
+            out.insert(name.clone(), p.to_string());
         }
         out
     }
 
+
     /// Borrow the `modules` block as a raw map (used for hintDuration lookup).
     pub fn modules_map(&self) -> Option<&Map<String, Value>> {
-        self.modules_raw.as_ref()
+        self.modules_raw.as_deref()
     }
 }
 
@@ -394,8 +412,28 @@ impl Modules {
     }
 }
 
-// Kept here so the `Deserialize` import stays used (silences the rustc warning
-// against an unused trait import that some Cargo setups trip on).
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
-struct PhantomSerdeImportUser(u8);
+/// Absolute path under one of the kernel trees the module is allowed to write.
+fn is_allowed_knob_path(path: &str) -> bool {
+    let absolute = path.starts_with('/');
+    let no_parent = !path.split('/').any(|c| c == "..");
+    let allowed_root = ["/sys/", "/proc/", "/dev/"].iter().any(|p| path.starts_with(p));
+    absolute && no_parent && allowed_root
+}
+
+/// Warn once per (knob, path): the table is rebuilt per plan, so an unconditional
+/// eprintln would flood the log.
+fn warn_once(name: &str, path: &str) {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let key = format!("{name}={path}");
+    let mut guard = match seen.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if guard.insert(key) {
+        eprintln!("uperf: ignoring sysfs knob '{name}' with unsupported path '{path}'");
+    }
+}

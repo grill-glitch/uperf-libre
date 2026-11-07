@@ -98,6 +98,9 @@ pub struct SchedConfig {
     pub affinity: BTreeMap<String, BTreeMap<String, String>>,
     pub prio: BTreeMap<String, BTreeMap<String, i64>>,
     pub rules: Vec<SchedRule>,
+    /// Defects found while parsing the sections above (wrong-typed affinity/prio values),
+    /// carried into the planner's anomaly list so the log names them.
+    pub anomalies: Vec<Anomaly>,
 }
 
 impl SchedConfig {
@@ -116,15 +119,21 @@ impl SchedConfig {
                 c.cpumask.insert(k.clone(), cpus);
             }
         }
+        let mut bad_affinity: Vec<(String, String)> = Vec::new();
+        let mut bad_prio: Vec<(String, String)> = Vec::new();
         if let Some(a) = o.get("affinity").and_then(|x| x.as_object()) {
             for (cls, scenes) in a {
                 let mut inner = BTreeMap::new();
                 if let Some(sm) = scenes.as_object() {
                     for (scene, mask) in sm {
-                        inner.insert(
-                            scene.clone(),
-                            mask.as_str().unwrap_or_default().to_string(),
-                        );
+                        // A non-string mask used to become "" (silently "leave affinity
+                        // alone"), indistinguishable from a deliberate empty value.
+                        match mask.as_str() {
+                            Some(m) => {
+                                inner.insert(scene.clone(), m.to_string());
+                            }
+                            None => bad_affinity.push((cls.clone(), scene.clone())),
+                        }
                     }
                 }
                 c.affinity.insert(cls.clone(), inner);
@@ -135,12 +144,27 @@ impl SchedConfig {
                 let mut inner = BTreeMap::new();
                 if let Some(sm) = scenes.as_object() {
                     for (scene, code) in sm {
-                        inner.insert(scene.clone(), code.as_i64().unwrap_or(0));
+                        // A non-integer code became 0 (= `Skip`), i.e. "no change", with no
+                        // diagnostic — unlike every other tolerated defect.
+                        match code.as_i64() {
+                            Some(n) => {
+                                inner.insert(scene.clone(), n);
+                            }
+                            None => bad_prio.push((cls.clone(), scene.clone())),
+                        }
                     }
                 }
                 c.prio.insert(cls.clone(), inner);
             }
         }
+        for (class, scene) in bad_affinity {
+            c.anomalies
+                .push(Anomaly::WrongTypeAffinity { class, scene });
+        }
+        for (class, scene) in bad_prio {
+            c.anomalies.push(Anomaly::WrongTypePrio { class, scene });
+        }
+
         if let Some(rs) = o.get("rules").and_then(|x| x.as_array()) {
             for r in rs {
                 let Some(ro) = r.as_object() else { continue };
@@ -252,6 +276,10 @@ pub enum Anomaly {
     UnknownCpumaskName { class: String, scene: String, name: String },
     /// A `prio` code outside the documented table -> treated as `skip`.
     BadPrioCode { class: String, scene: String, code: i64 },
+    /// `affinity[class][scene]` is not a string -> no affinity change (was silent).
+    WrongTypeAffinity { class: String, scene: String },
+    /// `prio[class][scene]` is not an integer -> treated as `skip` (was silent).
+    WrongTypePrio { class: String, scene: String },
 }
 
 impl std::fmt::Display for Anomaly {
@@ -273,6 +301,14 @@ impl std::fmt::Display for Anomaly {
                 f,
                 "prio[{class}][{scene}] = {code} is outside the documented table"
             ),
+            Self::WrongTypeAffinity { class, scene } => write!(
+                f,
+                "affinity[{class}][{scene}] is not a string (no affinity change)"
+            ),
+            Self::WrongTypePrio { class, scene } => write!(
+                f,
+                "prio[{class}][{scene}] is not an integer (no priority change)"
+            ),
         }
     }
 }
@@ -290,6 +326,9 @@ pub struct SchedPlanner {
     /// Substituted-pattern -> compiled regex, so a per-process recompile of a
     /// `/MAIN_THREAD/` pattern happens once per distinct main-thread name.
     thread_cache: HashMap<String, Regex>,
+    /// Patterns that failed to compile, so the failure is reported once instead of being
+    /// re-attempted (and silently no-op'd) on every decide() call.
+    failed_threads: std::collections::HashSet<String>,
     /// Tolerated config defects, collected at construction.
     anomalies: Vec<Anomaly>,
 }
@@ -336,12 +375,18 @@ impl SchedPlanner {
                 rules: items,
             });
         }
+        // Anomalies recorded while parsing the sections (wrong-typed values) are part of the
+        // config's diagnostics and must survive into the planner.
+        let parse_anomalies = cfg.anomalies.clone();
         let mut me = Self {
-            cfg: cfg.clone(),
+            // `cfg` is owned by this constructor and the loop above has ended: the clone
+            // doubled the whole rule/mask/prio table for nothing.
+            cfg,
             rules,
             home_package: home_package.to_string(),
             thread_cache: HashMap::new(),
-            anomalies: Vec::new(),
+            failed_threads: std::collections::HashSet::new(),
+            anomalies: parse_anomalies,
         };
         me.collect_anomalies();
         Ok(me)
@@ -491,32 +536,61 @@ impl SchedPlanner {
         }
         .to_string();
 
-        // Gather the (k, ac, pc) triples first so the borrow on self.rules ends
-        // before we touch the thread cache.
-        let triples: Vec<(String, String, String)> = self.rules[rule_idx]
-            .rules
-            .iter()
-            .map(|it| (it.k.clone(), it.ac.clone(), it.pc.clone()))
-            .collect();
-
-        for (k, ac, pc) in triples {
+        // Iterate by index instead of cloning every (k, ac, pc) triple up front: this runs
+        // per thread per scan, and only the *matching* item's fields are needed.
+        let item_count = self.rules[rule_idx].rules.len();
+        for i in 0..item_count {
+            // Only a pattern that carries a placeholder needs an owned, substituted copy:
+            // this runs per thread per scan and most patterns are literals, so the old
+            // unconditional `k.clone()` allocated for every one of them.
+            let mut compile_error: Option<(String, String)> = None;
             let matched = {
-                let text = substitute_main_thread(&k, main_thread);
-                match self.thread_cache.get(&text) {
+                let raw = self.rules[rule_idx].rules[i].k.as_str();
+                let owned;
+                let text: &str = if raw.contains('/') {
+                    // Apply the same substitutions as construction: `new` validates with
+                    // `/HOME_PACKAGE/` substituted, so deciding without it never matched.
+                    owned =
+                        substitute_main_thread(&substitute_home(raw, &self.home_package), main_thread);
+                    &owned
+                } else {
+                    raw
+                };
+                match self.thread_cache.get(text) {
                     Some(re) => re.is_match(thread_name),
-                    None => match Regex::new(&text) {
-                        Ok(re) => {
-                            let m = re.is_match(thread_name);
-                            self.thread_cache.insert(text, re);
-                            m
+                    None => {
+                        // A pattern that fails to compile (other than the deliberately
+                        // skipped `/MAIN_THREAD/` case) used to be retried, and to no-op
+                        // silently, on every call: report it once and cache the failure.
+                        if self.failed_threads.contains(text) {
+                            false
+                        } else {
+                            match Regex::new(text) {
+                                Ok(re) => {
+                                    let m = re.is_match(thread_name);
+                                    self.thread_cache.insert(text.to_string(), re);
+                                    m
+                                }
+                                Err(e) => {
+                                    compile_error = Some((text.to_string(), e.to_string()));
+                                    false
+                                }
+                            }
                         }
-                        Err(_) => false,
-                    },
+                    }
                 }
             };
+            if let Some((text, e)) = compile_error {
+                eprintln!("uperf: thread pattern {text:?} does not compile: {e}");
+                self.failed_threads.insert(text);
+            }
             if !matched {
                 continue;
             }
+            let (ac, pc) = {
+                let it = &self.rules[rule_idx].rules[i];
+                (it.ac.clone(), it.pc.clone())
+            };
             // Affinity: the mask name must resolve to a cpumask; an empty name
             // means "leave it alone".
             let mask_name = self

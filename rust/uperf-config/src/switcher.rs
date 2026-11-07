@@ -151,8 +151,10 @@ pub struct PerappRules {
     pub default: Option<String>,
     /// The `-` rule, applied while the screen is off.
     pub offscreen: Option<String>,
-    /// `<package> <preset>` rules, in file order.
-    pub apps: BTreeMap<String, String>,
+    /// `<package> <preset>` rules, in file order. Private: a public map let a caller insert
+    /// a rule with an undefined preset (contradicting the "never apply an undefined preset"
+    /// contract) and skip `order`, so `packages()` silently omitted it.
+    apps: BTreeMap<String, String>,
     /// Line order of `apps`, for deterministic logging.
     order: Vec<String>,
     pub anomalies: Vec<PerappAnomaly>,
@@ -171,25 +173,17 @@ impl PerappRules {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            // Split on the last whitespace run: packages never contain spaces,
-            // and being lenient about extra columns keeps a hand-edited file
-            // readable.
-            let Some((key, preset)) = line.rsplit_once(char::is_whitespace) else {
+            // Exactly two whitespace-separated fields. Splitting on the last whitespace run
+            // turned `com.a balance performance` into key `com.a balance` with preset
+            // `performance`, storing a bogus package and losing the real rule.
+            let mut parts = line.split_whitespace();
+            let (Some(key), Some(preset), None) = (parts.next(), parts.next(), parts.next()) else {
                 me.anomalies.push(PerappAnomaly::MalformedLine {
                     line: i + 1,
                     text: line.to_string(),
                 });
                 continue;
             };
-            let key = key.trim();
-            let preset = preset.trim();
-            if key.is_empty() || preset.is_empty() {
-                me.anomalies.push(PerappAnomaly::MalformedLine {
-                    line: i + 1,
-                    text: line.to_string(),
-                });
-                continue;
-            }
             if !known(preset) {
                 me.anomalies.push(PerappAnomaly::UnknownPreset {
                     package: key.to_string(),
@@ -242,6 +236,16 @@ impl PerappRules {
     /// Packages in file order.
     pub fn packages(&self) -> impl Iterator<Item = &String> {
         self.order.iter()
+    }
+
+    /// The preset for `package`, if a rule exists.
+    pub fn preset_of(&self, package: &str) -> Option<&str> {
+        self.apps.get(package).map(String::as_str)
+    }
+
+    /// Read-only view of the rules (insertion order matches `packages()`).
+    pub fn apps(&self) -> &BTreeMap<String, String> {
+        &self.apps
     }
 }
 

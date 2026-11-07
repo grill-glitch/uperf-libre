@@ -53,8 +53,15 @@ impl WriterKind {
         if path.contains("/cpufreq/") && path.ends_with("_freq") {
             return Self::Cpufreq;
         }
-        if path.ends_with("/online") {
-            return Self::PerCpu;
+        // `/cpu<N>/online` is per-CPU; the *global* `/sys/devices/system/cpu/online` takes a
+        // CPU list ("0-7") and must stay a plain string write.
+        if path.starts_with("/sys/devices/system/cpu/cpu") && path.ends_with("/online") {
+            let mid = &path["/sys/devices/system/cpu/cpu".len()..];
+            if mid.split('/').next().map(|n| n.chars().all(|c| c.is_ascii_digit())) == Some(true)
+                && !mid.split('/').next().unwrap_or("").is_empty()
+            {
+                return Self::PerCpu;
+            }
         }
         // devfreq `*/min_freq|max_freq`, `/sys/module/msm_performance/...`,
         // `/proc/ppm/...` all take the value verbatim.
@@ -72,9 +79,13 @@ pub struct SysfsWrite {
 
 impl SysfsWrite {
     /// Rewrite the path under a fake root, so offline validation never touches
-    /// the real filesystem.
-    pub fn under_root(&self, root: &str) -> String {
-        format!("{}{}", root.trim_end_matches('/'), self.path)
+    /// the real filesystem. `None` when the configured path could escape the root (relative,
+    /// or containing `..`), which would otherwise write outside it.
+    pub fn under_root(&self, root: &str) -> Option<String> {
+        if !self.path.starts_with('/') || self.path.split('/').any(|c| c == "..") {
+            return None;
+        }
+        Some(format!("{}{}", root.trim_end_matches('/'), self.path))
     }
 }
 
@@ -107,12 +118,11 @@ pub fn serialize_value(v: &Value) -> String {
             .map(serialize_value)
             .collect::<Vec<_>>()
             .join(","),
-        Value::Object(o) => format!(
-            "{}={}",
-            o.keys().next().map(|k| k.as_str()).unwrap_or(""),
-            o.values().next().map(serialize_value).unwrap_or_default()
-        ),
-        Value::Null => "".into(),
+        // Objects and nulls have no sysfs representation. The old code emitted
+        // `"<first-key>=<first-value>"` / `""`, i.e. a truncated or empty write pushed
+        // straight into a kernel node; the callers treat an empty value as "nothing to
+        // write" instead (the planner skips it).
+        Value::Object(_) | Value::Null => String::new(),
     }
 }
 
@@ -131,8 +141,23 @@ where
     // Two knobs can resolve to the same node (two cluster aliases -> one
     // devfreq). Upstream diffs against the previous action and skips identical
     // values (AGENT.md 8.3), so collapse (path, value) pairs.
-    out.sort_by(|a, b| a.path.cmp(&b.path));
+    // Sort on the full (path, value) tuple so equal pairs are adjacent — dedup_by only
+    // removes *adjacent* duplicates. Sorting by path alone kept a later `(A,1)` alive when
+    // the order was `(A,1), (A,2), (A,1)`.
+    out.sort_by(|a, b| (a.path.as_str(), a.value.as_str()).cmp(&(b.path.as_str(), b.value.as_str())));
     out.dedup_by(|a, b| a.path == b.path && a.value == b.value);
+    // Same path with different values is a config conflict; the last writer would otherwise
+    // win by luck of the ordering. Keep the first and report.
+    let mut conflicts: Vec<String> = Vec::new();
+    for w in out.windows(2) {
+        if w[0].path == w[1].path && w[0].value != w[1].value && !conflicts.contains(&w[0].path) {
+            conflicts.push(w[0].path.clone());
+        }
+    }
+    for path in conflicts {
+        eprintln!("uperf: conflicting values for '{path}' in one plan; the first write wins");
+    }
+    out.dedup_by(|a, b| a.path == b.path);
     out
 }
 
@@ -212,7 +237,16 @@ mod tests {
     fn under_root_rewrites() {
         let t = table();
         let w = dispatch("cpusetTa", &json!("0-7"), &t).unwrap();
-        assert_eq!(w.under_root("/tmp/fake"), "/tmp/fake/dev/cpuset/top-app/cpus");
+        assert_eq!(
+            w.under_root("/tmp/fake").as_deref(),
+            Some("/tmp/fake/dev/cpuset/top-app/cpus")
+        );
+        // A relative path or one containing `..` must not escape the fake root.
+        let bad = SysfsWrite {
+            path: "../../etc/passwd".into(),
+            ..w.clone()
+        };
+        assert_eq!(bad.under_root("/tmp/fake"), None);
     }
 
     #[test]

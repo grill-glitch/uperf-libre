@@ -60,10 +60,18 @@ impl ThermalPolicy {
     /// (0.05, 1.0] would either switch the CPU off or not bound anything.
     pub fn from_values(thresh_c: Option<f64>, span_c: Option<f64>, floor: Option<f64>) -> Self {
         let d = Self::default();
+        // Every value is filtered for finiteness: `clamp` panics on NaN, and a NaN or inf
+        // threshold silently disables throttling for the whole run.
+        let finite = |v: Option<f64>, fallback: f64| -> f64 {
+            match v {
+                Some(x) if x.is_finite() => x,
+                _ => fallback,
+            }
+        };
         Self {
-            thresh_c: thresh_c.unwrap_or(d.thresh_c),
-            span_c: span_c.unwrap_or(d.span_c).max(0.1),
-            floor: floor.unwrap_or(d.floor).clamp(0.05, 1.0),
+            thresh_c: finite(thresh_c, d.thresh_c),
+            span_c: finite(span_c, d.span_c).max(0.1),
+            floor: finite(floor, d.floor).clamp(0.05, 1.0),
         }
     }
 }
@@ -75,19 +83,33 @@ fn env_f64(key: &str) -> Option<f64> {
 /// PL1 multiplier for a temperature: exactly `1.0` at or below the threshold, ramping
 /// linearly to `floor` at `thresh + span`, clamped to `[floor, 1.0]`.
 pub fn pl1_scale(temp_c: f64, p: ThermalPolicy) -> f64 {
+    // The fields are public: a NaN temperature or a NaN/out-of-range floor must not panic
+    // here (clamp panics on NaN) nor poison the PL1 budget.
+    if !temp_c.is_finite() || !p.thresh_c.is_finite() || !p.span_c.is_finite() || !p.floor.is_finite() {
+        return 1.0;
+    }
+    let floor = p.floor.clamp(0.05, 1.0);
     if temp_c <= p.thresh_c {
         return 1.0;
     }
-    let over = (temp_c - p.thresh_c) / p.span_c;
-    (1.0 - over * (1.0 - p.floor)).clamp(p.floor, 1.0)
+    let span = if p.span_c > 0.0 { p.span_c } else { 1.0 };
+    let over = (temp_c - p.thresh_c) / span;
+    (1.0 - over * (1.0 - floor)).clamp(floor, 1.0)
 }
 
 /// The `cpu-*` thermal zones' `temp` files under `root` (default
 /// `/sys/class/thermal`), sorted so the choice is deterministic.
 pub fn discover_cpu_zones(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(root) else {
-        return out;
+    let rd = match std::fs::read_dir(root) {
+        Ok(rd) => rd,
+        Err(e) => {
+            // An empty result and "the directory could not be opened" (SELinux, /sys not
+            // mounted) used to be indistinguishable, and the caller then logged "no readable
+            // cpu zone" while throttling was silently off.
+            eprintln!("uperf: cannot read thermal zones under {}: {e}", root.display());
+            return out;
+        }
     };
     for e in rd.flatten() {
         let dir = e.path();
@@ -113,6 +135,12 @@ pub fn read_max_temp_c(paths: &[PathBuf]) -> Option<f64> {
             continue;
         };
         let c = milli as f64 / 1000.0;
+        // A dead/garbage zone must not look like a real reading: 999999999 becomes ~1e6 °C
+        // and would pin PL1 at the floor (maximum throttle), while a negative value reads as
+        // a cold CPU and disables throttling.
+        if !(-40.0..=150.0).contains(&c) {
+            continue;
+        }
         best = Some(best.map_or(c, |b: f64| b.max(c)));
     }
     best

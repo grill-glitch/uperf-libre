@@ -64,29 +64,61 @@ impl PowerModel {
         if eff <= 0.0 {
             return None;
         }
+        // `nr` is a core count: a lossy u64->u32 cast silently wrapped a nonsense value, and
+        // `nr.max(1)` elsewhere then hid the misalignment of every cluster after it.
+        let nr = u32::try_from(v.get("nr").and_then(|x| x.as_u64()).unwrap_or(1)).ok()?;
         let m = Self {
             efficiency: eff,
-            nr: v.get("nr").and_then(|x| x.as_u64()).unwrap_or(1) as u32,
+            nr,
             typical_power: g("typicalPower")?,
             typical_freq: g("typicalFreq")?,
             sweet_freq: g("sweetFreq").unwrap_or(0.0),
             plain_freq: g("plainFreq").unwrap_or(0.0),
             free_freq: g("freeFreq").unwrap_or(0.0),
         };
-        if m.typical_freq <= 0.0 {
+        // Invariants the power curve divides by: typicalPower and typicalFreq are the
+        // denominators of `cost` and `ratio`, and the region boundaries must be ordered.
+        if !m.typical_freq.is_finite() || m.typical_freq <= 0.0 {
+            return None;
+        }
+        if !m.typical_power.is_finite() || m.typical_power <= 0.0 {
+            return None;
+        }
+        if m.nr == 0 || !m.plain_freq.is_finite() || !m.sweet_freq.is_finite() || !m.free_freq.is_finite() {
+            return None;
+        }
+        if m.plain_freq < 0.0 || m.sweet_freq < m.plain_freq {
             return None;
         }
         Some(m)
     }
 
     /// The whole `modules.cpu.powerModel[]` array (cluster order preserved).
+    ///
+    /// `filter_map` used to drop an unparseable entry, which shifted every following cluster:
+    /// callers index this list positionally (`cpu_slices`, `opps_per_cluster`) and pair each
+    /// entry with a CPU slice, so cluster 1's model would be applied to cluster 2 and the last
+    /// cluster would end up with an empty OPP table. Any invalid entry therefore invalidates
+    /// the whole list — with a line saying which one.
     pub fn list_from_modules(modules: &serde_json::Map<String, Value>) -> Vec<Self> {
-        modules
+        let Some(arr) = modules
             .get("cpu")
             .and_then(|c| c.get("powerModel"))
             .and_then(|p| p.as_array())
-            .map(|arr| arr.iter().filter_map(Self::from_value).collect())
-            .unwrap_or_default()
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(arr.len());
+        for (i, v) in arr.iter().enumerate() {
+            match Self::from_value(v) {
+                Some(m) => out.push(m),
+                None => {
+                    eprintln!("uperf: powerModel[{i}] is invalid; ignoring the whole power model");
+                    return Vec::new();
+                }
+            }
+        }
+        out
     }
 
     fn ratios(&self) -> (f64, f64) {
@@ -144,10 +176,19 @@ impl PowerModel {
     /// cost(f) = typicalPower·ratio(f) / ((eff/100)·f). For a fixed region the
     /// ratio is a power law k·x^m, so cost = typicalPower·k·x^m / ((eff/100)·x·f_typ)
     /// ∝ x^(m-1) — solve numerically with a bisection over the OPP range.
+    ///
+    /// In the *linear* region (x < plainFreq/typicalFreq) `ratio = Rs·Rp·x`, so cost is
+    /// constant and every target at or below that plateau resolves to `f_min_khz`; the
+    /// documented curve is monotonic only above it.
     pub fn freq_for_cost(&self, cost: f64, f_min_khz: f64, f_max_khz: f64) -> f64 {
         let (mut lo, mut hi) = (f_min_khz, f_max_khz);
+        if !f_min_khz.is_finite() || !f_max_khz.is_finite() || f_min_khz >= f_max_khz {
+            return f_min_khz.max(0.0);
+        }
+        // A non-positive / NaN ceiling means "no budget": returning f_max (the most
+        // power-hungry OPP) inverted the request. Fail safe at the cheapest frequency.
         if cost <= 0.0 || !cost.is_finite() {
-            return f_max_khz;
+            return f_min_khz;
         }
         // cost is increasing in f for this model (cubic numerator beats linear
         // denominator), so a plain bisection converges.

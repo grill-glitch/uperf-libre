@@ -41,11 +41,21 @@ impl FreqTarget {
             _ => None,
         }
     }
+    /// The node to write for `PolicyMax`/`MsmPerformance`; for `Userspace` this is the
+    /// policy *directory* (a node cannot be named before the governor switch), so callers
+    /// that need a file must use `policy_dir()` and append it.
     pub fn path(&self) -> Option<&str> {
         match self {
             Self::PolicyMax { path, .. } | Self::MsmPerformance { path, .. } => Some(path),
             Self::Userspace { policy_dir } => Some(policy_dir),
             Self::None => None,
+        }
+    }
+    /// The policy directory a `userspace` target writes `scaling_setspeed` under.
+    pub fn policy_dir(&self) -> Option<&str> {
+        match self {
+            Self::Userspace { policy_dir } => Some(policy_dir),
+            _ => None,
         }
     }
     pub fn is_global(&self) -> bool {
@@ -60,6 +70,11 @@ impl FreqTarget {
 pub trait FsProbe {
     fn exists(&self, path: &str) -> bool;
     fn is_writable(&self, path: &str) -> bool;
+    /// File content, or None when it cannot be read. Default: unreadable, so an
+    /// implementation that only models existence keeps working.
+    fn read(&self, _path: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Real probe.
@@ -67,6 +82,9 @@ pub struct RealFs;
 impl FsProbe for RealFs {
     fn exists(&self, path: &str) -> bool {
         std::path::Path::new(path).exists()
+    }
+    fn read(&self, path: &str) -> Option<String> {
+        std::fs::read_to_string(path).ok()
     }
     fn is_writable(&self, path: &str) -> bool {
         // `access(2)` reports writability from the *mode bits*; a file the
@@ -76,7 +94,9 @@ impl FsProbe for RealFs {
         // proof is an attempted write, which the writer does and reports.
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o200 != 0)
+            // Any write permission, not just the owner's: a group/other-writable knob
+            // (0o664) was reported read-only and the usable strategy got skipped.
+            .map(|m| m.permissions().mode() & 0o222 != 0)
             .unwrap_or(false)
     }
 }
@@ -101,18 +121,26 @@ pub fn freq_target_for_cluster_with(
     // 1. userspace governor control — the only mechanism verified to work on a
     //    qcom-cpufreq-hw kernel with locked scaling_max_freq.
     let gov = format!("{dir}/scaling_governor");
-    let setspeed = format!("{dir}/scaling_setspeed");
-    if fs.exists(&gov) && fs.is_writable(&gov) {
-        // `scaling_setspeed` only appears once the policy is in userspace mode,
-        // so accept the pair on the strength of the governor being writable.
-        let _ = setspeed;
+    let available = format!("{dir}/scaling_available_governors");
+    // `scaling_setspeed` only appears once the policy *is* in userspace mode, so the pair is
+    // accepted on the strength of the governor file being writable — but only when the
+    // driver actually offers the governor. When the list cannot be read, keep the previous
+    // behaviour (accept) rather than regressing on an unreadable node.
+    let offers_userspace = fs
+        .read(&available)
+        .map(|list| list.split_whitespace().any(|g| g == "userspace"))
+        .unwrap_or(true);
+    if offers_userspace && fs.exists(&gov) && fs.is_writable(&gov) {
         return FreqTarget::Userspace { policy_dir: dir };
     }
 
     // 2. a per-policy scaling_max_freq knob declared in the config.
     let needle = format!("/policy{first_cpu}/");
     for (knob, path) in knob_table {
-        if path.contains(&needle) && path.ends_with("scaling_max_freq") {
+        // Probe before selecting: a stale config path (or a node that is not writable)
+        // otherwise resolves to a target whose write fails later, with no fallback.
+        if path.contains(&needle) && path.ends_with("scaling_max_freq") && fs.exists(path) && fs.is_writable(path)
+        {
             return FreqTarget::PolicyMax {
                 knob: knob.clone(),
                 path: path.clone(),
@@ -122,7 +150,7 @@ pub fn freq_target_for_cluster_with(
 
     // 3. the global Qualcomm knob.
     for (knob, path) in knob_table {
-        if path.contains("/msm_performance/parameters/cpu_max_freq") {
+        if path.contains("/msm_performance/parameters/cpu_max_freq") && fs.exists(path) && fs.is_writable(path) {
             return FreqTarget::MsmPerformance {
                 knob: knob.clone(),
                 path: path.clone(),
@@ -139,8 +167,16 @@ pub fn freq_target_for_cluster_with(
 /// the highest request, since the knob caps the whole CPU.
 pub fn freq_writes(targets: &[FreqTarget], freqs_khz: &[f64]) -> Vec<(String, String)> {
     let mut best: BTreeMap<String, i64> = BTreeMap::new();
+    // zip stops at the shorter side: a targets/frequencies mismatch used to drop writes with
+    // no diagnostic.
+    debug_assert_eq!(targets.len(), freqs_khz.len(), "targets and freqs_khz must be 1:1");
     for (t, f) in targets.iter().zip(freqs_khz.iter()) {
         let Some(knob) = t.knob() else { continue };
+        // `as i64` maps NaN to 0 and saturates out-of-range values: a bogus request must not
+        // be written to sysfs as 0 kHz.
+        if !f.is_finite() || *f < 0.0 {
+            continue;
+        }
         let n = *f as i64;
         best.entry(knob.to_string())
             .and_modify(|e| {
@@ -200,8 +236,11 @@ mod tests {
 
     #[test]
     fn falls_back_to_the_policy_max_knob_when_governor_is_locked() {
-        // The alioth situation: governor file absent/locked, config knob exists.
-        let fs = Fake { files: vec![] };
+        // The alioth situation: governor file absent/locked, config knob exists and is
+        // writable. The fallback is probed now, so the knob must be present.
+        let fs = Fake {
+            files: vec![("/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq", true)],
+        };
         let t = freq_target_for_cluster_with(&table(), 4, &fs);
         assert_eq!(t.knob(), Some("CPU4max"));
         assert!(matches!(t, FreqTarget::PolicyMax { .. }));
@@ -214,7 +253,12 @@ mod tests {
             "cpuMax".into(),
             "/sys/module/msm_performance/parameters/cpu_max_freq".into(),
         );
-        let fs = Fake { files: vec![] };
+        let fs = Fake {
+            files: vec![
+                ("/sys/module/msm_performance/parameters/cpu_max_freq", true),
+                ("/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq", true),
+            ],
+        };
         let t = freq_target_for_cluster_with(&tbl, 0, &fs);
         assert!(matches!(t, FreqTarget::MsmPerformance { .. }));
         assert!(t.is_global());
@@ -226,6 +270,17 @@ mod tests {
     fn nothing_available_is_none() {
         let fs = Fake { files: vec![] };
         assert_eq!(freq_target_for_cluster_with(&table(), 1, &fs), FreqTarget::None);
+    }
+
+    #[test]
+    fn a_declared_but_absent_knob_is_not_a_target() {
+        // The config lists the knob but the node does not exist (stale config): selecting it
+        // used to produce a target whose write failed at runtime, with no fallback.
+        let mut tbl = table();
+        tbl.insert("cpuMax".into(), "/sys/module/msm_performance/parameters/cpu_max_freq".into());
+        let fs = Fake { files: vec![] };
+        assert_eq!(freq_target_for_cluster_with(&tbl, 4, &fs), FreqTarget::None);
+        assert_eq!(freq_target_for_cluster_with(&tbl, 0, &fs), FreqTarget::None);
     }
 
     #[test]
@@ -243,7 +298,9 @@ mod tests {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-        let fs = Fake { files: vec![] };
+        let fs = Fake {
+            files: vec![("/sys/module/msm_performance/parameters/cpu_max_freq", true)],
+        };
         let targets: Vec<FreqTarget> = (0..3)
             .map(|i| freq_target_for_cluster_with(&tbl, i, &fs))
             .collect();

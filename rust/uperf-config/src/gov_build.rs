@@ -11,13 +11,10 @@
 //! The tunables come from `presets[<mode>][<scene>]` → `presets[<mode>]["*"]` →
 //! `initials.cpu.*` (the normal cascade), so a scene switch re-derives them.
 
-#![allow(dead_code)]
-
 use crate::config::Config;
 use crate::cpu::PowerModel;
 use crate::freq_target::FreqTarget;
 use crate::governor::{ClusterState, Governor, GovernorTunables};
-use std::collections::BTreeMap;
 
 /// Cluster CPU-id slices derived from `powerModel[].nr`, in order.
 pub fn cpu_slices(models: &[PowerModel]) -> Vec<Vec<usize>> {
@@ -32,15 +29,32 @@ pub fn cpu_slices(models: &[PowerModel]) -> Vec<Vec<usize>> {
 }
 
 fn f64_of(cfg: &Config, mode: &str, scene: &str, key: &str, dflt: f64) -> f64 {
-    cfg.resolve(mode, scene, key)
-        .and_then(|v| v.as_f64())
-        .unwrap_or(dflt)
+    match cfg.resolve(mode, scene, key) {
+        // Absent is a legitimate "use the default"; a present value of the wrong type is a
+        // config error that used to fall back silently (the governor then ran with different
+        // behaviour than the config author wrote).
+        None => dflt,
+        Some(v) => match v.as_f64() {
+            Some(x) if x.is_finite() => x,
+            _ => {
+                eprintln!("uperf: '{key}' is not a finite number ({v}), using {dflt}");
+                dflt
+            }
+        },
+    }
 }
 
 fn bool_of(cfg: &Config, mode: &str, scene: &str, key: &str, dflt: bool) -> bool {
-    cfg.resolve(mode, scene, key)
-        .and_then(|v| v.as_bool())
-        .unwrap_or(dflt)
+    match cfg.resolve(mode, scene, key) {
+        None => dflt,
+        Some(v) => match v.as_bool() {
+            Some(b) => b,
+            None => {
+                eprintln!("uperf: '{key}' is not a boolean ({v}), using {dflt}");
+                dflt
+            }
+        },
+    }
 }
 
 /// Tunables for a (mode, scene) pair, with the documented defaults as fallback.
@@ -75,15 +89,14 @@ pub fn governor_from_config(
         return None;
     }
     let slices = cpu_slices(&models);
+    // Consume the models and slices: indexing them only to clone each one doubled the work
+    // for no reason.
     let clusters: Vec<ClusterState> = models
-        .iter()
+        .into_iter()
+        .zip(slices)
         .enumerate()
-        .map(|(i, m)| {
-            ClusterState::new(
-                m.clone(),
-                slices[i].clone(),
-                opps_per_cluster.get(i).cloned().unwrap_or_default(),
-            )
+        .map(|(i, (model, cores))| {
+            ClusterState::new(model, cores, opps_per_cluster.get(i).cloned().unwrap_or_default())
         })
         .collect();
     Some(Governor::new(tunables_from(cfg, mode, scene), clusters))
@@ -96,47 +109,30 @@ pub fn freq_targets(cfg: &Config) -> Vec<FreqTarget> {
 }
 
 /// Same, with an injected probe so the resolution is unit-testable.
+/// Re-exported so callers of this module (and its tests) use the single implementation in
+/// `freq_target`; a local copy had already drifted (no length check, `parse().unwrap_or(0)`).
+pub use crate::freq_target::freq_writes;
+
 pub fn freq_targets_with(
     cfg: &Config,
     fs: &dyn crate::freq_target::FsProbe,
 ) -> Vec<FreqTarget> {
     let table = cfg.sysfs_knob_table();
-    let models = PowerModel::list_from_modules(cfg.modules_map().unwrap_or(&Default::default()));
+    // A missing/invalid `modules` block used to yield an empty model list, hence an empty
+    // target list, and *every* frequency write was silently disabled. Say so.
+    let models = match cfg.modules_map() {
+        Some(modules) => PowerModel::list_from_modules(modules),
+        None => {
+            eprintln!("uperf: config has no 'modules' block; no frequency targets resolved");
+            Vec::new()
+        }
+    };
     cpu_slices(&models)
         .iter()
         .map(|cores| {
             let first = cores.first().copied().unwrap_or(0);
             crate::freq_target::freq_target_for_cluster_with(&table, first, fs)
         })
-        .collect()
-}
-
-/// Convenience for parity tooling: `{knob: freq}` for one governor output.
-pub fn freq_writes(
-    targets: &[FreqTarget],
-    freqs_khz: &[f64],
-) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for (t, f) in targets.iter().zip(freqs_khz.iter()) {
-        if let Some(knob) = t.knob() {
-            out.push((knob.to_string(), format!("{}", *f as i64)));
-        }
-    }
-    // A global (msm_performance) knob can be hit by several clusters — keep the
-    // highest request, matching "the whole CPU can't exceed this" semantics.
-    let mut best: BTreeMap<String, i64> = BTreeMap::new();
-    for (k, v) in out {
-        let n: i64 = v.parse().unwrap_or(0);
-        best.entry(k)
-            .and_modify(|e| {
-                if n > *e {
-                    *e = n;
-                }
-            })
-            .or_insert(n);
-    }
-    best.into_iter()
-        .map(|(k, v)| (k, v.to_string()))
         .collect()
 }
 
@@ -214,20 +210,24 @@ mod tests {
 
     /// No sysfs at all -> pure config-knob resolution (the host has a real
     /// `/sys/devices/system/cpu/cpufreq/`, so the probe must be injected).
-    struct NoFs;
-    impl crate::freq_target::FsProbe for NoFs {
-        fn exists(&self, _p: &str) -> bool {
-            false
-        }
-        fn is_writable(&self, _p: &str) -> bool {
-            false
-        }
-    }
-
     #[test]
     fn freq_targets_and_global_dedupe() {
+        // The fallbacks probe the filesystem, so the config's knob paths must exist and be
+        // writable for a fallback to be selected.
+        struct AllKnobs;
+        impl crate::freq_target::FsProbe for AllKnobs {
+            // Only the frequency knobs from the config, not the governor files: this test is
+            // about the knob fallback, and a writable `scaling_governor` correctly resolves
+            // to `Userspace` first.
+            fn exists(&self, p: &str) -> bool {
+                p.ends_with("scaling_max_freq") || p.contains("/msm_performance/")
+            }
+            fn is_writable(&self, p: &str) -> bool {
+                self.exists(p)
+            }
+        }
         let c = cfg();
-        let t = freq_targets_with(&c, &NoFs);
+        let t = freq_targets_with(&c, &AllKnobs);
         assert_eq!(t.len(), 3);
         assert_eq!(t[0].knob(), Some("cpuMax"), "cluster0 falls back to the global knob");
         assert_eq!(t[1].knob(), Some("CPU4max"));

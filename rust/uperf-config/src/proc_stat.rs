@@ -16,14 +16,25 @@ pub fn parse_stat(text: &str, n_cpus: usize) -> CpuJiffies {
     let mut total = vec![0u64; n_cpus];
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("cpu") else { continue };
+        // The aggregate line is `cpu  <jiffies…>`: its first token parses as an index and
+        // would otherwise be written into a bogus slot (e.g. busy[100] with >100 CPUs).
+        if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
         let mut it = rest.split_whitespace();
         let Some(idx) = it.next() else { continue };
         let Ok(id) = idx.parse::<usize>() else { continue };
         if id >= n_cpus {
             continue;
         }
-        let nums: Vec<u64> = it.filter_map(|t| t.parse::<u64>().ok()).collect();
-        if nums.len() < 5 {
+        // Reject the whole line on any non-numeric field: the old `filter_map` compacted
+        // the vector, so one malformed column shifted every column after it.
+        let Some(nums) = it.map(|t| t.parse::<u64>().ok()).collect::<Option<Vec<u64>>>() else {
+            continue;
+        };
+        // user nice system idle iowait irq softirq — `busy_sum` below indexes [5], so five
+        // fields are not enough.
+        if nums.len() < 6 {
             continue;
         }
         // user nice system idle iowait irq softirq [steal guest guest_nice]
