@@ -260,6 +260,9 @@ impl SchedApplier {
             // Tracked per field so the cache reflects what really happened.
             let mut affinity_ok = d.cpus.is_none();
             let mut policy_ok = d.policy == SchedPolicy::Skip;
+            // Set when the kernel refused the mask because the thread's cpuset excludes
+            // those CPUs: retrying that on every scan only burns syscalls and log lines.
+            let mut cpuset_blocked = false;
             if let Some(cpus) = &d.cpus {
                 match sched_apply::set_affinity(t.tid, cpus) {
                     Ok(()) => {
@@ -286,11 +289,33 @@ impl SchedApplier {
                         }
                     }
                     Err(e) => {
-                        r.errors += 1;
-                        log_line(&format!(
-                            "Rust: sched pid={} tid={} setaffinity {cpus:?} failed: {e}",
-                            p.pid, t.tid
-                        ));
+                        // EINVAL here means the requested CPUs are not in the thread's
+                        // cpuset: a cgroup constraint this process cannot override, not a
+                        // bug. Counting it as an error (and retrying it every scan) filled
+                        // the log with `setaffinity [4, 5, 6] failed: Invalid argument` on
+                        // device. Classify it as ineffective and let the cache stop retries;
+                        // a scene/top-app change re-evaluates it.
+                        let allowed = sched_apply::cpus_allowed(t.tid);
+                        let excluded = match &allowed {
+                            Some(a) => cpus.iter().any(|c| !a.contains(c)),
+                            None => false,
+                        };
+                        if excluded {
+                            r.affinity_ineffective += 1;
+                            cpuset_blocked = true;
+                            log_line(&format!(
+                                "Rust: sched pid={} tid={} affinity={cpus:?} not allowed by its cpuset ({:?}); leaving it alone",
+                                p.pid,
+                                t.tid,
+                                allowed.unwrap_or_default()
+                            ));
+                        } else {
+                            r.errors += 1;
+                            log_line(&format!(
+                                "Rust: sched pid={} tid={} setaffinity {cpus:?} failed: {e}",
+                                p.pid, t.tid
+                            ));
+                        }
                     }
                 }
             }
@@ -309,6 +334,14 @@ impl SchedApplier {
                         ));
                     }
                 }
+            }
+            if !changed && cpuset_blocked {
+                // Nothing we can do right now, and retrying costs a `comm` lookup plus two
+                // syscalls per thread per scan. Record "settled" so the scan skips it until
+                // the scene, the top app or the cpuset layout moves.
+                self.applied.insert(t.tid, Applied::default());
+                r.unchanged += 1;
+                continue;
             }
             if changed {
                 log_line(&format!(
