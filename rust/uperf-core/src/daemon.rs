@@ -248,8 +248,8 @@ impl Daemon {
         }
     }
 
-    /// The userspace CPU governor (`UPERF_CPU_GOVERNOR=1`; off by default — see the
-    /// note on `CpuTask::spawn`).
+    /// The userspace CPU governor (on by default; `UPERF_CPU_GOVERNOR=0` disables it — see
+    /// the note on `CpuTask::spawn`).
     fn start_governor(&mut self) {
         // Borrow, do not clone: `CpuTask::spawn` only reads the config, and a deep copy of
         // every mask/rule table at each start is pure waste.

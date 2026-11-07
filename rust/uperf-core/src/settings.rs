@@ -140,7 +140,7 @@ impl Default for Settings {
             log_path: String::new(),
             config_dir: None,
             fake_root: None,
-            cpu_governor: false,
+            cpu_governor: true,
             thermal_root: PathBuf::from(DEFAULT_THERMAL_ROOT),
             thermal: ThermalPolicy::default(),
             sched_dry_run: false,
@@ -218,7 +218,7 @@ impl Settings {
             config_dir,
 
             fake_root: env_str("UPERF_FAKE_ROOT").filter(|s| !s.is_empty()),
-            cpu_governor: env_on("UPERF_CPU_GOVERNOR"),
+            cpu_governor: env_on_by_default("UPERF_CPU_GOVERNOR"),
             thermal_root: env_path("UPERF_THERMAL_ROOT")
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_THERMAL_ROOT)),
             thermal: ThermalPolicy::from_values(
@@ -311,6 +311,19 @@ fn env_on(key: &str) -> bool {
     matches!(env_str(key).as_deref(), Some("1") | Some("true"))
 }
 
+/// A switch that is *on* unless explicitly turned off. Used for the frequency takeover:
+/// leaving it off by default made the module's main job opt-in, so an install did nothing
+/// but sched/cgroup work. `UPERF_CPU_GOVERNOR=0` (or `false`/`no`/`off`) still disables it.
+fn env_on_by_default(key: &str) -> bool {
+    parse_on_by_default(env_str(key).as_deref())
+}
+
+/// Pure half of `env_on_by_default`, so the contract is testable without touching the
+/// process environment (which `cargo test` shares across threads).
+fn parse_on_by_default(value: Option<&str>) -> bool {
+    !matches!(value, Some("0") | Some("false") | Some("no") | Some("off"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +359,15 @@ mod tests {
     fn opt_in_switches_accept_only_1_and_true() {
         // Documented contract of the switches; `env_on` is the single parser.
         assert!(!env_on("UPERF_DEFINITELY_NOT_SET_ANYWHERE"));
+
+        // The takeover is on unless explicitly disabled: an install that silently did
+        // nothing but sched/cgroup work was the bug.
+        assert!(parse_on_by_default(None));
+        assert!(parse_on_by_default(Some("1")));
+        assert!(parse_on_by_default(Some("true")));
+        assert!(!parse_on_by_default(Some("0")));
+        assert!(!parse_on_by_default(Some("false")));
+        assert!(!parse_on_by_default(Some("no")));
+        assert!(!parse_on_by_default(Some("off")));
     }
 }

@@ -496,14 +496,13 @@ impl CpuTask {
     /// almost nothing — so interactive work that runs there drops to the minimum
     /// frequency. Upstream's own governor cannot run on this kernel at all (all
     /// eight CpufreqWriter strategies need a min-freq knob that the driver locks),
-    /// so taking over preserves no upstream behaviour. The default is therefore to
-    /// leave the platform's governor alone.
+    /// so taking over preserves no upstream behaviour. The takeover is therefore the only
+    /// way this module controls frequency at all, and it is enabled by default;
+    /// `UPERF_CPU_GOVERNOR=0` leaves the platform's governor alone.
     /// Production constructor: real OPPs + real `/proc/stat`.
     pub fn spawn(cfg: &Config, mode: &str, scene: &str, settings: &Settings) -> Option<Self> {
         if !settings.cpu_governor {
-            log_line(
-                "Rust: cpu governor idle (set UPERF_CPU_GOVERNOR=1 to take over frequency control)",
-            );
+            log_line("Rust: cpu governor disabled by UPERF_CPU_GOVERNOR=0");
             return None;
         }
         let opps = read_opps_for_config_with(cfg, settings.fake_root.as_deref());
