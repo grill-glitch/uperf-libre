@@ -29,9 +29,13 @@
 // M1: StartPlatform() is replaced by uperf_rs_start() from the Rust staticlib
 // (cpp/include/uperf_rs.h).
 
+#include <fcntl.h>
 #include <getopt.h>
+#include <poll.h>
 #include <pthread.h>
 #include <cstdlib>
+#include <cerrno>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -70,9 +74,17 @@ static constexpr int TERM_SIG = SIGUSR1;
 static std::string configFile;
 static std::string logFile;
 
-static pid_t dead_pid;
-static pid_t new_pid;
-static pid_t old_pid;
+// Touched from DaemonSigHandler (signal context) and from the supervisor loop: plain
+// pid_t is a data race and the compiler may cache them across the loop. sig_atomic_t is
+// the type the C standard guarantees for this.
+static volatile sig_atomic_t dead_pid;
+static volatile sig_atomic_t new_pid;
+static volatile sig_atomic_t old_pid;
+
+// Self-pipe for the signal handler: it must be declared before the supervisor loop helpers
+// that close it in the forked worker.
+static int sigPipe[2] = {-1, -1};
+static volatile sig_atomic_t pendingSig;
 
 // ---------------------------------------------------------------- logger
 
@@ -86,7 +98,8 @@ static pid_t old_pid;
 // `UPERF_LOG_MAX_BYTES` overrides the per-file budget (used by the device harness to
 // force a rotation without writing 4 MB).
 static constexpr uint64_t LOG_MAX_BYTES_DEFAULT = 4 * 1024 * 1024;
-static constexpr size_t LOG_MAX_FILES = 2; // uperf_log.txt + .1 + .2
+// spdlog's max_files counts the current file, so 3 = uperf_log.txt + .1 + .2.
+static constexpr size_t LOG_MAX_FILES = 3;
 
 static uint64_t LogMaxBytes(void) {
     const char *env = ::getenv("UPERF_LOG_MAX_BYTES");
@@ -129,7 +142,9 @@ static void PrintTombstone(int pid) {
     std::stringstream ss(bt);
     std::string line;
     while (std::getline(ss, line)) {
-        SPDLOG_ERROR(line);
+        // Tombstones contain demangled C++ symbols with `{`/`}`: as a format string this
+        // either throws fmt::format_error or interprets the braces.
+        SPDLOG_ERROR("{}", line);
     }
     SPDLOG_ERROR(">>> End of tombstone {} <<<", pid);
 }
@@ -235,8 +250,27 @@ static void BlockTerminationSignals(void) {
 }
 
 static void StartNewApp(void) {
+    // Consume any death recorded by an earlier generation: a recycled pid may legitimately
+    // equal it, which used to be reported as "Failed to start" for a live worker.
+    dead_pid = 0;
     new_pid = fork();
+    if (new_pid < 0) {
+        // A failure here must never reach kill(): kill(-1, ...) signals every process this
+        // uid may signal.
+        SPDLOG_ERROR("Failed to fork {}: {}", PROC_NAME, strerror(errno));
+        new_pid = 0;
+        return;
+    }
     if (new_pid == 0) {
+        // The worker must not write into the supervisor's signal pipe.
+        if (sigPipe[0] >= 0) {
+            close(sigPipe[0]);
+            sigPipe[0] = -1;
+        }
+        if (sigPipe[1] >= 0) {
+            close(sigPipe[1]);
+            sigPipe[1] = -1;
+        }
         // Before anything in this process creates a thread: the mask is inherited by
         // every thread made afterwards, which is the whole point (see the teardown
         // signals section above).
@@ -245,59 +279,100 @@ static void StartNewApp(void) {
     }
 
     Sleep(SToUs(1.0));
-    if (new_pid != dead_pid) {
+    if (new_pid > 0 && new_pid != dead_pid) {
         old_pid = new_pid;
     } else {
         SPDLOG_INFO("Failed to start {}(pid={})", PROC_NAME, new_pid);
     }
 }
 
+// Give the worker its chance to disarm, then make sure it is really gone. A fixed sleep
+// was not a synchronisation point: the old pid was dropped from `old_pid` whether or not the
+// worker had exited, leaving an untracked process whose sysfs writes stayed applied (and
+// with the CPU governor still armed).
 static void KillOldApp(void) {
-    if (old_pid) {
-        kill(old_pid, TERM_SIG);
+    if (old_pid == 0) {
+        return;
+    }
+    auto pid = old_pid;
+    kill(pid, TERM_SIG);
+    for (int i = 0; i < 40; ++i) { // up to ~2 s
+        if (dead_pid == pid) {
+            break;
+        }
+        Sleep(SToUs(0.05));
+    }
+    if (dead_pid != pid) {
+        SPDLOG_WARN("{}(pid={}) did not stop in time, killing it", PROC_NAME, pid);
+        kill(pid, SIGKILL);
+    }
+    old_pid = 0;
+}
+
+// Signal handling, async-signal-safe: the handler only records the signal and writes a
+// byte to a self-pipe. Everything else (reaping, tombstone printing, logging, killing the
+// worker, exiting) happens in the supervisor loop, which used to run from signal context —
+// where wait()/spdlog/Sleep/PrintTombstone/exit() can deadlock the process while it is
+// already crashing.
+static void DaemonSigHandler(int signum) {
+    pendingSig = signum;
+    if (sigPipe[1] >= 0) {
+        char c = 1;
+        (void)!write(sigPipe[1], &c, 1);
     }
 }
 
-static void DaemonSigHandler(int signum) {
-    pid_t child_pid;
-    int status;
-    switch (signum) {
-        case SIGCHLD:
-            child_pid = wait(&status);
-            if (child_pid != new_pid && child_pid != old_pid) {
-                return;
-            }
-            dead_pid = child_pid;
-            if (WIFSIGNALED(status)) {
-                SPDLOG_ERROR("{}(pid={}) terminated unexpectedly, try to get tombstone", PROC_NAME, dead_pid);
-                // wait tombstone generated
-                Sleep(SToUs(1.0));
-                PrintTombstone(dead_pid);
-            }
-            break;
-        case SIGTERM:
-        case SIGINT:
-            // Take the worker down with us. dfps' original handler just exited,
-            // which orphaned the (forked) worker — and an orphaned worker keeps
-            // the CPU governor armed, leaving every policy stuck in `userspace`.
-            SPDLOG_INFO("Terminated by user, stopping worker");
-            if (new_pid) {
-                kill(new_pid, TERM_SIG);
-            }
-            if (old_pid && old_pid != new_pid) {
-                kill(old_pid, TERM_SIG);
-            }
-            Sleep(SToUs(0.5)); // let the worker run uperf_rs_stop()
-            exit(EXIT_SUCCESS);
-        default:
-            break;
+// Reap every exited child (SIGCHLD may cover more than the two roles we track).
+static void ReapChildren(void) {
+    for (;;) {
+        int status = 0;
+        auto child = waitpid(-1, &status, WNOHANG);
+        if (child <= 0) {
+            return;
+        }
+        if (child != (pid_t)new_pid && child != (pid_t)old_pid) {
+            continue; // not one of ours (e.g. a `cmd settings put` child of the worker)
+        }
+        dead_pid = child;
+        if (WIFSIGNALED(status)) {
+            SPDLOG_ERROR("{}(pid={}) terminated unexpectedly, try to get tombstone", PROC_NAME, (int)child);
+            Sleep(SToUs(1.0)); // wait for the tombstone to be written
+            PrintTombstone(child);
+        }
     }
+}
+
+// SIGTERM/SIGINT: take the worker down with us, then exit. Here, not in the handler.
+static void StopFromSignal(void) {
+    SPDLOG_INFO("Terminated by user, stopping worker");
+    if (new_pid > 0) {
+        kill(new_pid, TERM_SIG);
+    }
+    if (old_pid > 0 && old_pid != new_pid) {
+        kill(old_pid, TERM_SIG);
+    }
+    Sleep(SToUs(0.5)); // let the worker run uperf_rs_stop()
+    _exit(EXIT_SUCCESS);
 }
 
 static void Daemon(void) {
-    signal(SIGCHLD, DaemonSigHandler);
-    signal(SIGTERM, DaemonSigHandler);
-    signal(SIGINT, DaemonSigHandler);
+    // Self-pipe for the signal handler (see DaemonSigHandler). Non-blocking + CLOEXEC: the
+    // handler must never block, and the pipe must not leak into exec'd children.
+    if (pipe2(sigPipe, O_CLOEXEC | O_NONBLOCK) != 0) {
+        SPDLOG_ERROR("cannot create the signal pipe: {}", strerror(errno));
+        sigPipe[0] = sigPipe[1] = -1;
+    }
+
+    struct sigaction act;
+    memset(&act, 0, sizeof(act));
+    act.sa_handler = DaemonSigHandler;
+    sigemptyset(&act.sa_mask);
+    // SA_RESTART only for the supervisor's own bookkeeping: the loop below is written to
+    // tolerate an interrupted poll and re-check `dead_pid`.
+    act.sa_flags = SA_RESTART;
+    sigaction(SIGCHLD, &act, nullptr);
+    sigaction(SIGTERM, &act, nullptr);
+    sigaction(SIGINT, &act, nullptr);
 
     SPDLOG_INFO("{} {}[{}], by {}", PROC_NAME, VERSION, GetGitCommitHash(), AUTHOR);
 
@@ -307,11 +382,62 @@ static void Daemon(void) {
     StartNewApp();
 
     for (;;) {
-        inotify.WaitAndHandle();
-        SPDLOG_INFO("Config file updated, restart {} to load new config file", PROC_NAME);
-        KillOldApp();
-        Sleep(SToUs(0.5)); // wait finishing termination
-        StartNewApp();
+        // Poll the config-file watch and the self-pipe together: a blocking read on the
+        // inotify fd could not notice a dead worker or a teardown signal.
+        struct pollfd pfds[2];
+        pfds[0].fd = inotify.Fd();
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+        pfds[1].fd = sigPipe[0];
+        pfds[1].events = POLLIN;
+        pfds[1].revents = 0;
+        auto nr = poll(pfds, 2, 1000);
+        if (nr < 0 && errno != EINTR) {
+            SPDLOG_ERROR("supervisor poll failed: {}", strerror(errno));
+            Sleep(SToUs(1.0));
+            continue;
+        }
+
+        if (pfds[1].revents & POLLIN) {
+            char drain[16];
+            while (read(sigPipe[0], drain, sizeof(drain)) > 0) {
+            }
+            auto sig = pendingSig;
+            pendingSig = 0;
+            if (sig == SIGTERM || sig == SIGINT) {
+                StopFromSignal();
+            }
+        }
+        // A child may have died without a SIGCHLD wakeup being observed above.
+        ReapChildren();
+
+        bool configUpdated = false;
+        try {
+            if (pfds[0].revents & POLLIN) {
+                inotify.WaitAndHandle();
+                configUpdated = true;
+            }
+        } catch (const std::exception &e) {
+            SPDLOG_ERROR("inotify: {}", e.what());
+            Sleep(SToUs(1.0));
+        }
+
+        if (configUpdated) {
+            SPDLOG_INFO("Config file updated, restart {} to load new config file", PROC_NAME);
+            KillOldApp();
+            StartNewApp();
+            continue;
+        }
+
+        if (dead_pid != 0 && dead_pid == new_pid) {
+            // The worker exited on its own; bring a fresh one up so the device is not left
+            // running without a policy engine.
+            SPDLOG_WARN("{}(pid={}) exited, starting a new worker", PROC_NAME, (int)dead_pid);
+            dead_pid = 0;
+            new_pid = 0;
+            old_pid = 0;
+            StartNewApp();
+        }
     }
 }
 
@@ -381,6 +507,10 @@ int main(int argc, char **argv) {
     InitLogger();
 
     pid_t pid = fork();
+    if (pid < 0) {
+        SPDLOG_ERROR("Failed to fork daemon: {}", strerror(errno));
+        return EXIT_FAILURE;
+    }
     if (pid == 0) {
         setsid();
         SetSelfName(PROC_NAME);
