@@ -67,8 +67,10 @@ each are in [`docs/history/device-findings.md`](./docs/history/device-findings.m
 │ C++ side (reuses dfps, Apache-2.0, process skeleton)         │
 │ main.cpp        process supervisor: fork / SIGCHLD tombstone │
 │                 SIGUSR1 restart (hot reload) / log(spdlog)   │
-│ platform/       ModuleBase(event bus) CoBridge DelayedWorker │
-│                 HeavyWorker Inotifier Singleton              │
+│                 self-pipe signals (handler = write only)     │
+│ platform/       ModuleBase(Start/Stop) CoBridge(subscribe +  │
+│                 unsubscribe) DelayedWorker HeavyWorker       │
+│                 Inotifier Singleton                          │
 │ modules/        InputListener CgroupListener OffscreenMonitor│
 │                 TopappMonitor  ← event source, reused as-is  │
 │ utils/          inotify input_reader sched_ctrl atrace       │
@@ -200,9 +202,9 @@ void uperf_bridge_set_thread_name(const char *name);
 
 | uperf module | Owner | Note |
 |---|---|---|
-| process skeleton / logging / event bus | **C++ (dfps)** | `main.cpp` + `platform/*`, changing only `PROC_NAME`, the log pattern and the CLI |
-| InputListener / CgroupListener / OffscreenMonitor / TopappMonitor | **C++ (dfps)** | reused word for word, topics unchanged |
-| inotify / input_reader / sched_ctrl / atrace / misc_android / backtrace / time_counter | **C++ (dfps)** | reused word for word |
+| process skeleton / logging / event bus | **C++ (dfps)** | `main.cpp` + `platform/*`; topics/CLI unchanged, lifecycle and thread-ownership corrected (§6.2) |
+| InputListener / CgroupListener / OffscreenMonitor / TopappMonitor | **C++ (dfps)** | reused; topics unchanged, `Stop()`/atomics/validation added (§6.2) |
+| inotify / input_reader / sched_ctrl / atrace / misc_android / backtrace / time_counter | **C++ (dfps)** | reused; correctness and signal-safety fixes (§6.2) |
 | module assembly (original `uperf.cpp`) | **Rust** | `rust/uperf-core/src/lib.rs` |
 | config management (original JSON/knob system) | **Rust** | `config/`, including layered overrides and warning text |
 | `switcher` (hint state machine + preset + perapp) | **Rust** | `switcher/`, state machine in §8.1 |
@@ -285,6 +287,28 @@ the `uperf_frames.state` state file now all live in `frame_state`:
   crate's Settings).
 
 ---
+
+### 6.2 Deviations from vendored dfps (platform layer)
+
+The topics, the CLI, the log pattern and the file-switch semantics are unchanged (§7). What
+differs from the vendored tree is lifecycle, thread ownership and input validation — each
+entry fixes a defect that could crash, deadlock or silently mis-tune the device:
+
+| Area | Change | Why |
+|---|---|---|
+| `platform/cobridge` | `pubsub_` behind a mutex; `Subscribe()` returns a token, `Unsubscribe()` removes it; `Publish()` snapshots the callback list and invokes it outside the lock | publish runs on worker/timer threads while the FFI thread subscribes (data race on `unordered_map`), and a re-entrant `Subscribe` from a callback invalidated the iterated vector |
+| `platform/module_base` | `Stop()` (virtual, idempotent) removes every subscription made through `CoSubscribe`; also called from the destructor; copy deleted | every module registers `this`-bound callbacks in a process-wide bus and had no teardown, so a destroyed module was called on the next publish |
+| `DelayedWorker` / `HeavyWorker` | `Destroy(handle)` with a free-list; work exceptions contained; `HeavyWorker` joins on `Stop()` instead of detaching; `timer_create` failure throws; `isThreadInited_` atomic | handles leaked for the process lifetime, an exception in a detached worker called `std::terminate`, and a failed timer silently stopped the scheduler |
+| `Inotifier` / `Inotify` | table mutex; stop flag + `Stop()`/join; `Remove(path)`; event record bounds checks; `IN_CLOEXEC\|IN_NONBLOCK` + `poll`; `0666` written as octal | `Add()` raced the watcher thread, callbacks outlived their modules, a truncated event desynchronised the buffer, and the fd leaked into children |
+| `InputListener` | joinable thread + `Stop()`; pending add/remove queue swapped and processed outside the lock (and actually cleared); thresholds atomic and clamped to (0,0.5]; `EV_KEY` autorepeat is not a release; `gestureDelayUs_`/`holdDelayUs_` converted from seconds | the queue replayed every path ever seen, blocking `open()`/`CoPublish` ran under the mutex, a second `Start()` spawned a second poller, and 2 µs/1 µs made hold immediate and gesture unreachable |
+| `TopappMonitor` | counters atomic; probe also fires when the last probe is older than 2 s (the count-delta gate alone skipped same-size app switches forever); publishes the member string, null-checks the payload | stale `topapp.pkgName`, data race, and a stack address handed to subscribers |
+| `OffscreenMonitor` | edge detection via `exchange()`; returns unless `offscreen.state` has a subscriber; null payload check | overlapping timer threads could publish the same transition twice, and the 3-8 ms restricted-cgroup scan ran for nobody |
+| `main.cpp` supervisor | handlers only record the signal + write to a self-pipe; reaping/tombstone/log/exit moved to the supervisor loop; a dead worker is re-forked; restart waits for the old worker (SIGKILL after ~2 s); `fork()` failure handled (no `kill(-1)`) | the handler ran `wait`/spdlog/`Sleep`/`exit` in signal context, a `fork` failure broadcast SIGUSR1 to every process this uid can signal, and a worker that died left the daemon "running" with no policy engine |
+| `utils/misc`, `atrace`, `inotify`, `input_reader` | `open()`/`creat()` compared with `>= 0` (fd 0 is valid); sysfs `int` writes rendered as text; `ExecCmdSync` drains the pipe before `waitpid`; `nanosleep`; `atrace` clamps `snprintf` length before `write` and is C11-atomic; `ParseInt` accumulates in 64-bit | descriptor 0 was treated as failure (leak), a deadlock on >64 KiB output, an out-of-bounds read on a long trace tag, and signed overflow on 10-digit input |
+| `utils/misc_android` | dumpsys/tombstone parsing done on `std::string` with bounds checks; `fgets`/`opendir` results checked; nanosecond timestamps in integer arithmetic; OS-version cache atomic | pointer arithmetic walked before the buffer start and past its end, and the tombstone backtrace duplicated its last line or grew without bound |
+| `utils/backtrace` | handler writes a static buffer with `write(2)` (no spdlog/`std::string`/`__cxa_demangle`/`exit`), raw addresses, `sigaltstack` + `SA_ONSTACK`, re-raises the signal | the old handler was not async-signal-safe (deadlock instead of a dump) and a stack-overflow SIGSEGV lost the handler entirely |
+| `utils/sched_ctrl` | logical RT range 1..98 (99 mapped to kernel priority 0, which the kernel rejects); `sched_getparam` checked; `getpriority` errno handled; `resetOnFork` honoured on the normal path | a value inside the advertised range always failed, and a failure read as a real priority |
+| `include/uperf_rs*.h` | one copy of the shared prototypes (`uperf_rs.h` includes `uperf_rs_bridge.h`) + `static_assert` on the layouts; exception guards on every `extern "C"` entry point | two hand-written copies had already diverged, and a C++ exception crossing the FFI boundary is UB |
 
 ## 7. Compatibility Contract (the do-not-change list)
 
