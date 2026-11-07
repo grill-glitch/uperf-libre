@@ -16,8 +16,11 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <string>
-#include <vector>
+#include <string_view>
 
 int64_t GetNowTs(void);
 void Sleep(int64_t us);

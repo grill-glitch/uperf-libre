@@ -16,10 +16,15 @@
 
 #pragma once
 
-#include <stdlib.h>
+// __BEGIN_DECLS comes from <sys/cdefs.h>; <stdlib.h> only pulls it in transitively on
+// glibc/bionic, and this header needs no stdlib declaration of its own.
+#include <sys/cdefs.h>
 
 __BEGIN_DECLS
 
+/// The build's git commit hash, as a NUL-terminated string.
+/// The pointer refers to static storage owned by the library: do not free() it, it stays
+/// valid for the process lifetime and it is never NULL. Thread-safe (immutable).
 const char *GetGitCommitHash(void);
 
 __END_DECLS

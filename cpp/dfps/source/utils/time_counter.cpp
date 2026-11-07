@@ -19,9 +19,9 @@
 
 TimeCounter::TimeCounter() { Reset(); }
 
-void TimeCounter::Reset(void) { start_ = GetNowTs(); }
+void TimeCounter::Reset(void) { start_.store(GetNowTs(), std::memory_order_relaxed); }
 
-int64_t TimeCounter::ElapsedUs(void) const { return GetNowTs() - start_; }
+int64_t TimeCounter::ElapsedUs(void) const { return GetNowTs() - start_.load(std::memory_order_relaxed); }
 
 int64_t TimeCounter::ElapsedMs(void) const { return ElapsedUs() / 1000; }
 
