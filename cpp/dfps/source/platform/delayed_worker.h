@@ -17,20 +17,35 @@
 #pragma once
 
 #include "singleton.h"
+#include <atomic>
+#include <cstdint>
 #include <functional>
+#include <mutex>
+#include <string>
 #include <time.h>
+#include <tuple>
 #include <vector>
 
 class DelayedWorker : public Singleton<DelayedWorker> {
 public:
     using Handle = int;
     using Work = std::function<void(void)>;
+    // `ts` is an absolute timestamp in the GetNowTs() clock (microseconds);
+    // SLEEP_TS (0) means "no work"/"cancel".
     static constexpr int64_t SLEEP_TS = 0;
 
+private:
+    // Only Singleton<DelayedWorker> may construct it: a second instance would bypass the shared
+    // state (the subscriber table / worker slots) the class exists to provide.
+    friend class Singleton<DelayedWorker>;
     DelayedWorker();
+
+public:
     ~DelayedWorker();
     Handle Create(const std::string &name);
     void SetWork(Handle handle, const Work &work, int64_t ts);
+    /// Cancel any pending work for `handle` and release the slot (indices are recycled).
+    void Destroy(Handle handle);
 
     void _OnTimer(void);
 
@@ -40,7 +55,11 @@ private:
     int FindEarliestReadyWorkIdx(void);
 
     std::vector<std::tuple<int64_t, Work>> slots_;
+    /// Slots released by Destroy(), reused by Create().
+    std::vector<std::size_t> free_;
     std::mutex mut_;
     timer_t timerId_;
-    bool isThreadInited_;
+    // SIGEV_THREAD delivers every expiry on a fresh callback thread, so this one-shot
+    // thread-renaming flag is touched concurrently.
+    std::atomic<bool> isThreadInited_{false};
 };

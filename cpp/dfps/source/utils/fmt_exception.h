@@ -19,15 +19,30 @@
 #include <exception>
 #include <spdlog/fmt/fmt.h>
 #include <string>
+#include <utility>
 
 class FmtException : public std::exception {
 public:
+    /// `explicit` so a stray `const char *` cannot be converted into an exception object.
+    /// The message is formatted best-effort: fmt::format allocates and can throw, and a
+    /// throw while constructing an exception (during unwinding, or in a noexcept context)
+    /// would call std::terminate.
     template <typename... Args>
-    FmtException(fmt::format_string<Args...> fmt, Args &&...args)
-        : msg_(fmt::format(fmt, std::forward<Args>(args)...)) {}
+    explicit FmtException(fmt::format_string<Args...> fmt, Args &&...args)
+        : msg_(FormatSafe(fmt, std::forward<Args>(args)...)) {}
 
     const char *what(void) const noexcept override { return msg_.c_str(); }
 
-protected:
+private:
+    template <typename... Args>
+    static std::string FormatSafe(fmt::format_string<Args...> fmt, Args &&...args) noexcept {
+        try {
+            return fmt::format(fmt, std::forward<Args>(args)...);
+        } catch (...) {
+            return std::string("FmtException (message formatting failed)");
+        }
+    }
+
+    // Private: `what()` returns a pointer into this string, so nothing may reassign it.
     std::string msg_;
 };

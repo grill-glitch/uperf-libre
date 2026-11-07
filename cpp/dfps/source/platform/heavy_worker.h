@@ -18,10 +18,12 @@
 
 #include "singleton.h"
 #include <condition_variable>
+#include <cstddef>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 class HeavyWorker : public Singleton<HeavyWorker> {
@@ -29,13 +31,27 @@ public:
     using Handle = int;
     using Work = std::function<void(void)>;
 
+private:
+    // Only Singleton<HeavyWorker> may construct it: a second instance would bypass the shared
+    // state (the subscriber table / worker slots) the class exists to provide.
+    friend class Singleton<HeavyWorker>;
     HeavyWorker();
+
+public:
+    ~HeavyWorker();
     Handle Create(const std::string &name);
     void SetWork(Handle handle, const Work &work);
+    /// Cancel queued work for `handle` and release the slot (indices are recycled).
+    void Destroy(Handle handle);
+    /// Stop and join the worker thread. Idempotent.
+    void Stop(void);
 
 private:
     std::vector<std::tuple<std::string, Work>> works_;
+    /// Slots released by Destroy(), reused by Create().
+    std::vector<std::size_t> free_;
     bool pending_;
+    bool stop_ = false;
     std::mutex mut_;
     std::condition_variable cv_;
     std::thread th_;

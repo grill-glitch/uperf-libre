@@ -17,52 +17,87 @@
 #include "delayed_worker.h"
 #include "utils/fmt_exception.h"
 #include "utils/misc.h"
+#include <cerrno>
+#include <climits>
 #include <signal.h>
+#include <spdlog/spdlog.h>
 #include <unistd.h>
 
 constexpr char MODULE_NAME[] = "DelayedWorker";
 
 void OnTimerWrapper(union sigval v) { DelayedWorker::GetInstance()->_OnTimer(); }
 
-DelayedWorker::DelayedWorker() : timerId_(nullptr), isThreadInited_(false) {
+DelayedWorker::DelayedWorker() : timerId_(nullptr) {
     constexpr int SIVAL_INT_DEFAULT = 111;
     struct sigevent evp;
     memset(&evp, 0, sizeof(struct sigevent));
     evp.sigev_value.sival_int = SIVAL_INT_DEFAULT;
     evp.sigev_notify = SIGEV_THREAD;
     evp.sigev_notify_function = OnTimerWrapper;
-    timer_create(CLOCK_MONOTONIC, &evp, &timerId_);
+    // An unchecked failure leaves timerId_ invalid: every later timer_settime() then fails
+    // silently and the scheduler simply never fires.
+    if (timer_create(CLOCK_MONOTONIC, &evp, &timerId_) != 0) {
+        throw FmtException("timer_create failed, errno = {}", errno);
+    }
 }
 
 DelayedWorker::~DelayedWorker() { timer_delete(timerId_); }
 
 DelayedWorker::Handle DelayedWorker::Create(const std::string &name) {
     std::lock_guard<std::mutex> lk(mut_);
-    Handle handle = slots_.size();
+    if (!free_.empty()) {
+        auto handle = static_cast<Handle>(free_.back());
+        free_.pop_back();
+        slots_[static_cast<std::size_t>(handle)] = std::make_tuple(SLEEP_TS, Work());
+        return handle;
+    }
+    if (slots_.size() >= static_cast<std::size_t>(INT_MAX)) {
+        throw FmtException("DelayedWorker slot table is full");
+    }
+    Handle handle = static_cast<Handle>(slots_.size());
     slots_.emplace_back(std::make_tuple(SLEEP_TS, nullptr));
     return handle;
 }
 
+void DelayedWorker::Destroy(Handle handle) {
+    std::lock_guard<std::mutex> lk(mut_);
+    if (handle < 0 || static_cast<std::size_t>(handle) >= slots_.size()) {
+        return;
+    }
+    auto &[preserveTs, w] = slots_[static_cast<std::size_t>(handle)];
+    // Cancelling the work is what makes the module teardown safe: a queued lambda that
+    // captured `this` must not run after the object is gone.
+    w = nullptr;
+    preserveTs = SLEEP_TS;
+    for (auto i : free_) {
+        if (i == static_cast<std::size_t>(handle)) {
+            ReloadTimer();
+            return;
+        }
+    }
+    free_.push_back(static_cast<std::size_t>(handle));
+    ReloadTimer();
+}
+
 void DelayedWorker::SetWork(Handle handle, const Work &work, int64_t ts) {
-    if (handle < 0 || handle >= slots_.size()) {
+    std::lock_guard<std::mutex> lk(mut_);
+    // Validate under the lock: `slots_.size()` is otherwise read while Create() may be
+    // appending on another thread (a TOCTOU check that protects nothing).
+    if (handle < 0 || static_cast<std::size_t>(handle) >= slots_.size()) {
         throw FmtException("DelayedWorker handle not found, handle = {}", handle);
     }
 
-    {
-        std::lock_guard<std::mutex> lk(mut_);
-        auto &[preserveTs, w] = slots_[handle];
-        w = work;
-        preserveTs = ts;
-        if (work == nullptr) {
-            preserveTs = SLEEP_TS;
-        }
-        ReloadTimer();
+    auto &[preserveTs, w] = slots_[handle];
+    w = work;
+    preserveTs = ts;
+    if (work == nullptr) {
+        preserveTs = SLEEP_TS;
     }
+    ReloadTimer();
 }
 
 void DelayedWorker::_OnTimer(void) {
-    if (isThreadInited_ == false) {
-        isThreadInited_ = true;
+    if (!isThreadInited_.exchange(true)) {
         SetSelfThreadName(MODULE_NAME);
     }
 
@@ -79,26 +114,35 @@ void DelayedWorker::_OnTimer(void) {
         }
     }
 
-    // SetWork() may be called in work()
+    // SetWork() may be called in work(). A throwing work must never escape this
+    // SIGEV_THREAD callback: that calls std::terminate, and it would also skip the
+    // re-arm below, wedging every scheduled task.
     if (work) {
-        work();
+        try {
+            work();
+        } catch (const std::exception &e) {
+            SPDLOG_ERROR("DelayedWorker task failed: {}", e.what());
+        } catch (...) {
+            SPDLOG_ERROR("DelayedWorker task failed with an unknown exception");
+        }
     }
 
-    {
-        std::lock_guard<std::mutex> lk(mut_);
-        ReloadTimer();
-    }
+    std::lock_guard<std::mutex> lk(mut_);
+    ReloadTimer();
 }
 
 void DelayedWorker::ReloadTimer(void) {
     constexpr int64_t MIN_INTERVAL = 1;
     auto setTimer = [this](int64_t usec) {
         struct itimerspec itv;
-        itv.it_value.tv_sec = usec / 1000000ull;
-        itv.it_value.tv_nsec = (usec % 1000000ull) * 1000ull;
-        itv.it_interval.tv_sec = 0;
-        itv.it_interval.tv_nsec = 0;
-        return timer_settime(timerId_, 0, &itv, NULL);
+        memset(&itv, 0, sizeof(itv));
+        // Signed arithmetic: mixing in an `ull` literal promotes `usec` to unsigned.
+        itv.it_value.tv_sec = usec / 1000000LL;
+        itv.it_value.tv_nsec = (usec % 1000000LL) * 1000LL;
+        if (timer_settime(timerId_, 0, &itv, nullptr) != 0) {
+            // A broken timer silently stops the whole scheduler: say so once per failure.
+            SPDLOG_ERROR("DelayedWorker: timer_settime failed, errno = {}", errno);
+        }
     };
 
     auto idx = FindEarliestWorkIdx();

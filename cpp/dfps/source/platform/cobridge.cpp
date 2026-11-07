@@ -19,23 +19,82 @@
 CoBridge::CoBridge() {}
 
 void CoBridge::Publish(const std::string &theme, const void *data) const {
-    auto it = pubsub_.find(theme);
-    if (it != pubsub_.end()) {
-        for (const auto &cb : it->second) {
-            cb(data);
+    // Take the immutable snapshot by reference count, then invoke outside the lock: a
+    // callback may call Subscribe()/Unsubscribe() (which take the same lock and publish a
+    // *new* list), so neither the lock nor the dispatched list can be invalidated.
+    EntryList snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = pubsub_.find(theme);
+        if (it == pubsub_.end()) {
+            return;
+        }
+        snapshot = it->second;
+    }
+    if (!snapshot) {
+        return;
+    }
+    for (const auto &entry : *snapshot) {
+        if (entry.second != nullptr) {
+            entry.second(data);
         }
     }
 }
 
-void CoBridge::Subscribe(const std::string &theme, const SubscribeCallback &cb) {
+CoBridge::SubscriptionId CoBridge::Subscribe(const std::string &theme, const SubscribeCallback &cb) {
     if (cb == nullptr) {
-        return;
+        return 0;
     }
 
-    if (HasSubscriber(theme) == false) {
-        pubsub_[theme] = {};
-    }
-    pubsub_[theme].emplace_back(cb);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto id = ++nextId_;
+    auto &slot = pubsub_[theme];
+    // Build the new list outside any reader's view: a concurrent Publish() keeps using the
+    // previous immutable vector.
+    auto next = slot ? std::make_shared<std::vector<Entry>>(*slot)
+                     : std::make_shared<std::vector<Entry>>();
+    next->emplace_back(id, cb);
+    slot = std::move(next);
+    return id;
 }
 
-bool CoBridge::HasSubscriber(const std::string &theme) const { return pubsub_.count(theme) > 0; }
+bool CoBridge::Unsubscribe(const std::string &theme, SubscriptionId id) {
+    if (id == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = pubsub_.find(theme);
+    if (it == pubsub_.end()) {
+        return false;
+    }
+    const auto &entries = it->second;
+    if (!entries) {
+        return false;
+    }
+    auto remaining = std::make_shared<std::vector<Entry>>();
+    remaining->reserve(entries->size());
+    bool found = false;
+    for (const auto &e : *entries) {
+        if (e.first == id) {
+            found = true;
+            continue;
+        }
+        remaining->push_back(e);
+    }
+    if (!found) {
+        return false;
+    }
+    if (remaining->empty()) {
+        // Drop the topic entry too, so HasSubscriber() and the map do not keep growing.
+        pubsub_.erase(it);
+    } else {
+        it->second = std::move(remaining);
+    }
+    return true;
+}
+
+bool CoBridge::HasSubscriber(const std::string &theme) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = pubsub_.find(theme);
+    return it != pubsub_.end() && it->second && !it->second->empty();
+}

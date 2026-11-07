@@ -16,13 +16,27 @@
 
 #pragma once
 
-#include <memory>
 #include <mutex>
 
+/// Process-wide instance holder.
+///
+/// The instance is heap-allocated and **deliberately never destroyed**: every T here owns
+/// threads, timers and a subscriber table that stay in use until the process exits, and a
+/// static-destruction order would have those threads touch already-destroyed mutexes. The
+/// destructor of T therefore never runs — say so here rather than leave it implied.
+///
+/// Two constraints the call sites must respect:
+///   * T's constructor must not call GetInstance<T>() (call_once cannot be re-entered on
+///     the same flag: that deadlocks). Constructor bodies are kept trivial for this reason.
+///   * A throwing constructor leaves the flag unset, so the next call retries and the
+///     exception reaches the caller — GetInstance never returns nullptr.
+///
+/// Construction is enforced at compile time: each T declares its constructor private and
+/// friends this class, so `CoBridge b;` cannot create a second, silently independent
+/// instance that bypasses the shared state.
 template <typename T>
 class Singleton {
 public:
-    Singleton() = default;
     Singleton(const Singleton &) = delete;
     Singleton &operator=(const Singleton &) = delete;
 
@@ -30,6 +44,9 @@ public:
         std::call_once(once_, []() { instance_ = new T(); });
         return instance_;
     }
+
+protected:
+    Singleton() = default;
 
 private:
     static T *instance_;

@@ -16,16 +16,32 @@
 
 #include "platform/module_base.h"
 
-ModuleBase::ModuleBase() : disabled_(false) {}
+ModuleBase::ModuleBase() {}
 
-ModuleBase::~ModuleBase() {}
+ModuleBase::~ModuleBase() {
+    // A derived destructor has already run, so virtual dispatch is gone; this cleanup must
+    // be unconditional and base-local. Without it every module left `this`-bound callbacks
+    // in the process-wide bridge for good, and the next publish called into freed memory.
+    Stop();
+}
+
+void ModuleBase::Stop(void) {
+    for (const auto &entry : subs_) {
+        CoBridge::GetInstance()->Unsubscribe(entry.first, entry.second);
+    }
+    subs_.clear();
+}
 
 void ModuleBase::CoPublish(const std::string &theme, const void *data) const {
     return CoBridge::GetInstance()->Publish(theme, data);
 }
 
-void ModuleBase::CoSubscribe(const std::string &theme, const CoBridge::SubscribeCallback &cb) {
-    return CoBridge::GetInstance()->Subscribe(theme, cb);
+CoBridge::SubscriptionId ModuleBase::CoSubscribe(const std::string &theme, const CoBridge::SubscribeCallback &cb) {
+    auto id = CoBridge::GetInstance()->Subscribe(theme, cb);
+    if (id != 0) {
+        subs_.emplace_back(theme, id);
+    }
+    return id;
 }
 
 bool ModuleBase::CoHasSubscriber(const std::string &theme) const {
@@ -40,8 +56,12 @@ void ModuleBase::DwSetWork(DelayedWorker::Handle handle, const DelayedWorker::Wo
     return DelayedWorker::GetInstance()->SetWork(handle, work, ts);
 }
 
+void ModuleBase::DwDestroy(DelayedWorker::Handle handle) { DelayedWorker::GetInstance()->Destroy(handle); }
+
 HeavyWorker::Handle ModuleBase::HwCreate(const std::string &name) { return HeavyWorker::GetInstance()->Create(name); }
 
 void ModuleBase::HwSetWork(HeavyWorker::Handle handle, const HeavyWorker::Work &work) {
     return HeavyWorker::GetInstance()->SetWork(handle, work);
 }
+
+void ModuleBase::HwDestroy(HeavyWorker::Handle handle) { HeavyWorker::GetInstance()->Destroy(handle); }
