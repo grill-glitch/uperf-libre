@@ -58,7 +58,15 @@ fi
 echo "sh \"$SCRIPT_PATH/powercfg_main.sh\" \"\$1\"" >>/data/powercfg.sh || exit 1
 grep -q "powercfg_main.sh" /data/powercfg.sh || echo "uperf: powercfg wrapper has no command appended" >/dev/kmsg 2>/dev/null
 
-wait_until_login || echo "uperf: login not detected in time; continuing" >/dev/kmsg 2>/dev/null
+# The tuning pass needs the user's config and a writable /sdcard, and it locks sysfs nodes
+# and restarts HALs — doing that while the device is still locked (and the daemon cannot
+# start because `uperf.json` is unreadable) leaves the ROM with a half-applied boot
+# configuration and no supervisor. Skip the whole pass instead of guessing; the next boot
+# after unlocking does it properly.
+if ! wait_until_login; then
+    echo "uperf: still locked after the login timeout; skipping the tuning pass (reboot after unlocking, or run initsvc.sh manually)" >/dev/kmsg 2>/dev/null
+    exit 0
+fi
 
 # Report each step: a missing script or a failed pass used to leave the device on a
 # half-applied boot configuration with no trace in the log.

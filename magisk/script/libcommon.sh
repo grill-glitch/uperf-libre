@@ -116,13 +116,15 @@ clear_panel() {
 }
 
 wait_until_login() {
-    # Bounded: an unbounded loop meant a device whose boot never completes (or a ROM without
-    # `getprop`) hung the whole boot script here, forever.
+    # Bounded, but generously: this runs in a background boot script, so waiting for the
+    # user does not hold up the boot — returning non-zero does, however, decide whether the
+    # tuning pass runs at all (initsvc skips it rather than applying half a configuration).
+    # 30 min covers a phone left on the lock screen.
     local tries=0
     while [ "$(getprop sys.boot_completed 2>/dev/null)" != "1" ]; do
         sleep 1
         tries=$((tries + 1))
-        [ "$tries" -ge 300 ] && return 1
+        [ "$tries" -ge 1800 ] && return 1
     done
 
     # We cannot rw "/sdcard" before the user unlocks the screen. Verify the *write* and delete
@@ -131,7 +133,7 @@ wait_until_login() {
     local retry=0
     rm -f "$test_file" 2>/dev/null
     while ! (true >"$test_file" 2>/dev/null && [ -f "$test_file" ]); do
-        [ "$retry" -ge 300 ] && return 1
+        [ "$retry" -ge 1800 ] && return 1
         retry=$((retry + 1))
         sleep 1
     done
